@@ -1,0 +1,11 @@
+[Unit]
+Description=Run Zetta raw loaders every 5 minutes
+
+[Timer]
+OnBootSec=2min
+OnUnitActiveSec=5min
+AccuracySec=30s
+Unit=zetta-load.service
+
+[Install]
+WantedBy=timers.target

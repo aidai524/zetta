@@ -1,0 +1,14 @@
+[Unit]
+Description=Zetta product API
+After=network-online.target docker.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+EnvironmentFile=/etc/zetta/zetta.env
+ExecStart=/usr/local/bin/zetta-runner api
+Restart=always
+RestartSec=10
+
+[Install]
+WantedBy=multi-user.target

@@ -1,0 +1,11 @@
+[Unit]
+Description=Run Zetta mart builders every 15 minutes
+
+[Timer]
+OnBootSec=10min
+OnUnitActiveSec=15min
+AccuracySec=1min
+Unit=zetta-marts.service
+
+[Install]
+WantedBy=timers.target

@@ -1,0 +1,22 @@
+[Unit]
+Description=Zetta distributed collector worker
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory={{ zetta_repo_path }}
+Environment=PYTHONPATH={{ zetta_repo_path }}/src
+ExecStart={{ zetta_repo_path }}/.venv/bin/python -m zetta.cli \
+  --task-store postgres \
+  --node-id {{ inventory_hostname }} \
+  --postgres-dsn {{ zetta_postgres_dsn }} \
+  --clickhouse-host {{ zetta_clickhouse_host }} \
+  --raw-data-dir {{ zetta_raw_dir }} \
+  --state-dir {{ zetta_state_dir }} \
+  tasks run-loop --idle-sleep-seconds 5
+Restart=always
+RestartSec=10
+
+[Install]
+WantedBy=multi-user.target

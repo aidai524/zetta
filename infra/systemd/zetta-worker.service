@@ -1,0 +1,14 @@
+[Unit]
+Description=Zetta Postgres-backed collector worker
+After=network-online.target docker.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+EnvironmentFile=/etc/zetta/zetta.env
+ExecStart=/usr/local/bin/zetta-runner worker
+Restart=always
+RestartSec=10
+
+[Install]
+WantedBy=multi-user.target

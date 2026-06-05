@@ -1,0 +1,9 @@
+[Unit]
+Description=Zetta analytical mart builder
+After=network-online.target docker.service
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+EnvironmentFile=/etc/zetta/zetta.env
+ExecStart=/usr/local/bin/zetta-runner marts

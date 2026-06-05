@@ -1,0 +1,80 @@
+---
+- name: Install and run Zetta workers
+  hosts: zetta_all
+  become: true
+  vars:
+    zetta_repo_path: /opt/zetta
+    zetta_raw_dir: /var/lib/zetta/raw
+    zetta_state_dir: /var/lib/zetta/state
+    zetta_postgres_dsn: postgresql://zetta:zetta@postgres.internal:55432/zetta
+    zetta_clickhouse_host: clickhouse.internal
+  tasks:
+    - name: Install system packages
+      ansible.builtin.package:
+        name:
+          - git
+          - python3
+          - python3-venv
+        state: present
+
+    - name: Create data directories
+      ansible.builtin.file:
+        path: "{{ item }}"
+        state: directory
+        owner: root
+        group: root
+        mode: "0755"
+      loop:
+        - "{{ zetta_repo_path }}"
+        - "{{ zetta_raw_dir }}"
+        - "{{ zetta_state_dir }}"
+
+    - name: Sync repository checkout
+      ansible.builtin.git:
+        repo: "{{ zetta_git_repo }}"
+        dest: "{{ zetta_repo_path }}"
+        version: "{{ zetta_git_version | default('main') }}"
+        update: true
+      when: zetta_git_repo is defined
+
+    - name: Create virtual environment
+      ansible.builtin.command:
+        cmd: python3 -m venv {{ zetta_repo_path }}/.venv
+        creates: "{{ zetta_repo_path }}/.venv/bin/python"
+
+    - name: Install project dependencies
+      ansible.builtin.command:
+        cmd: "{{ zetta_repo_path }}/.venv/bin/pip install -e {{ zetta_repo_path }}"
+      changed_when: false
+
+    - name: Install worker systemd unit
+      ansible.builtin.template:
+        src: zetta-worker.service.j2
+        dest: /etc/systemd/system/zetta-worker.service
+        mode: "0644"
+      when: inventory_hostname in groups.get('zetta_workers', [])
+
+    - name: Install API systemd unit
+      ansible.builtin.template:
+        src: zetta-api.service.j2
+        dest: /etc/systemd/system/zetta-api.service
+        mode: "0644"
+      when: inventory_hostname in groups.get('zetta_api', [])
+
+    - name: Reload systemd
+      ansible.builtin.systemd:
+        daemon_reload: true
+
+    - name: Enable worker
+      ansible.builtin.systemd:
+        name: zetta-worker
+        enabled: true
+        state: started
+      when: inventory_hostname in groups.get('zetta_workers', [])
+
+    - name: Enable API
+      ansible.builtin.systemd:
+        name: zetta-api
+        enabled: true
+        state: started
+      when: inventory_hostname in groups.get('zetta_api', [])

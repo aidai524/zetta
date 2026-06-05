@@ -1,0 +1,18 @@
+[Unit]
+Description=Zetta product API
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory={{ zetta_repo_path }}
+Environment=PYTHONPATH={{ zetta_repo_path }}/src
+ExecStart={{ zetta_repo_path }}/.venv/bin/python -m zetta.cli \
+  --postgres-dsn {{ zetta_postgres_dsn }} \
+  --clickhouse-host {{ zetta_clickhouse_host }} \
+  api serve --host 0.0.0.0 --port 8088
+Restart=always
+RestartSec=10
+
+[Install]
+WantedBy=multi-user.target

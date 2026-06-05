@@ -1,0 +1,74 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+MODE="${1:?mode is required}"
+
+source /etc/zetta/zetta.env
+
+cd "$ZETTA_HOME"
+
+COMMON_ARGS=(
+  --postgres-dsn "$ZETTA_POSTGRES_DSN"
+  --clickhouse-host "$ZETTA_CLICKHOUSE_HOST"
+  --clickhouse-port "$ZETTA_CLICKHOUSE_PORT"
+  --clickhouse-user "$ZETTA_CLICKHOUSE_USER"
+  --clickhouse-password "$ZETTA_CLICKHOUSE_PASSWORD"
+  --clickhouse-database "$ZETTA_CLICKHOUSE_DATABASE"
+  --polygon-rpc-url "$ZETTA_POLYGON_RPC_URL"
+  --raw-data-dir "$ZETTA_RAW_DIR"
+  --state-dir "$ZETTA_STATE_DIR"
+)
+
+if [[ -n "${ZETTA_HTTP_RESOLVE_OVERRIDES:-}" ]]; then
+  COMMON_ARGS+=(--http-resolve-overrides "$ZETTA_HTTP_RESOLVE_OVERRIDES")
+fi
+
+case "$MODE" in
+  worker)
+    exec "$ZETTA_PYTHON" -m zetta.cli \
+      "${COMMON_ARGS[@]}" \
+      --task-store postgres \
+      --node-id "$ZETTA_NODE_ID" \
+      tasks run-loop --idle-sleep-seconds "$ZETTA_WORKER_IDLE_SECONDS"
+    ;;
+  api)
+    exec "$ZETTA_PYTHON" -m zetta.cli \
+      "${COMMON_ARGS[@]}" \
+      api serve --host 0.0.0.0 --port 8088
+    ;;
+  ws-market)
+    exec "$ZETTA_PYTHON" -m zetta.cli \
+      "${COMMON_ARGS[@]}" \
+      collect ws-market \
+        --active-only \
+        --limit "$ZETTA_WS_TOKEN_LIMIT" \
+        --max-messages "$ZETTA_WS_MAX_MESSAGES" \
+        --max-seconds "$ZETTA_WS_MAX_SECONDS"
+    ;;
+  load)
+    "$ZETTA_PYTHON" -m zetta.cli "${COMMON_ARGS[@]}" load gamma-raw --batch-size "$ZETTA_LOADER_BATCH_SIZE"
+    "$ZETTA_PYTHON" -m zetta.cli "${COMMON_ARGS[@]}" load data-trades --batch-size "$ZETTA_LOADER_BATCH_SIZE"
+    "$ZETTA_PYTHON" -m zetta.cli "${COMMON_ARGS[@]}" load clob-price-history --batch-size "$ZETTA_LOADER_BATCH_SIZE"
+    "$ZETTA_PYTHON" -m zetta.cli "${COMMON_ARGS[@]}" load clob-books --batch-size "$ZETTA_LOADER_BATCH_SIZE"
+    "$ZETTA_PYTHON" -m zetta.cli "${COMMON_ARGS[@]}" load clob-ws-market-books --batch-size "$ZETTA_LOADER_BATCH_SIZE"
+    "$ZETTA_PYTHON" -m zetta.cli "${COMMON_ARGS[@]}" load chain-logs --batch-size "$ZETTA_LOADER_BATCH_SIZE"
+    "$ZETTA_PYTHON" -m zetta.cli "${COMMON_ARGS[@]}" load exchange-fills --batch-size "$ZETTA_LOADER_BATCH_SIZE"
+    "$ZETTA_PYTHON" -m zetta.cli "${COMMON_ARGS[@]}" load orders-matched --batch-size "$ZETTA_LOADER_BATCH_SIZE"
+    "$ZETTA_PYTHON" -m zetta.cli "${COMMON_ARGS[@]}" load fees-charged --batch-size "$ZETTA_LOADER_BATCH_SIZE"
+    "$ZETTA_PYTHON" -m zetta.cli "${COMMON_ARGS[@]}" load balance-movements --batch-size "$ZETTA_LOADER_BATCH_SIZE"
+    "$ZETTA_PYTHON" -m zetta.cli "${COMMON_ARGS[@]}" load lifecycle-events --batch-size "$ZETTA_LOADER_BATCH_SIZE"
+    ;;
+  marts)
+    "$ZETTA_PYTHON" -m zetta.cli "${COMMON_ARGS[@]}" build market-1m
+    "$ZETTA_PYTHON" -m zetta.cli "${COMMON_ARGS[@]}" build trader-profiles
+    "$ZETTA_PYTHON" -m zetta.cli "${COMMON_ARGS[@]}" build trader-chain-pnl
+    "$ZETTA_PYTHON" -m zetta.cli "${COMMON_ARGS[@]}" build trade-reconciliation
+    "$ZETTA_PYTHON" -m zetta.cli "${COMMON_ARGS[@]}" build settlement-audit
+    "$ZETTA_PYTHON" -m zetta.cli "${COMMON_ARGS[@]}" build alerts --since-hours 24
+    "$ZETTA_PYTHON" -m zetta.cli "${COMMON_ARGS[@]}" build collector-health
+    ;;
+  *)
+    echo "unknown mode: $MODE" >&2
+    exit 2
+    ;;
+esac
