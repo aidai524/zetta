@@ -90,6 +90,21 @@ class LocalTaskStore:
             counts[task.status] += 1
         return counts
 
+    def progress(self, *, recent_limit: int = 10) -> dict[str, Any]:
+        tasks = self.load()
+        return task_progress_from_rows(
+            [
+                {
+                    "kind": task.kind,
+                    "status": task.status,
+                    "attempts": task.attempts,
+                    "updated_at": task.updated_at,
+                }
+                for task in tasks
+            ],
+            recent_limit=recent_limit,
+        )
+
     def _mark(self, task_id: str, status: TaskStatus, error: str | None = None) -> None:
         tasks = self.load()
         for task in tasks:
@@ -208,6 +223,84 @@ class PostgresTaskStore:
                     counts[str(status)] = int(count)
         return counts
 
+    def progress(self, *, recent_limit: int = 10) -> dict[str, Any]:
+        psycopg, _Jsonb = import_psycopg()
+
+        with psycopg.connect(self.dsn) as conn:
+            with conn.cursor() as cursor:
+                cursor.execute(
+                    """
+                    select task_type, status, attempts, updated_at
+                    from collector_tasks
+                    """
+                )
+                task_rows = [
+                    {
+                        "kind": str(kind),
+                        "status": str(status),
+                        "attempts": int(attempts or 0),
+                        "updated_at": updated_at.isoformat()
+                        if hasattr(updated_at, "isoformat")
+                        else str(updated_at),
+                    }
+                    for kind, status, attempts, updated_at in cursor.fetchall()
+                ]
+
+                cursor.execute(
+                    """
+                    select
+                      r.task_id,
+                      coalesce(t.task_type, '') as task_type,
+                      r.node_id,
+                      r.started_at,
+                      r.finished_at,
+                      r.status,
+                      r.pages,
+                      r.items,
+                      extract(epoch from (coalesce(r.finished_at, now()) - r.started_at)),
+                      r.error
+                    from collector_runs as r
+                    left join collector_tasks as t on t.id = r.task_id
+                    order by r.started_at desc
+                    limit %s
+                    """,
+                    (recent_limit,),
+                )
+                recent_runs = [
+                    {
+                        "task_id": str(task_id),
+                        "kind": str(kind),
+                        "node_id": str(node_id),
+                        "started_at": started_at.isoformat()
+                        if hasattr(started_at, "isoformat")
+                        else str(started_at),
+                        "finished_at": finished_at.isoformat()
+                        if hasattr(finished_at, "isoformat")
+                        else None,
+                        "status": str(status),
+                        "pages": int(pages or 0),
+                        "items": int(items or 0),
+                        "duration_seconds": round(float(duration_seconds or 0), 3),
+                        "error": str(error) if error else None,
+                    }
+                    for (
+                        task_id,
+                        kind,
+                        node_id,
+                        started_at,
+                        finished_at,
+                        status,
+                        pages,
+                        items,
+                        duration_seconds,
+                        error,
+                    ) in cursor.fetchall()
+                ]
+
+        progress = task_progress_from_rows(task_rows, recent_limit=recent_limit)
+        progress["recent_runs"] = recent_runs
+        return progress
+
     def _mark(self, task_id: str, status: TaskStatus, error: str | None = None) -> None:
         psycopg, _Jsonb = import_psycopg()
 
@@ -300,6 +393,60 @@ class LocalRunStore:
 
 def _stable_json(value: Any) -> str:
     return json.dumps(value, sort_keys=True, separators=(",", ":"))
+
+
+def task_progress_from_rows(
+    rows: list[dict[str, Any]],
+    *,
+    recent_limit: int = 10,
+) -> dict[str, Any]:
+    summary = {"pending": 0, "running": 0, "done": 0, "failed": 0, "dead_lettered": 0}
+    by_kind: dict[str, dict[str, Any]] = {}
+    for row in rows:
+        status = str(row["status"])
+        kind = str(row["kind"])
+        if status in summary:
+            summary[status] += 1
+        kind_counts = by_kind.setdefault(
+            kind,
+            {
+                "pending": 0,
+                "running": 0,
+                "done": 0,
+                "failed": 0,
+                "dead_lettered": 0,
+                "total": 0,
+                "done_percent": 0.0,
+            },
+        )
+        if status in summary:
+            kind_counts[status] += 1
+        kind_counts["total"] += 1
+
+    total = sum(summary.values())
+    completed = summary["done"] + summary["dead_lettered"]
+    for counts in by_kind.values():
+        kind_total = int(counts["total"])
+        if kind_total:
+            counts["done_percent"] = round((int(counts["done"]) / kind_total) * 100, 2)
+
+    active_rows = [
+        row
+        for row in rows
+        if str(row["status"]) in {"pending", "running", "failed", "dead_lettered"}
+    ]
+    active_rows.sort(key=lambda row: str(row.get("updated_at") or ""), reverse=True)
+
+    return {
+        "summary": summary,
+        "total_tasks": total,
+        "completed_tasks": completed,
+        "done_percent": round((summary["done"] / total) * 100, 2) if total else 0.0,
+        "closed_percent": round((completed / total) * 100, 2) if total else 0.0,
+        "by_kind": dict(sorted(by_kind.items())),
+        "active": active_rows[:recent_limit],
+        "recent_runs": [],
+    }
 
 
 def task_source_entity(kind: str) -> tuple[str, str]:

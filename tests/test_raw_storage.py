@@ -22,4 +22,4 @@ def test_raw_jsonl_writer_writes_partitioned_gzip(tmp_path) -> None:
     assert record["source"] == "gamma"
     assert record["entity"] == "events"
     assert record["payload"] == {"data": [{"id": "1"}]}
-
+    assert not list(tmp_path.rglob("*.tmp"))

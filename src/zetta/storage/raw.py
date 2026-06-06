@@ -33,8 +33,9 @@ class RawJsonlWriter:
             request_url=request_url,
             payload=payload,
         )
-        with gzip.open(output_path, "at", encoding="utf-8") as handle:
+        tmp_path = output_path.with_suffix(output_path.suffix + ".tmp")
+        with gzip.open(tmp_path, "wt", encoding="utf-8") as handle:
             handle.write(json.dumps(asdict(record), ensure_ascii=False, separators=(",", ":")))
             handle.write("\n")
+        tmp_path.replace(output_path)
         return output_path
-

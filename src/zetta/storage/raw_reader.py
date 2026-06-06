@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import gzip
 import json
+import zlib
 from collections.abc import Iterator
 from pathlib import Path
 from typing import Any
@@ -15,10 +16,12 @@ def iter_raw_records(root: Path, *, source: str | None = None, entity: str | Non
             continue
         if entity and f"entity={entity}" not in path_text:
             continue
-        with gzip.open(path, "rt", encoding="utf-8") as handle:
-            for line in handle:
-                if line.strip():
-                    record = json.loads(line)
-                    record["_raw_path"] = str(path)
-                    yield record
-
+        try:
+            with gzip.open(path, "rt", encoding="utf-8") as handle:
+                for line in handle:
+                    if line.strip():
+                        record = json.loads(line)
+                        record["_raw_path"] = str(path)
+                        yield record
+        except (EOFError, OSError, zlib.error) as exc:
+            raise RuntimeError(f"Failed to read raw gzip file {path}: {exc}") from exc

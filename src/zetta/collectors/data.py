@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 
+from zetta.http import HttpClientError
 from zetta.polymarket import PolymarketClient
 from zetta.storage.raw import RawJsonlWriter
 from zetta.storage.state import LocalStateStore
@@ -57,13 +58,18 @@ class DataCollector:
         total_trades = 0
 
         while max_pages == 0 or pages < max_pages:
-            page = self.client.data_trades(
-                limit=page_limit,
-                offset=offset,
-                user=user,
-                market=market,
-                event_id=event_id,
-            )
+            try:
+                page = self.client.data_trades(
+                    limit=page_limit,
+                    offset=offset,
+                    user=user,
+                    market=market,
+                    event_id=event_id,
+                )
+            except HttpClientError as exc:
+                if is_data_api_offset_limit(exc):
+                    break
+                raise
             self.raw_writer.write(
                 source="data",
                 entity="trades",
@@ -151,3 +157,8 @@ class DataCollector:
             payload=page.response.body,
         )
         return DataCollectionResult("open_interest", 1, len(page.items))
+
+
+def is_data_api_offset_limit(exc: HttpClientError) -> bool:
+    message = str(exc)
+    return "failed with 400" in message and "max historical activity offset" in message

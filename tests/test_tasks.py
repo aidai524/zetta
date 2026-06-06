@@ -37,6 +37,35 @@ def test_task_source_entity_maps_known_task_kinds() -> None:
     assert task_source_entity("chain-logs") == ("polygon", "logs")
 
 
+def test_local_task_store_reports_progress(tmp_path) -> None:
+    store = LocalTaskStore(tmp_path / "tasks.json")
+    store.add_many(
+        [
+            Task(kind="gamma-events", params={"page_limit": 100}),
+            Task(kind="trades", params={"market": "condition-1"}),
+            Task(kind="trades", params={"market": "condition-2"}),
+        ]
+    )
+    claimed = store.claim_next()
+    assert claimed is not None
+    store.complete(claimed.id)
+
+    progress = store.progress()
+
+    assert progress["total_tasks"] == 3
+    assert progress["summary"] == {
+        "dead_lettered": 0,
+        "done": 1,
+        "failed": 0,
+        "pending": 2,
+        "running": 0,
+    }
+    assert progress["done_percent"] == 33.33
+    assert progress["by_kind"]["gamma-events"]["done"] == 1
+    assert progress["by_kind"]["trades"]["pending"] == 2
+    assert len(progress["active"]) == 2
+
+
 def test_row_to_task_normalizes_postgres_row() -> None:
     now = datetime(2026, 1, 1, tzinfo=UTC)
     task = row_to_task((123, "gamma-events", {"page_limit": 100}, "running", 2, now, now, None, 7))

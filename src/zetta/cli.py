@@ -269,6 +269,10 @@ def build_parser() -> argparse.ArgumentParser:
     status = task_subparsers.add_parser("status", help="Print task status counts.")
     status.set_defaults(func=cmd_tasks_status)
 
+    progress = task_subparsers.add_parser("progress", help="Print task progress details.")
+    progress.add_argument("--recent-limit", type=int, default=10)
+    progress.set_defaults(func=cmd_tasks_progress)
+
     run_once = task_subparsers.add_parser("run-once", help="Claim and run one pending task.")
     run_once.set_defaults(func=cmd_tasks_run_once)
 
@@ -872,6 +876,16 @@ def cmd_tasks_seed_history(args: argparse.Namespace, app_settings: Settings) -> 
 def cmd_tasks_status(args: argparse.Namespace, app_settings: Settings) -> Any:
     store = task_store_for_args(args, app_settings)
     return {"summary": store.summary(), "task_store": args.task_store}
+
+
+def cmd_tasks_progress(args: argparse.Namespace, app_settings: Settings) -> Any:
+    store = task_store_for_args(args, app_settings)
+    if not hasattr(store, "progress"):
+        raise ValueError(f"{args.task_store} task store does not support progress")
+    return {
+        **store.progress(recent_limit=args.recent_limit),
+        "task_store": args.task_store,
+    }
 
 
 def cmd_tasks_run_once(args: argparse.Namespace, app_settings: Settings) -> Any:
