@@ -308,11 +308,32 @@ PYTHONPATH=src python -m zetta.cli api serve --host 127.0.0.1 --port 8088
 
 Endpoints:
 
+- `GET /stats/overview`
+- `GET /stats/ingestion`
+- `GET /tasks/progress?recent_limit=10`
 - `GET /markets/search?q=<text>&limit=25`
+- `GET /markets/detail?market_id=<market_id>`
+- `GET /markets/trades?market_id=<market_id>&limit=50`
 - `GET /events/timeline?event_id=<event_id>&limit=100`
 - `GET /traders/profile?user=<wallet>`
 - `GET /markets/liquidity?token_id=<token_id>&limit=25`
 - `GET /alerts?type=<alert_type>&token_id=<token_id>&limit=50`
+
+## Internal Web Dashboard
+
+The internal frontend lives in `apps/web`. It is a Vite/React app for collection
+progress, market search/detail inspection, trader profile lookup, and operational
+task visibility.
+
+```bash
+cd apps/web
+npm install
+npm run build
+```
+
+Production deployment serves the static build from `/var/www/zetta` behind nginx.
+The app uses same-origin `/api` by default, and the nginx site proxies that path to
+the local product API.
 
 ## Network Diagnostics
 

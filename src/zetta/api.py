@@ -8,6 +8,7 @@ from typing import Any
 from urllib.parse import parse_qs, urlparse
 
 from zetta.config import Settings
+from zetta.scheduler.tasks import PostgresTaskStore
 from zetta.storage.clickhouse import ClickHouseWriter
 
 
@@ -18,14 +19,28 @@ class ApiResponse:
 
 
 class ProductApi:
-    def __init__(self, *, clickhouse: ClickHouseWriter) -> None:
+    def __init__(self, *, clickhouse: ClickHouseWriter, settings: Settings | None = None) -> None:
         self.clickhouse = clickhouse
+        self.settings = settings
 
     def handle(self, path: str, query: dict[str, list[str]]) -> ApiResponse:
         if path == "/health":
             return ApiResponse(HTTPStatus.OK, {"ok": True})
+        if path == "/stats/overview":
+            return ApiResponse(HTTPStatus.OK, {"overview": self.stats_overview()})
+        if path == "/stats/ingestion":
+            return ApiResponse(HTTPStatus.OK, {"ingestion": self.stats_ingestion()})
+        if path == "/tasks/progress":
+            return ApiResponse(HTTPStatus.OK, self.tasks_progress(query))
         if path == "/markets/search":
             return ApiResponse(HTTPStatus.OK, {"markets": self.market_search(query)})
+        if path == "/markets/detail":
+            market = self.market_detail(query)
+            if market is None:
+                return ApiResponse(HTTPStatus.NOT_FOUND, {"error": "market_not_found"})
+            return ApiResponse(HTTPStatus.OK, {"market": market})
+        if path == "/markets/trades":
+            return ApiResponse(HTTPStatus.OK, {"trades": self.market_trades(query)})
         if path == "/events/timeline":
             return ApiResponse(HTTPStatus.OK, {"events": self.event_timeline(query)})
         if path == "/traders/profile":
@@ -38,6 +53,47 @@ class ProductApi:
         if path == "/alerts":
             return ApiResponse(HTTPStatus.OK, {"alerts": self.alerts(query)})
         return ApiResponse(HTTPStatus.NOT_FOUND, {"error": "not_found"})
+
+    def stats_overview(self) -> dict[str, Any]:
+        sql = """
+            select
+              (select count() from dim_event final) as events,
+              (select count() from dim_market final) as markets,
+              (select count() from dim_outcome_token final) as outcome_tokens,
+              (select count() from fact_trade final) as trades,
+              (select count() from fact_price_history final) as price_points,
+              (select count() from fact_orderbook_snapshot) as orderbook_snapshots,
+              (select count() from fact_chain_log final) as chain_logs,
+              (select max(collected_at) from raw_ingest_log) as last_ingested_at
+            format JSONEachRow
+        """
+        rows = rows_json(self.clickhouse.query_text(sql))
+        return rows[0] if rows else {}
+
+    def stats_ingestion(self) -> list[dict[str, Any]]:
+        sql = """
+            select
+              source,
+              entity,
+              count() as raw_batches,
+              sum(item_count) as items,
+              max(collected_at) as last_collected_at,
+              max(raw_path) as sample_raw_path
+            from raw_ingest_log
+            group by source, entity
+            order by last_collected_at desc
+            format JSONEachRow
+        """
+        return rows_json(self.clickhouse.query_text(sql))
+
+    def tasks_progress(self, query: dict[str, list[str]]) -> dict[str, Any]:
+        if self.settings is None:
+            return {"error": "task_store_unavailable"}
+        recent_limit = int_param(query, "recent_limit", 10, maximum=100)
+        return PostgresTaskStore(
+            dsn=self.settings.postgres_dsn,
+            node_id="api",
+        ).progress(recent_limit=recent_limit)
 
     def market_search(self, query: dict[str, list[str]]) -> list[dict[str, Any]]:
         text = param(query, "q").lower()
@@ -63,6 +119,96 @@ class ProductApi:
             from dim_market final
             {where}
             order by volume desc, liquidity desc
+            limit {limit}
+            format JSONEachRow
+        """
+        return rows_json(self.clickhouse.query_text(sql))
+
+    def market_detail(self, query: dict[str, list[str]]) -> dict[str, Any] | None:
+        market_id = param(query, "market_id")
+        condition_id = param(query, "condition_id")
+        where = "where 1 = 1"
+        if market_id:
+            where += f" and market_id = {ch_string(market_id)}"
+        elif condition_id:
+            where += f" and condition_id = {ch_string(condition_id)}"
+        else:
+            return None
+        sql = f"""
+            select
+              market_id,
+              condition_id,
+              question,
+              slug,
+              event_id,
+              active,
+              closed,
+              archived,
+              accepting_orders,
+              volume,
+              liquidity,
+              start_time,
+              end_time,
+              created_at,
+              updated_at
+            from dim_market final
+            {where}
+            order by updated_at desc
+            limit 1
+            format JSONEachRow
+        """
+        rows = rows_json(self.clickhouse.query_text(sql))
+        if not rows:
+            return None
+        market = rows[0]
+        market["tokens"] = self.market_tokens(str(market.get("market_id", "")))
+        return market
+
+    def market_tokens(self, market_id: str) -> list[dict[str, Any]]:
+        if not market_id:
+            return []
+        sql = f"""
+            select
+              token_id,
+              market_id,
+              condition_id,
+              outcome,
+              outcome_index
+            from dim_outcome_token final
+            where market_id = {ch_string(market_id)}
+            order by outcome_index asc
+            format JSONEachRow
+        """
+        return rows_json(self.clickhouse.query_text(sql))
+
+    def market_trades(self, query: dict[str, list[str]]) -> list[dict[str, Any]]:
+        market_id = param(query, "market_id")
+        condition_id = param(query, "condition_id")
+        limit = int_param(query, "limit", 50, maximum=500)
+        where = "where 1 = 1"
+        if market_id:
+            where += f" and market_id = {ch_string(market_id)}"
+        elif condition_id:
+            where += f" and condition_id = {ch_string(condition_id)}"
+        else:
+            where += " and 1 = 0"
+        sql = f"""
+            select
+              trade_id,
+              transaction_hash,
+              timestamp,
+              market_id,
+              condition_id,
+              token_id,
+              user_address,
+              side,
+              price,
+              size,
+              notional,
+              source
+            from fact_trade final
+            {where}
+            order by timestamp desc
             limit {limit}
             format JSONEachRow
         """
@@ -189,12 +335,16 @@ class ProductApi:
 
 
 def serve_api(*, settings: Settings, host: str, port: int) -> None:
-    api = ProductApi(clickhouse=ClickHouseWriter(settings))
+    api = ProductApi(clickhouse=ClickHouseWriter(settings), settings=settings)
 
     class Handler(BaseHTTPRequestHandler):
         def do_GET(self) -> None:
             parsed = urlparse(self.path)
-            response = api.handle(parsed.path, parse_qs(parsed.query))
+            try:
+                response = api.handle(parsed.path, parse_qs(parsed.query))
+            except Exception as exc:
+                print(f"api request failed path={parsed.path}: {exc}", flush=True)
+                response = ApiResponse(HTTPStatus.INTERNAL_SERVER_ERROR, {"error": "internal_error"})
             encoded = json.dumps(response.body, ensure_ascii=False, default=str).encode("utf-8")
             self.send_response(int(response.status))
             self.send_header("Content-Type", "application/json; charset=utf-8")

@@ -9,4 +9,6 @@ data/
 logs/
 .env
 .DS_Store
-
+*.tsbuildinfo
+apps/web/node_modules/
+apps/web/dist/

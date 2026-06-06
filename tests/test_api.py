@@ -2,12 +2,15 @@ from zetta.api import ProductApi, ch_string, int_param, rows_json
 
 
 class FakeClickHouse:
-    def __init__(self, output="") -> None:
+    def __init__(self, output="", outputs=None) -> None:
         self.output = output
+        self.outputs = list(outputs or [])
         self.queries = []
 
     def query_text(self, query):
         self.queries.append(query)
+        if self.outputs:
+            return self.outputs.pop(0)
         return self.output
 
 
@@ -52,3 +55,43 @@ def test_product_api_alerts_and_liquidity_routes() -> None:
     assert liquidity.status == 200
     assert "alerts" in alerts.body
     assert "liquidity" in liquidity.body
+
+
+def test_product_api_stats_overview_returns_first_row() -> None:
+    fake = FakeClickHouse('{"events":10,"markets":20}\n')
+    api = ProductApi(clickhouse=fake)
+
+    response = api.handle("/stats/overview", {})
+
+    assert response.status == 200
+    assert response.body == {"overview": {"events": 10, "markets": 20}}
+
+
+def test_product_api_market_detail_includes_tokens() -> None:
+    fake = FakeClickHouse(
+        outputs=[
+            '{"market_id":"m1","condition_id":"c1","question":"Q?"}\n',
+            '{"token_id":"t1","market_id":"m1","condition_id":"c1","outcome":"Yes","outcome_index":0}\n',
+        ],
+    )
+    api = ProductApi(clickhouse=fake)
+
+    response = api.handle("/markets/detail", {"market_id": ["m1"]})
+
+    assert response.status == 200
+    assert response.body["market"]["market_id"] == "m1"
+    assert response.body["market"]["tokens"] == [
+        {"token_id": "t1", "market_id": "m1", "condition_id": "c1", "outcome": "Yes", "outcome_index": 0}
+    ]
+    assert "from dim_outcome_token final" in fake.queries[1]
+
+
+def test_product_api_market_trades_requires_market_or_condition() -> None:
+    fake = FakeClickHouse("")
+    api = ProductApi(clickhouse=fake)
+
+    response = api.handle("/markets/trades", {"limit": ["5"]})
+
+    assert response.status == 200
+    assert "and 1 = 0" in fake.queries[0]
+    assert response.body == {"trades": []}
