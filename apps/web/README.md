@@ -11,11 +11,20 @@ npm run dev
 ```
 
 By default the app calls `/api`, which matches the nginx production deployment. For
-local development against the public API domain:
+local development, Vite proxies `/api` to `http://127.0.0.1:8088`. To use a different
+API target, create `apps/web/.env.local`:
+
+```dotenv
+ZETTA_API_PROXY_TARGET=https://api-zetta.prophet.zone
+```
+
+Then run:
 
 ```bash
-VITE_ZETTA_API_BASE=https://api-zetta.prophet.zone npm run dev
+npm run dev
 ```
+
+Production builds still use same-origin `/api`; the server nginx config owns that proxy.
 
 ## Production Build
 

@@ -8,6 +8,9 @@ venv/
 data/
 logs/
 .env
+.env.local
+apps/web/.env
+apps/web/.env.local
 .DS_Store
 *.tsbuildinfo
 apps/web/node_modules/

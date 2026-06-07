@@ -27,6 +27,7 @@ import {
 import "./styles.css";
 
 const API_BASE = import.meta.env.VITE_ZETTA_API_BASE || "/api";
+const DASHBOARD_REFRESH_MS = 30_000;
 
 type Overview = {
   events?: number;
@@ -122,6 +123,10 @@ function App() {
   useEffect(() => {
     void refreshDashboard();
     void searchMarkets("election");
+    const timer = window.setInterval(() => {
+      void refreshDashboard();
+    }, DASHBOARD_REFRESH_MS);
+    return () => window.clearInterval(timer);
   }, []);
 
   async function getJson<T>(path: string): Promise<T> {
