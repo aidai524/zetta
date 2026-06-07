@@ -133,7 +133,7 @@ type Progress = {
   }>;
 };
 
-type View = "dashboard" | "markets" | "traders" | "operations";
+type View = "dashboard" | "hardware" | "markets" | "traders" | "operations";
 
 function App() {
   const [view, setView] = useState<View>("dashboard");
@@ -250,6 +250,7 @@ function App() {
         </div>
         <nav>
           <NavButton active={view === "dashboard"} icon={<BarChart3 size={18} />} label="Dashboard" onClick={() => setView("dashboard")} />
+          <NavButton active={view === "hardware"} icon={<Cpu size={18} />} label="Hardware" onClick={() => setView("hardware")} />
           <NavButton active={view === "markets"} icon={<Table2 size={18} />} label="Markets" onClick={() => setView("markets")} />
           <NavButton active={view === "traders"} icon={<UserRound size={18} />} label="Traders" onClick={() => setView("traders")} />
           <NavButton active={view === "operations"} icon={<Server size={18} />} label="Operations" onClick={() => setView("operations")} />
@@ -273,6 +274,8 @@ function App() {
           <Dashboard overview={overview} ingestion={ingestion} progress={progress} progressRows={progressRows} system={system} />
         ) : null}
 
+        {view === "hardware" ? <Hardware system={system} /> : null}
+
         {view === "markets" ? (
           <Markets
             query={query}
@@ -293,6 +296,52 @@ function App() {
         {view === "operations" ? <Operations progress={progress} progressRows={progressRows} ingestion={ingestion} system={system} /> : null}
       </main>
     </div>
+  );
+}
+
+function Hardware({ system }: { system: SystemStats | null }) {
+  return (
+    <section className="gridPage">
+      <SystemPressure system={system} wide />
+
+      <div className="panel">
+        <PanelTitle icon={<Cpu size={18} />} title="CPU" />
+        <table>
+          <tbody>
+            <tr><td>Usage</td><td className="num">{formatPercent(system?.cpu?.percent)}</td></tr>
+            <tr><td>Cores</td><td className="num">{formatMetric(system?.cpu?.count)}</td></tr>
+            <tr><td>Load 1m</td><td className="num">{formatMetric(system?.cpu?.load_avg_1m)}</td></tr>
+            <tr><td>Load 5m</td><td className="num">{formatMetric(system?.cpu?.load_avg_5m)}</td></tr>
+            <tr><td>Load 15m</td><td className="num">{formatMetric(system?.cpu?.load_avg_15m)}</td></tr>
+          </tbody>
+        </table>
+      </div>
+
+      <div className="panel">
+        <PanelTitle icon={<MemoryStick size={18} />} title="Memory" />
+        <table>
+          <tbody>
+            <tr><td>Usage</td><td className="num">{formatPercent(system?.memory?.percent)}</td></tr>
+            <tr><td>Used</td><td className="num">{formatBytes(system?.memory?.used_bytes)}</td></tr>
+            <tr><td>Available</td><td className="num">{formatBytes(system?.memory?.available_bytes)}</td></tr>
+            <tr><td>Total</td><td className="num">{formatBytes(system?.memory?.total_bytes)}</td></tr>
+          </tbody>
+        </table>
+      </div>
+
+      <div className="panel wide">
+        <PanelTitle icon={<HardDrive size={18} />} title="Disk" />
+        <table>
+          <tbody>
+            <tr><td>Path</td><td className="num">{system?.disk?.path || "/"}</td></tr>
+            <tr><td>Usage</td><td className="num">{formatPercent(system?.disk?.percent)}</td></tr>
+            <tr><td>Used</td><td className="num">{formatBytes(system?.disk?.used_bytes)}</td></tr>
+            <tr><td>Free</td><td className="num">{formatBytes(system?.disk?.free_bytes)}</td></tr>
+            <tr><td>Total</td><td className="num">{formatBytes(system?.disk?.total_bytes)}</td></tr>
+          </tbody>
+        </table>
+      </div>
+    </section>
   );
 }
 
@@ -596,7 +645,7 @@ function Operations({
 function SystemPressure({ system, wide = false }: { system: SystemStats | null; wide?: boolean }) {
   return (
     <div className={wide ? "panel wide" : "panel"}>
-      <PanelTitle icon={<Server size={18} />} title="System Pressure" />
+      <PanelTitle icon={<Server size={18} />} title="Hardware Status" />
       <div className="resourceGrid">
         <ResourceMeter
           icon={<Cpu size={18} />}
@@ -672,6 +721,7 @@ function PanelTitle({ icon, title }: { icon: React.ReactNode; title: string }) {
 function viewTitle(view: View) {
   return {
     dashboard: "Internal Overview",
+    hardware: "Hardware Status",
     markets: "Market Explorer",
     traders: "Trader Profiles",
     operations: "Collection Operations",
@@ -681,6 +731,12 @@ function viewTitle(view: View) {
 function formatNumber(value: unknown) {
   const number = Number(value || 0);
   return new Intl.NumberFormat("en-US", { maximumFractionDigits: 2 }).format(number);
+}
+
+function formatMetric(value: unknown) {
+  const number = Number(value);
+  if (!Number.isFinite(number)) return "--";
+  return formatNumber(number);
 }
 
 function formatCurrency(value: unknown) {
