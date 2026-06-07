@@ -1,4 +1,4 @@
-from zetta.api import ProductApi, ch_string, int_param, rows_json
+from zetta.api import ProductApi, ch_string, collect_system_stats, int_param, rows_json
 
 
 class FakeClickHouse:
@@ -65,6 +65,28 @@ def test_product_api_stats_overview_returns_first_row() -> None:
 
     assert response.status == 200
     assert response.body == {"overview": {"events": 10, "markets": 20}}
+
+
+def test_product_api_system_stats_route_does_not_query_clickhouse() -> None:
+    fake = FakeClickHouse("")
+    api = ProductApi(clickhouse=fake)
+
+    response = api.handle("/stats/system", {})
+
+    assert response.status == 200
+    assert response.body["system"]["cpu"]["count"] >= 1
+    assert response.body["system"]["memory"]["total_bytes"] >= 0
+    assert response.body["system"]["disk"]["total_bytes"] > 0
+    assert fake.queries == []
+
+
+def test_collect_system_stats_has_dashboard_fields() -> None:
+    stats = collect_system_stats()
+
+    assert {"collected_at", "cpu", "memory", "disk", "uptime_seconds"} <= stats.keys()
+    assert "percent" in stats["cpu"]
+    assert "percent" in stats["memory"]
+    assert "percent" in stats["disk"]
 
 
 def test_product_api_market_detail_includes_tokens() -> None:

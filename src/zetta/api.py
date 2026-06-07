@@ -1,7 +1,11 @@
 from __future__ import annotations
 
 import json
+import os
+import shutil
+import time
 from dataclasses import dataclass
+from datetime import UTC, datetime
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import Any
@@ -30,6 +34,8 @@ class ProductApi:
             return ApiResponse(HTTPStatus.OK, {"overview": self.stats_overview()})
         if path == "/stats/ingestion":
             return ApiResponse(HTTPStatus.OK, {"ingestion": self.stats_ingestion()})
+        if path == "/stats/system":
+            return ApiResponse(HTTPStatus.OK, {"system": collect_system_stats()})
         if path == "/tasks/progress":
             return ApiResponse(HTTPStatus.OK, self.tasks_progress(query))
         if path == "/markets/search":
@@ -360,6 +366,129 @@ def serve_api(*, settings: Settings, host: str, port: int) -> None:
 
 def rows_json(text: str) -> list[dict[str, Any]]:
     return [json.loads(line) for line in text.splitlines() if line.strip()]
+
+
+def collect_system_stats() -> dict[str, Any]:
+    return {
+        "collected_at": datetime.now(UTC).isoformat(),
+        "cpu": cpu_stats(),
+        "memory": memory_stats(),
+        "disk": disk_stats("/"),
+        "uptime_seconds": read_uptime_seconds(),
+    }
+
+
+def cpu_stats(interval_seconds: float = 0.1) -> dict[str, Any]:
+    cpu_count = os.cpu_count() or 1
+    load_avg = read_load_avg()
+    percent = read_cpu_percent(interval_seconds)
+    return {
+        "percent": percent,
+        "count": cpu_count,
+        "load_avg_1m": load_avg[0] if load_avg else None,
+        "load_avg_5m": load_avg[1] if load_avg else None,
+        "load_avg_15m": load_avg[2] if load_avg else None,
+        "load_per_cpu_percent": ratio_percent(load_avg[0], cpu_count) if load_avg else None,
+    }
+
+
+def read_cpu_percent(interval_seconds: float) -> float | None:
+    first = read_proc_cpu_times()
+    if first is None:
+        return None
+    time.sleep(interval_seconds)
+    second = read_proc_cpu_times()
+    if second is None:
+        return None
+    busy_delta = second[0] - first[0]
+    total_delta = second[1] - first[1]
+    if total_delta <= 0:
+        return None
+    return ratio_percent(busy_delta, total_delta)
+
+
+def read_proc_cpu_times() -> tuple[int, int] | None:
+    try:
+        with open("/proc/stat", encoding="utf-8") as proc_stat:
+            line = proc_stat.readline()
+    except OSError:
+        return None
+    parts = line.split()
+    if not parts or parts[0] != "cpu":
+        return None
+    try:
+        values = [int(value) for value in parts[1:]]
+    except ValueError:
+        return None
+    if len(values) < 4:
+        return None
+    idle_all = values[3] + (values[4] if len(values) > 4 else 0)
+    total = sum(values)
+    busy = total - idle_all
+    return busy, total
+
+
+def read_load_avg() -> tuple[float, float, float] | None:
+    try:
+        return os.getloadavg()
+    except (AttributeError, OSError):
+        return None
+
+
+def memory_stats() -> dict[str, Any]:
+    meminfo = read_meminfo()
+    total = meminfo.get("MemTotal", 0) * 1024
+    available = meminfo.get("MemAvailable", meminfo.get("MemFree", 0)) * 1024
+    used = max(total - available, 0) if total else 0
+    return {
+        "total_bytes": total,
+        "used_bytes": used,
+        "available_bytes": available,
+        "percent": ratio_percent(used, total),
+    }
+
+
+def read_meminfo() -> dict[str, int]:
+    values: dict[str, int] = {}
+    try:
+        with open("/proc/meminfo", encoding="utf-8") as meminfo:
+            for line in meminfo:
+                key, _, rest = line.partition(":")
+                first = rest.strip().split(" ", 1)[0]
+                if first:
+                    values[key] = int(first)
+    except (OSError, ValueError):
+        return {}
+    return values
+
+
+def disk_stats(path: str) -> dict[str, Any]:
+    usage = shutil.disk_usage(path)
+    return {
+        "path": path,
+        "total_bytes": usage.total,
+        "used_bytes": usage.used,
+        "free_bytes": usage.free,
+        "percent": ratio_percent(usage.used, usage.total),
+    }
+
+
+def read_uptime_seconds() -> float | None:
+    try:
+        with open("/proc/uptime", encoding="utf-8") as uptime:
+            raw_seconds = uptime.read().split()[0]
+    except (OSError, IndexError):
+        return None
+    try:
+        return round(float(raw_seconds), 2)
+    except ValueError:
+        return None
+
+
+def ratio_percent(value: float, total: float) -> float:
+    if total <= 0:
+        return 0.0
+    return round((value / total) * 100, 2)
 
 
 def param(query: dict[str, list[str]], key: str, default: str = "") -> str:

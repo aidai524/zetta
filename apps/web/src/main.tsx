@@ -4,9 +4,12 @@ import {
   Activity,
   AlertTriangle,
   BarChart3,
+  Cpu,
   Database,
+  HardDrive,
   LineChart,
   Loader2,
+  MemoryStick,
   Search,
   Server,
   Table2,
@@ -46,6 +49,32 @@ type IngestionRow = {
   raw_batches: number;
   items: number;
   last_collected_at: string;
+};
+
+type SystemStats = {
+  collected_at?: string;
+  uptime_seconds?: number | null;
+  cpu?: {
+    percent?: number | null;
+    count?: number | null;
+    load_avg_1m?: number | null;
+    load_avg_5m?: number | null;
+    load_avg_15m?: number | null;
+    load_per_cpu_percent?: number | null;
+  };
+  memory?: {
+    total_bytes?: number;
+    used_bytes?: number;
+    available_bytes?: number;
+    percent?: number;
+  };
+  disk?: {
+    path?: string;
+    total_bytes?: number;
+    used_bytes?: number;
+    free_bytes?: number;
+    percent?: number;
+  };
 };
 
 type Market = {
@@ -111,6 +140,7 @@ function App() {
   const [overview, setOverview] = useState<Overview>({});
   const [ingestion, setIngestion] = useState<IngestionRow[]>([]);
   const [progress, setProgress] = useState<Progress | null>(null);
+  const [system, setSystem] = useState<SystemStats | null>(null);
   const [markets, setMarkets] = useState<Market[]>([]);
   const [selectedMarket, setSelectedMarket] = useState<Market | null>(null);
   const [marketTrades, setMarketTrades] = useState<Trade[]>([]);
@@ -140,14 +170,16 @@ function App() {
   async function refreshDashboard() {
     setError("");
     try {
-      const [overviewData, ingestionData, progressData] = await Promise.all([
+      const [overviewData, ingestionData, progressData, systemData] = await Promise.all([
         getJson<{ overview: Overview }>("/stats/overview"),
         getJson<{ ingestion: IngestionRow[] }>("/stats/ingestion"),
         getJson<Progress>("/tasks/progress?recent_limit=8"),
+        getJson<{ system: SystemStats }>("/stats/system"),
       ]);
       setOverview(overviewData.overview || {});
       setIngestion(ingestionData.ingestion || []);
       setProgress(progressData);
+      setSystem(systemData.system || null);
     } catch (exc) {
       setError(errorMessage(exc));
     }
@@ -238,7 +270,7 @@ function App() {
         {error ? <div className="notice"><AlertTriangle size={16} />{error}</div> : null}
 
         {view === "dashboard" ? (
-          <Dashboard overview={overview} ingestion={ingestion} progress={progress} progressRows={progressRows} />
+          <Dashboard overview={overview} ingestion={ingestion} progress={progress} progressRows={progressRows} system={system} />
         ) : null}
 
         {view === "markets" ? (
@@ -258,7 +290,7 @@ function App() {
           <Traders wallet={wallet} setWallet={setWallet} profile={profile} loading={loading} onLoad={loadTrader} />
         ) : null}
 
-        {view === "operations" ? <Operations progress={progress} progressRows={progressRows} ingestion={ingestion} /> : null}
+        {view === "operations" ? <Operations progress={progress} progressRows={progressRows} ingestion={ingestion} system={system} /> : null}
       </main>
     </div>
   );
@@ -269,11 +301,13 @@ function Dashboard({
   ingestion,
   progress,
   progressRows,
+  system,
 }: {
   overview: Overview;
   ingestion: IngestionRow[];
   progress: Progress | null;
   progressRows: Array<{ kind: string; total: number; done: number; running: number; dead_lettered: number }>;
+  system: SystemStats | null;
 }) {
   const statCards = [
     ["Events", overview.events],
@@ -293,6 +327,8 @@ function Dashboard({
           </div>
         ))}
       </div>
+
+      <SystemPressure system={system} />
 
       <div className="panel wide">
         <PanelTitle icon={<LineChart size={18} />} title="Backfill Progress" />
@@ -482,13 +518,17 @@ function Operations({
   progress,
   progressRows,
   ingestion,
+  system,
 }: {
   progress: Progress | null;
   progressRows: Array<{ kind: string; total: number; pending: number; running: number; done: number; dead_lettered: number; done_percent: number }>;
   ingestion: IngestionRow[];
+  system: SystemStats | null;
 }) {
   return (
     <section className="gridPage">
+      <SystemPressure system={system} wide />
+
       <div className="panel wide">
         <PanelTitle icon={<Server size={18} />} title="Task Queue" />
         <table>
@@ -553,6 +593,69 @@ function Operations({
   );
 }
 
+function SystemPressure({ system, wide = false }: { system: SystemStats | null; wide?: boolean }) {
+  return (
+    <div className={wide ? "panel wide" : "panel"}>
+      <PanelTitle icon={<Server size={18} />} title="System Pressure" />
+      <div className="resourceGrid">
+        <ResourceMeter
+          icon={<Cpu size={18} />}
+          label="CPU"
+          percent={system?.cpu?.percent}
+          value={formatPercent(system?.cpu?.percent)}
+          detail={`${formatCores(system?.cpu?.count)} / load ${formatLoad(system)}`}
+        />
+        <ResourceMeter
+          icon={<MemoryStick size={18} />}
+          label="Memory"
+          percent={system?.memory?.percent}
+          value={formatPercent(system?.memory?.percent)}
+          detail={`${formatBytes(system?.memory?.used_bytes)} / ${formatBytes(system?.memory?.total_bytes)}`}
+        />
+        <ResourceMeter
+          icon={<HardDrive size={18} />}
+          label="Disk /"
+          percent={system?.disk?.percent}
+          value={formatPercent(system?.disk?.percent)}
+          detail={`${formatBytes(system?.disk?.used_bytes)} / ${formatBytes(system?.disk?.total_bytes)}`}
+        />
+      </div>
+      <div className="resourceMeta">
+        <span>Uptime {formatDuration(system?.uptime_seconds)}</span>
+        <span>{formatDate(system?.collected_at)}</span>
+      </div>
+    </div>
+  );
+}
+
+function ResourceMeter({
+  icon,
+  label,
+  percent,
+  value,
+  detail,
+}: {
+  icon: React.ReactNode;
+  label: string;
+  percent: unknown;
+  value: string;
+  detail: string;
+}) {
+  const bounded = boundedPercent(percent);
+  return (
+    <div className="resourceItem" data-pressure={pressureTone(bounded)}>
+      <div className="resourceHead">
+        <span className="resourceLabel">{icon}{label}</span>
+        <strong>{value}</strong>
+      </div>
+      <div className="resourceTrack">
+        <div style={{ width: `${bounded}%` }} />
+      </div>
+      <div className="resourceDetail">{detail}</div>
+    </div>
+  );
+}
+
 function NavButton({ active, icon, label, onClick }: { active: boolean; icon: React.ReactNode; label: string; onClick: () => void }) {
   return (
     <button className={active ? "nav active" : "nav"} onClick={onClick}>
@@ -585,9 +688,63 @@ function formatCurrency(value: unknown) {
   return new Intl.NumberFormat("en-US", { style: "currency", currency: "USD", maximumFractionDigits: 0 }).format(number);
 }
 
+function formatPercent(value: unknown) {
+  const number = Number(value);
+  if (!Number.isFinite(number)) return "--";
+  return `${formatNumber(number)}%`;
+}
+
+function formatBytes(value: unknown) {
+  const bytes = Number(value);
+  if (!Number.isFinite(bytes) || bytes <= 0) return "--";
+  const units = ["B", "KB", "MB", "GB", "TB"];
+  let size = bytes;
+  let unitIndex = 0;
+  while (size >= 1024 && unitIndex < units.length - 1) {
+    size /= 1024;
+    unitIndex += 1;
+  }
+  return `${new Intl.NumberFormat("en-US", { maximumFractionDigits: size >= 100 ? 0 : 1 }).format(size)} ${units[unitIndex]}`;
+}
+
+function formatLoad(system: SystemStats | null) {
+  const loads = [system?.cpu?.load_avg_1m, system?.cpu?.load_avg_5m, system?.cpu?.load_avg_15m]
+    .filter((value): value is number => typeof value === "number" && Number.isFinite(value));
+  return loads.length ? loads.map((value) => formatNumber(value)).join(" / ") : "--";
+}
+
+function formatCores(value: unknown) {
+  const cores = Number(value);
+  if (!Number.isFinite(cores) || cores <= 0) return "-- cores";
+  return `${formatNumber(cores)} cores`;
+}
+
 function formatDate(value: string | null | undefined) {
   if (!value) return "";
   return new Date(value).toLocaleString();
+}
+
+function formatDuration(value: unknown) {
+  const seconds = Number(value);
+  if (!Number.isFinite(seconds) || seconds <= 0) return "--";
+  const days = Math.floor(seconds / 86400);
+  const hours = Math.floor((seconds % 86400) / 3600);
+  const minutes = Math.floor((seconds % 3600) / 60);
+  if (days > 0) return `${days}d ${hours}h`;
+  if (hours > 0) return `${hours}h ${minutes}m`;
+  return `${minutes}m`;
+}
+
+function boundedPercent(value: unknown) {
+  const number = Number(value);
+  if (!Number.isFinite(number)) return 0;
+  return Math.max(0, Math.min(number, 100));
+}
+
+function pressureTone(value: number) {
+  if (value >= 85) return "hot";
+  if (value >= 70) return "warm";
+  return "normal";
 }
 
 function errorMessage(exc: unknown) {
