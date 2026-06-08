@@ -73,6 +73,7 @@ systemctl daemon-reload
 systemctl enable --now zetta-worker.service
 systemctl enable --now zetta-api.service
 systemctl enable --now zetta-ws-market.service
+systemctl enable --now zetta-frontier.timer
 systemctl enable --now zetta-load.timer
 systemctl enable --now zetta-marts.timer
 
@@ -84,8 +85,9 @@ Next:
   2. Seed backfill work with:
      cd /opt/zetta
      .venv/bin/python -m zetta.cli --task-store postgres tasks seed-basic --page-limit 100 --max-pages 0
+     .venv/bin/python -m zetta.cli --task-store postgres tasks seed-frontier
      .venv/bin/python -m zetta.cli --task-store postgres tasks seed-history --active-only --chain-from-block <block> --chain-to-block <block>
   3. Watch:
-     systemctl status zetta-worker zetta-ws-market zetta-load.timer
+     systemctl status zetta-worker zetta-ws-market zetta-frontier.timer zetta-load.timer
      journalctl -u zetta-worker -f
 EOF

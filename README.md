@@ -40,6 +40,7 @@ header/SNI intact.
 
 ```bash
 PYTHONPATH=src python -m zetta.cli tasks seed-basic --page-limit 100 --max-pages 1
+PYTHONPATH=src python -m zetta.cli tasks seed-frontier --event-limit 50
 PYTHONPATH=src python -m zetta.cli tasks status
 PYTHONPATH=src python -m zetta.cli tasks run-once
 ```
@@ -48,6 +49,7 @@ Use Postgres-backed task leases for multi-worker runs:
 
 ```bash
 PYTHONPATH=src python -m zetta.cli --task-store postgres --node-id worker-a tasks seed-basic
+PYTHONPATH=src python -m zetta.cli --task-store postgres --node-id worker-a tasks seed-frontier
 PYTHONPATH=src python -m zetta.cli --task-store postgres --node-id worker-a tasks status
 PYTHONPATH=src python -m zetta.cli --task-store postgres --node-id worker-a tasks run-once
 PYTHONPATH=src python -m zetta.cli --task-store postgres --node-id worker-a tasks run-loop
@@ -58,6 +60,12 @@ dead-letter records after `max_attempts`. Run history is written to `collector_r
 for Postgres workers and to `*.runs.jsonl` for local JSON workers. The Postgres task
 store uses `psycopg`; install the project dependencies with `pip install -e .` if the
 active Python environment does not already include it.
+
+`seed-frontier` is the preferred recurring seed for usable event-level analysis while
+deep backfills are still running. It always refreshes recent Gamma event and market
+metadata first, then adds bounded high-priority trade, price-history, and book tasks for
+the most recently updated active events. This keeps individual events analyzable without
+waiting for the full historical queue to finish.
 
 Use `make test` for offline tests. The target disables globally installed pytest plugins
 so the project test run is isolated from unrelated Python packages on the host.

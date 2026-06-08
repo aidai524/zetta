@@ -58,7 +58,24 @@ cd /opt/zetta
   tasks seed-basic --page-limit 100 --max-pages 0
 ```
 
-After Gamma raw data has loaded into ClickHouse, seed deep historical work. Use
+Then keep a small frontier of recent active events complete enough for analysis while
+the full backfill runs:
+
+```bash
+.venv/bin/python -m zetta.cli \
+  --task-store postgres \
+  tasks seed-frontier \
+  --event-limit 50 \
+  --condition-limit 50 \
+  --token-limit 100
+```
+
+The `zetta-frontier.timer` runs this periodically in production. It prioritizes recent
+Gamma event/market refreshes, then bounded trade, price-history, and book tasks for those
+events, so ClickHouse receives usable event slices before the full historical queue
+finishes.
+
+After Gamma raw data has loaded into ClickHouse, also seed deep historical work. Use
 `--active-only` for the first production run, then remove it for all historical events:
 
 ```bash
@@ -98,6 +115,8 @@ For a small chain scanner smoke test, use a tiny known block range first:
 ```
 
 The task store deduplicates identical work, so the seed commands are safe to rerun.
+`seed-frontier` intentionally adds a refresh marker to its task params, so each timer run
+can enqueue a fresh bounded update for recent events.
 
 ## Runtime Model
 

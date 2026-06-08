@@ -4,6 +4,7 @@ import argparse
 import json
 import sys
 from dataclasses import asdict, is_dataclass
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
@@ -29,6 +30,15 @@ from zetta.storage.clickhouse import ClickHouseWriter
 from zetta.storage.raw import RawJsonlWriter
 from zetta.storage.redpanda import RpkPublisher
 from zetta.storage.state import LocalStateStore
+
+
+FRONTIER_GAMMA_PRIORITY = 1
+FRONTIER_TRADES_PRIORITY = 2
+FRONTIER_PRICE_HISTORY_PRIORITY = 3
+FRONTIER_BOOK_PRIORITY = 4
+DISCOVERY_PRIORITY = 50
+HISTORY_BACKFILL_PRIORITY = 100
+CHAIN_BACKFILL_PRIORITY = 150
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -246,6 +256,35 @@ def build_parser() -> argparse.ArgumentParser:
     seed.add_argument("--page-limit", type=int, default=100)
     seed.add_argument("--max-pages", type=int, default=1)
     seed.set_defaults(func=cmd_tasks_seed_basic)
+
+    seed_frontier = task_subparsers.add_parser(
+        "seed-frontier", help="Seed high-priority tasks for recent event-level analysis."
+    )
+    seed_frontier.add_argument("--event-limit", type=int, default=50)
+    seed_frontier.add_argument("--condition-limit", type=int, default=50)
+    seed_frontier.add_argument("--token-limit", type=int, default=100)
+    seed_frontier.add_argument(
+        "--active-only", action=argparse.BooleanOptionalAction, default=True
+    )
+    seed_frontier.add_argument(
+        "--include-trades", action=argparse.BooleanOptionalAction, default=True
+    )
+    seed_frontier.add_argument(
+        "--include-price-history", action=argparse.BooleanOptionalAction, default=True
+    )
+    seed_frontier.add_argument(
+        "--include-books", action=argparse.BooleanOptionalAction, default=True
+    )
+    seed_frontier.add_argument("--gamma-page-limit", type=int, default=100)
+    seed_frontier.add_argument("--gamma-max-pages", type=int, default=1)
+    seed_frontier.add_argument("--gamma-resume", action="store_true")
+    seed_frontier.add_argument("--gamma-sleep-seconds", type=float, default=0.0)
+    seed_frontier.add_argument("--trade-page-limit", type=int, default=500)
+    seed_frontier.add_argument("--trade-max-pages", type=int, default=1)
+    seed_frontier.add_argument("--price-interval", default="1d")
+    seed_frontier.add_argument("--price-fidelity", type=int)
+    seed_frontier.add_argument("--refresh-run", help=argparse.SUPPRESS)
+    seed_frontier.set_defaults(func=cmd_tasks_seed_frontier)
 
     seed_history = task_subparsers.add_parser(
         "seed-history", help="Seed deep historical backfill tasks from ClickHouse."
@@ -773,8 +812,80 @@ def discover_token_ids_for_history(
     ]
 
 
+def discover_frontier_work(
+    clickhouse: ClickHouseWriter,
+    *,
+    event_limit: int,
+    condition_limit: int,
+    token_limit: int,
+    active_only: bool,
+) -> tuple[list[str], list[str]]:
+    if event_limit <= 0:
+        raise ValueError("event_limit must be positive")
+    if condition_limit < 0:
+        raise ValueError("condition_limit must not be negative")
+    if token_limit < 0:
+        raise ValueError("token_limit must not be negative")
+
+    markets_where = "where event_id != '' and condition_id != ''"
+    if active_only:
+        markets_where += " and active = true and closed = false and archived = false"
+
+    condition_query = f"""
+        with selected_events as
+        (
+          select distinct event_id
+          from dim_market final
+          {markets_where}
+          order by updated_at desc, event_id
+          limit {event_limit}
+        )
+        select distinct condition_id
+        from dim_market final
+        where event_id in selected_events
+          and condition_id != ''
+        order by condition_id
+        limit {condition_limit}
+        format JSONEachRow
+    """
+    token_query = f"""
+        with selected_events as
+        (
+          select distinct event_id
+          from dim_market final
+          {markets_where}
+          order by updated_at desc, event_id
+          limit {event_limit}
+        )
+        select distinct token_id
+        from dim_outcome_token final
+        where token_id != ''
+          and market_id in
+          (
+            select market_id
+            from dim_market final
+            where event_id in selected_events
+          )
+        order by token_id
+        limit {token_limit}
+        format JSONEachRow
+    """
+    condition_ids = [
+        json.loads(line)["condition_id"]
+        for line in clickhouse.query_text(condition_query).splitlines()
+        if line.strip()
+    ]
+    token_ids = [
+        json.loads(line)["token_id"]
+        for line in clickhouse.query_text(token_query).splitlines()
+        if line.strip()
+    ]
+    return condition_ids, token_ids
+
+
 def cmd_tasks_seed_basic(args: argparse.Namespace, app_settings: Settings) -> Any:
     store = task_store_for_args(args, app_settings)
+    trade_max_pages = args.max_pages if args.max_pages > 0 else 1
     params = {
         "page_limit": args.page_limit,
         "max_pages": args.max_pages,
@@ -786,22 +897,111 @@ def cmd_tasks_seed_basic(args: argparse.Namespace, app_settings: Settings) -> An
     }
     added = store.add_many(
         [
-            Task(kind="gamma-events", params=dict(params)),
-            Task(kind="gamma-markets", params=dict(params)),
+            Task(kind="gamma-events", params=dict(params), priority=DISCOVERY_PRIORITY),
+            Task(kind="gamma-markets", params=dict(params), priority=DISCOVERY_PRIORITY),
             Task(
                 kind="trades",
                 params={
                     "page_limit": min(args.page_limit, 500),
-                    "max_pages": args.max_pages,
-                    "resume": True,
+                    "max_pages": trade_max_pages,
+                    "resume": False,
                     "user": None,
                     "market": None,
                     "event_id": None,
                 },
+                priority=DISCOVERY_PRIORITY,
             ),
         ]
     )
     return {"added": added, "summary": store.summary(), "task_store": args.task_store}
+
+
+def cmd_tasks_seed_frontier(args: argparse.Namespace, app_settings: Settings) -> Any:
+    store = task_store_for_args(args, app_settings)
+    refresh_run = args.refresh_run or datetime.now(UTC).replace(microsecond=0).isoformat()
+    gamma_params = {
+        "page_limit": args.gamma_page_limit,
+        "max_pages": args.gamma_max_pages,
+        "resume": args.gamma_resume,
+        "sleep_seconds": args.gamma_sleep_seconds,
+        "closed": None,
+        "archived": None,
+        "active": True if args.active_only else None,
+        "_refresh_run": refresh_run,
+    }
+    tasks = [
+        Task(kind="gamma-events", params=dict(gamma_params), priority=FRONTIER_GAMMA_PRIORITY),
+        Task(kind="gamma-markets", params=dict(gamma_params), priority=FRONTIER_GAMMA_PRIORITY),
+    ]
+
+    condition_ids: list[str] = []
+    token_ids: list[str] = []
+    if (
+        args.include_trades
+        or args.include_price_history
+        or args.include_books
+    ):
+        condition_ids, token_ids = discover_frontier_work(
+            ClickHouseWriter(app_settings),
+            event_limit=args.event_limit,
+            condition_limit=args.condition_limit,
+            token_limit=args.token_limit,
+            active_only=args.active_only,
+        )
+
+    if args.include_trades:
+        tasks.extend(
+            Task(
+                kind="trades",
+                params={
+                    "page_limit": args.trade_page_limit,
+                    "max_pages": args.trade_max_pages,
+                    "resume": False,
+                    "user": None,
+                    "market": condition_id,
+                    "event_id": None,
+                    "_refresh_run": refresh_run,
+                },
+                priority=FRONTIER_TRADES_PRIORITY,
+            )
+            for condition_id in condition_ids
+        )
+    if args.include_price_history:
+        tasks.extend(
+            Task(
+                kind="prices-history",
+                params={
+                    "token_id": token_id,
+                    "start_ts": None,
+                    "end_ts": None,
+                    "interval": args.price_interval,
+                    "fidelity": args.price_fidelity,
+                    "_refresh_run": refresh_run,
+                },
+                priority=FRONTIER_PRICE_HISTORY_PRIORITY,
+            )
+            for token_id in token_ids
+        )
+    if args.include_books:
+        tasks.extend(
+            Task(
+                kind="book",
+                params={"token_id": token_id, "_refresh_run": refresh_run},
+                priority=FRONTIER_BOOK_PRIORITY,
+            )
+            for token_id in token_ids
+        )
+
+    added = store.add_many(tasks)
+    return {
+        "added": added,
+        "candidate_tasks": len(tasks),
+        "condition_ids": len(condition_ids),
+        "token_ids": len(token_ids),
+        "refresh_run": refresh_run,
+        "summary": store.summary(),
+        "task_store": args.task_store,
+    }
 
 
 def cmd_tasks_seed_history(args: argparse.Namespace, app_settings: Settings) -> Any:
@@ -831,6 +1031,7 @@ def cmd_tasks_seed_history(args: argparse.Namespace, app_settings: Settings) -> 
                     "market": condition_id,
                     "event_id": None,
                 },
+                priority=HISTORY_BACKFILL_PRIORITY,
             )
             for condition_id in condition_ids
         )
@@ -845,11 +1046,19 @@ def cmd_tasks_seed_history(args: argparse.Namespace, app_settings: Settings) -> 
                     "interval": args.price_interval,
                     "fidelity": args.price_fidelity,
                 },
+                priority=HISTORY_BACKFILL_PRIORITY,
             )
             for token_id in token_ids
         )
     if args.include_books:
-        tasks.extend(Task(kind="book", params={"token_id": token_id}) for token_id in token_ids)
+        tasks.extend(
+            Task(
+                kind="book",
+                params={"token_id": token_id},
+                priority=HISTORY_BACKFILL_PRIORITY,
+            )
+            for token_id in token_ids
+        )
     if args.include_chain_logs:
         if args.chain_from_block is None or args.chain_to_block is None:
             raise ValueError("--chain-from-block and --chain-to-block are required for chain logs")
@@ -864,8 +1073,13 @@ def cmd_tasks_seed_history(args: argparse.Namespace, app_settings: Settings) -> 
                     "addresses": args.chain_addresses,
                     "topics": args.chain_topics,
                 },
+                priority=CHAIN_BACKFILL_PRIORITY,
             )
-            for start in range(args.chain_from_block, args.chain_to_block + 1, args.chain_block_step)
+            for start in range(
+                args.chain_from_block,
+                args.chain_to_block + 1,
+                args.chain_block_step,
+            )
         )
 
     added = store.add_many(tasks)

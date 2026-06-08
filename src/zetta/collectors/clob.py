@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 
+from zetta.http import HttpClientError
 from zetta.polymarket import PolymarketClient
 from zetta.storage.raw import RawJsonlWriter
 
@@ -55,7 +56,12 @@ class ClobCollector:
         )
 
     def collect_book(self, *, token_id: str) -> ClobCollectionResult:
-        page = self.client.clob_book(token_id=token_id)
+        try:
+            page = self.client.clob_book(token_id=token_id)
+        except HttpClientError as exc:
+            if is_missing_orderbook(exc):
+                return ClobCollectionResult(entity="book", items=0, output_path="")
+            raise
         output_path = self.raw_writer.write(
             source="clob",
             entity="book",
@@ -119,3 +125,8 @@ class ClobCollector:
             items=total_items,
             failures=failures,
         )
+
+
+def is_missing_orderbook(exc: HttpClientError) -> bool:
+    message = str(exc)
+    return "failed with 404" in message and "No orderbook exists" in message

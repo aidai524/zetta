@@ -47,6 +47,21 @@ case "$MODE" in
         --max-messages "$ZETTA_WS_MAX_MESSAGES" \
         --max-seconds "$ZETTA_WS_MAX_SECONDS"
     ;;
+  frontier)
+    "$ZETTA_PYTHON" -m zetta.cli \
+      "${COMMON_ARGS[@]}" \
+      --task-store postgres \
+      --node-id "$ZETTA_NODE_ID" \
+      tasks seed-frontier \
+        --event-limit "${ZETTA_FRONTIER_EVENT_LIMIT:-50}" \
+        --condition-limit "${ZETTA_FRONTIER_CONDITION_LIMIT:-50}" \
+        --token-limit "${ZETTA_FRONTIER_TOKEN_LIMIT:-100}" \
+        --gamma-page-limit "${ZETTA_FRONTIER_GAMMA_PAGE_LIMIT:-100}" \
+        --gamma-max-pages "${ZETTA_FRONTIER_GAMMA_MAX_PAGES:-1}" \
+        --trade-page-limit "${ZETTA_FRONTIER_TRADE_PAGE_LIMIT:-500}" \
+        --trade-max-pages "${ZETTA_FRONTIER_TRADE_MAX_PAGES:-1}" \
+        --price-interval "${ZETTA_FRONTIER_PRICE_INTERVAL:-1d}"
+    ;;
   load)
     "$ZETTA_PYTHON" -m zetta.cli "${COMMON_ARGS[@]}" load gamma-raw --batch-size "$ZETTA_LOADER_BATCH_SIZE"
     "$ZETTA_PYTHON" -m zetta.cli "${COMMON_ARGS[@]}" load data-trades --batch-size "$ZETTA_LOADER_BATCH_SIZE" --workers "${ZETTA_LOADER_WORKERS:-1}"

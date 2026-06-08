@@ -1,0 +1,11 @@
+[Unit]
+Description=Seed recent Zetta event tasks every 15 minutes
+
+[Timer]
+OnBootSec=3min
+OnUnitActiveSec=15min
+AccuracySec=30s
+Unit=zetta-frontier.service
+
+[Install]
+WantedBy=timers.target

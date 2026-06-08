@@ -45,11 +45,13 @@ class TaskRunner:
         started_at = datetime.now(UTC)
         try:
             result = self.run_task(task)
+            self.raw_writer.flush()
             self.task_store.complete(task.id)
             finished_at = datetime.now(UTC)
             self.record_run(task, started_at, finished_at, "done", result=result)
             return {"task": task.id, "kind": task.kind, "status": "done", "result": result}
         except Exception as exc:
+            self.raw_writer.flush()
             finished_at = datetime.now(UTC)
             error = str(exc)
             if task.attempts >= task.max_attempts:
@@ -90,39 +92,40 @@ class TaskRunner:
 
     def run_task(self, task: Task) -> dict[str, Any]:
         result: Any
+        params = task_execution_params(task.params)
         if task.kind == "gamma-events":
             result = GammaCollector(
                 client=self.client,
                 raw_writer=self.raw_writer,
                 state_store=self.state_store,
-            ).collect_keyset("events", **task.params)
+            ).collect_keyset("events", **params)
         elif task.kind == "gamma-markets":
             result = GammaCollector(
                 client=self.client,
                 raw_writer=self.raw_writer,
                 state_store=self.state_store,
-            ).collect_keyset("markets", **task.params)
+            ).collect_keyset("markets", **params)
         elif task.kind == "trades":
             result = DataCollector(
                 client=self.client,
                 raw_writer=self.raw_writer,
                 state_store=self.state_store,
-            ).collect_trades(**task.params)
+            ).collect_trades(**params)
         elif task.kind == "prices-history":
             result = ClobCollector(
                 client=self.client,
                 raw_writer=self.raw_writer,
-            ).collect_prices_history(**task.params)
+            ).collect_prices_history(**params)
         elif task.kind == "book":
             result = ClobCollector(
                 client=self.client,
                 raw_writer=self.raw_writer,
-            ).collect_book(**task.params)
+            ).collect_book(**params)
         elif task.kind == "chain-logs":
             result = ChainCollector(
                 client=PolygonRpcClient(self.settings),
                 raw_writer=self.raw_writer,
-            ).collect_logs(**task.params)
+            ).collect_logs(**params)
         else:
             raise ValueError(f"Unknown task kind: {task.kind}")
 
@@ -186,3 +189,7 @@ def task_result_raw_paths(result: dict[str, Any]) -> list[str]:
         return [str(path) for path in raw_paths]
     output_path = result.get("output_path")
     return [str(output_path)] if output_path else []
+
+
+def task_execution_params(params: dict[str, Any]) -> dict[str, Any]:
+    return {key: value for key, value in params.items() if not key.startswith("_")}

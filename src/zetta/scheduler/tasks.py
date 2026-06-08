@@ -15,6 +15,7 @@ TaskStatus = Literal["pending", "running", "done", "failed", "dead_lettered"]
 class Task:
     kind: str
     params: dict[str, Any]
+    priority: int = 100
     id: str = field(default_factory=lambda: uuid4().hex)
     status: TaskStatus = "pending"
     attempts: int = 0
@@ -64,12 +65,17 @@ class LocalTaskStore:
 
     def claim_next(self) -> Task | None:
         tasks = self.load()
-        for task in tasks:
-            if task.status == "pending":
-                task.mark("running")
-                self.save(tasks)
-                return task
-        return None
+        pending = [
+            (index, task)
+            for index, task in enumerate(tasks)
+            if task.status == "pending"
+        ]
+        if not pending:
+            return None
+        _index, task = min(pending, key=lambda item: (item[1].priority, item[0]))
+        task.mark("running")
+        self.save(tasks)
+        return task
 
     def complete(self, task_id: str) -> None:
         self._mark(task_id, "done")
@@ -146,8 +152,11 @@ class PostgresTaskStore:
                     cursor.execute(
                         """
                         insert into collector_tasks
-                          (task_type, source, entity, params, status, attempts, max_attempts, last_error)
-                        values (%s, %s, %s, %s, %s, %s, %s, %s)
+                          (
+                            task_type, source, entity, params, status, priority,
+                            attempts, max_attempts, last_error
+                          )
+                        values (%s, %s, %s, %s, %s, %s, %s, %s, %s)
                         on conflict do nothing
                         """,
                         (
@@ -156,6 +165,7 @@ class PostgresTaskStore:
                             entity,
                             Jsonb(task.params),
                             task.status,
+                            task.priority,
                             task.attempts,
                             task.max_attempts,
                             task.last_error,
@@ -205,7 +215,7 @@ class PostgresTaskStore:
             from candidate
             where task.id = candidate.id
             returning task.id, task.task_type, task.params, task.status, task.attempts,
-              task.created_at, task.updated_at, task.last_error, task.max_attempts
+              task.created_at, task.updated_at, task.last_error, task.max_attempts, task.priority
             """,
             (self.node_id, lease_expires_at),
         )
@@ -486,10 +496,12 @@ def row_to_task(row: Any) -> Task:
         *optional,
     ) = row
     max_attempts = optional[0] if optional else 3
+    priority = optional[1] if len(optional) > 1 else 100
     return Task(
         id=str(task_id),
         kind=str(kind),
         params=dict(params or {}),
+        priority=int(priority or 100),
         status=status,
         attempts=int(attempts),
         created_at=created_at.isoformat() if hasattr(created_at, "isoformat") else str(created_at),
