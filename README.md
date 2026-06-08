@@ -122,6 +122,9 @@ PYTHONPATH=src python -m zetta.cli --raw-data-dir data/raw load gamma-raw
 
 See `docs/todo.md` for the staged implementation backlog.
 
+Product analytics requirements for event PnL, smart-money tracking, wallet intelligence,
+anomaly signals, and SQL Agent are documented in `docs/product/analytics-requirements.md`.
+
 ## CLOB Price History
 
 Discover active CLOB token IDs from ClickHouse:
