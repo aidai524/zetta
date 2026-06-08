@@ -82,9 +82,10 @@
 
 ## Phase 9: Product Analytics
 
+- [ ] Build `mart_market_overview`, `mart_market_trending`, `mart_market_mover`, `mart_category_flow`, and `mart_global_smart_money_activity`.
 - [ ] Build `mart_event_summary`, `mart_event_market_snapshot`, and `mart_event_volume_liquidity_daily`.
 - [ ] Build `mart_event_wallet_pnl`, `mart_wallet_event_history`, and `mart_wallet_trade_timeline`.
 - [ ] Build `mart_live_wallet_position`, `mart_wallet_reputation`, and `mart_smart_money_signal`.
 - [ ] Build `mart_event_anomaly_signal`, `mart_wallet_risk_signal`, `mart_wallet_cluster`, and `mart_orderbook_anomaly`.
-- [ ] Add product APIs for event analytics, wallet intelligence, anomaly signals, and SQL Agent schema/query execution.
+- [ ] Add product APIs for market overview, event analytics, wallet intelligence, anomaly signals, and SQL Agent schema/query execution.
 - [ ] Add SQL Agent safeguards: read-only enforcement, default limit, timeout, schema catalog, and approved query templates.
