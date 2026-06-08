@@ -48,6 +48,8 @@ def main(argv: list[str] | None = None) -> int:
         postgres_dsn=args.postgres_dsn,
         raw_data_dir=Path(args.raw_data_dir),
         state_dir=Path(args.state_dir),
+        raw_chunk_records=args.raw_chunk_records,
+        raw_chunk_seconds=args.raw_chunk_seconds,
         request_timeout_seconds=args.timeout,
         user_agent=args.user_agent,
         http_resolve_overrides=args.http_resolve_overrides,
@@ -77,6 +79,8 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--postgres-dsn", default=settings.postgres_dsn)
     parser.add_argument("--raw-data-dir", default=str(settings.raw_data_dir))
     parser.add_argument("--state-dir", default=str(settings.state_dir))
+    parser.add_argument("--raw-chunk-records", type=int, default=settings.raw_chunk_records)
+    parser.add_argument("--raw-chunk-seconds", type=float, default=settings.raw_chunk_seconds)
     parser.add_argument("--task-file", default="data/state/tasks.json")
     parser.add_argument("--task-store", choices=["local", "postgres"], default="local")
     parser.add_argument("--node-id", default="local-node")
@@ -309,6 +313,7 @@ def build_parser() -> argparse.ArgumentParser:
     )
     clob_ws_books.add_argument("--force", action="store_true")
     clob_ws_books.add_argument("--batch-size", type=int, default=10_000)
+    clob_ws_books.add_argument("--workers", type=int, default=1)
     clob_ws_books.set_defaults(func=cmd_load_clob_ws_market_books)
 
     data_trades = load_subparsers.add_parser(
@@ -316,6 +321,7 @@ def build_parser() -> argparse.ArgumentParser:
     )
     data_trades.add_argument("--force", action="store_true")
     data_trades.add_argument("--batch-size", type=int, default=10_000)
+    data_trades.add_argument("--workers", type=int, default=1)
     data_trades.set_defaults(func=cmd_load_data_trades)
 
     data_activity = load_subparsers.add_parser("data-activity", help="Load raw user activity.")
@@ -499,7 +505,7 @@ def cmd_db_migrate(args: argparse.Namespace, app_settings: Settings) -> Any:
 def cmd_gamma(args: argparse.Namespace, app_settings: Settings, entity: str) -> Any:
     collector = GammaCollector(
         client=PolymarketClient(app_settings),
-        raw_writer=RawJsonlWriter(app_settings.raw_data_dir),
+        raw_writer=raw_writer(app_settings),
         state_store=LocalStateStore(app_settings.state_dir),
     )
     return collector.collect_keyset(
@@ -517,7 +523,7 @@ def cmd_gamma(args: argparse.Namespace, app_settings: Settings, entity: str) -> 
 def cmd_trades(args: argparse.Namespace, app_settings: Settings) -> Any:
     collector = DataCollector(
         client=PolymarketClient(app_settings),
-        raw_writer=RawJsonlWriter(app_settings.raw_data_dir),
+        raw_writer=raw_writer(app_settings),
         state_store=LocalStateStore(app_settings.state_dir),
     )
     return collector.collect_trades(
@@ -533,7 +539,7 @@ def cmd_trades(args: argparse.Namespace, app_settings: Settings) -> Any:
 def cmd_activity(args: argparse.Namespace, app_settings: Settings) -> Any:
     return DataCollector(
         client=PolymarketClient(app_settings),
-        raw_writer=RawJsonlWriter(app_settings.raw_data_dir),
+        raw_writer=raw_writer(app_settings),
         state_store=LocalStateStore(app_settings.state_dir),
     ).collect_activity(
         user=args.user,
@@ -546,7 +552,7 @@ def cmd_activity(args: argparse.Namespace, app_settings: Settings) -> Any:
 def cmd_holders(args: argparse.Namespace, app_settings: Settings) -> Any:
     return DataCollector(
         client=PolymarketClient(app_settings),
-        raw_writer=RawJsonlWriter(app_settings.raw_data_dir),
+        raw_writer=raw_writer(app_settings),
         state_store=LocalStateStore(app_settings.state_dir),
     ).collect_holders(market=args.market, limit=args.limit)
 
@@ -554,7 +560,7 @@ def cmd_holders(args: argparse.Namespace, app_settings: Settings) -> Any:
 def cmd_market_positions(args: argparse.Namespace, app_settings: Settings) -> Any:
     return DataCollector(
         client=PolymarketClient(app_settings),
-        raw_writer=RawJsonlWriter(app_settings.raw_data_dir),
+        raw_writer=raw_writer(app_settings),
         state_store=LocalStateStore(app_settings.state_dir),
     ).collect_market_positions(market=args.market, limit=args.limit)
 
@@ -562,7 +568,7 @@ def cmd_market_positions(args: argparse.Namespace, app_settings: Settings) -> An
 def cmd_open_interest(args: argparse.Namespace, app_settings: Settings) -> Any:
     return DataCollector(
         client=PolymarketClient(app_settings),
-        raw_writer=RawJsonlWriter(app_settings.raw_data_dir),
+        raw_writer=raw_writer(app_settings),
         state_store=LocalStateStore(app_settings.state_dir),
     ).collect_open_interest(market=args.market)
 
@@ -570,7 +576,7 @@ def cmd_open_interest(args: argparse.Namespace, app_settings: Settings) -> Any:
 def cmd_prices_history(args: argparse.Namespace, app_settings: Settings) -> Any:
     collector = ClobCollector(
         client=PolymarketClient(app_settings),
-        raw_writer=RawJsonlWriter(app_settings.raw_data_dir),
+        raw_writer=raw_writer(app_settings),
     )
     return collector.collect_prices_history(
         token_id=args.token_id,
@@ -585,7 +591,7 @@ def cmd_prices_history_batch(args: argparse.Namespace, app_settings: Settings) -
     token_result = cmd_discover_tokens(args, app_settings)
     collector = ClobCollector(
         client=PolymarketClient(app_settings),
-        raw_writer=RawJsonlWriter(app_settings.raw_data_dir),
+        raw_writer=raw_writer(app_settings),
     )
     return collector.collect_prices_history_batch(
         token_ids=token_result["tokens"],
@@ -598,7 +604,7 @@ def cmd_prices_history_batch(args: argparse.Namespace, app_settings: Settings) -
 def cmd_book(args: argparse.Namespace, app_settings: Settings) -> Any:
     collector = ClobCollector(
         client=PolymarketClient(app_settings),
-        raw_writer=RawJsonlWriter(app_settings.raw_data_dir),
+        raw_writer=raw_writer(app_settings),
     )
     return collector.collect_book(token_id=args.token_id)
 
@@ -607,7 +613,7 @@ def cmd_books_batch(args: argparse.Namespace, app_settings: Settings) -> Any:
     token_result = cmd_discover_tokens(args, app_settings)
     collector = ClobCollector(
         client=PolymarketClient(app_settings),
-        raw_writer=RawJsonlWriter(app_settings.raw_data_dir),
+        raw_writer=raw_writer(app_settings),
     )
     return collector.collect_books_batch(
         token_ids=token_result["tokens"],
@@ -622,7 +628,7 @@ def cmd_ws_market(args: argparse.Namespace, app_settings: Settings) -> Any:
         token_ids = token_result["tokens"]
     collector = MarketWebSocketCollector(
         settings=app_settings,
-        raw_writer=RawJsonlWriter(app_settings.raw_data_dir),
+        raw_writer=raw_writer(app_settings),
     )
     result = collector.collect(
         token_ids=token_ids,
@@ -637,7 +643,7 @@ def cmd_ws_market(args: argparse.Namespace, app_settings: Settings) -> Any:
 def cmd_chain_logs(args: argparse.Namespace, app_settings: Settings) -> Any:
     return ChainCollector(
         client=PolygonRpcClient(app_settings),
-        raw_writer=RawJsonlWriter(app_settings.raw_data_dir),
+        raw_writer=raw_writer(app_settings),
     ).collect_logs(
         from_block=args.from_block,
         to_block=args.to_block,
@@ -957,6 +963,7 @@ def cmd_load_clob_ws_market_books(args: argparse.Namespace, app_settings: Settin
         raw_root=app_settings.raw_data_dir,
         force=args.force,
         batch_size=args.batch_size,
+        workers=args.workers,
     )
 
 
@@ -965,6 +972,7 @@ def cmd_load_data_trades(args: argparse.Namespace, app_settings: Settings) -> An
         raw_root=app_settings.raw_data_dir,
         force=args.force,
         batch_size=args.batch_size,
+        workers=args.workers,
     )
 
 
@@ -1129,6 +1137,14 @@ def parse_token_ids(values: list[str]) -> list[str]:
     for value in values:
         token_ids.extend(token.strip() for token in value.split(",") if token.strip())
     return token_ids
+
+
+def raw_writer(app_settings: Settings) -> RawJsonlWriter:
+    return RawJsonlWriter(
+        app_settings.raw_data_dir,
+        chunk_records=app_settings.raw_chunk_records,
+        chunk_seconds=app_settings.raw_chunk_seconds,
+    )
 
 
 def print_json(value: Any) -> None:

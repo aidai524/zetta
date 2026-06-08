@@ -1,3 +1,5 @@
+import time
+
 from zetta.loaders.data import (
     DataRawLoader,
     activity_rows,
@@ -13,6 +15,8 @@ class FakeClickHouse:
     def __init__(self) -> None:
         self.tables = {}
         self.loaded_hashes = set()
+        self.max_raw_path = ""
+        self.queries = []
 
     def insert(self, table, rows):
         self.tables.setdefault(table, []).extend(rows)
@@ -21,6 +25,11 @@ class FakeClickHouse:
         return len(rows)
 
     def query_text(self, query):
+        self.queries.append(query)
+        if "max(raw_path)" in query:
+            return self.max_raw_path
+        if "startsWith(raw_path" in query:
+            return ""
         if "raw_ingest_log" in query:
             return "\n".join(sorted(self.loaded_hashes))
         return ""
@@ -148,3 +157,28 @@ def test_open_interest_rows_normalize_values() -> None:
 
     assert rows[0]["condition_id"] == "condition-1"
     assert rows[0]["value"] == 123.45
+
+
+def test_data_trades_loader_uses_raw_path_high_watermark(tmp_path) -> None:
+    writer = RawJsonlWriter(tmp_path)
+    first = writer.write(
+        source="data",
+        entity="trades",
+        request_url="https://data.test/trades?page=1",
+        payload=[],
+    )
+    time.sleep(0.001)
+    writer.write(
+        source="data",
+        entity="trades",
+        request_url="https://data.test/trades?page=2",
+        payload=[],
+    )
+    fake = FakeClickHouse()
+    fake.max_raw_path = str(first)
+
+    result = DataRawLoader(clickhouse=fake).load_trades(raw_root=tmp_path)
+
+    assert result.raw_records == 1
+    assert any("max(raw_path)" in query for query in fake.queries)
+    assert not any("SELECT payload_hash" in query for query in fake.queries)

@@ -22,9 +22,18 @@ from zetta.chain.polymarket import (
     orders_matched_row,
 )
 from zetta.loaders.clob import payload_hash
+from zetta.loaders.incremental import (
+    clickhouse_state_dir,
+    loaded_max_raw_path,
+    loaded_payload_hashes,
+    loaded_payload_hashes_for_paths,
+    loader_checkpoint_raw_path,
+    save_loader_checkpoint_raw_path,
+)
+from zetta.loaders.parallel import raw_paths
 from zetta.models.normalize import as_bool, parse_dt
 from zetta.storage.clickhouse import ClickHouseWriter
-from zetta.storage.raw_reader import iter_raw_records
+from zetta.storage.raw_reader import iter_raw_records, iter_raw_records_from_paths
 
 
 @dataclass(frozen=True)
@@ -53,16 +62,47 @@ class ChainRawLoader:
     ) -> ChainLoadResult:
         if batch_size <= 0:
             raise ValueError("batch_size must be positive")
-        loaded_hashes = self.loaded_payload_hashes()
+        checkpoint_path = None if force else self.loader_checkpoint_raw_path()
+        database_after_path = None if force else self.loaded_max_raw_path()
+        after_path = checkpoint_path or database_after_path
+        paths = (
+            raw_paths(raw_root, source="polygon", entity="logs", after_path=after_path)
+            if not force and after_path is not None
+            else None
+        )
+        if not force and checkpoint_path is None and database_after_path is not None:
+            self.save_loader_checkpoint_raw_path(database_after_path)
+        loaded_hashes = (
+            loaded_payload_hashes_for_paths(
+                self.clickhouse,
+                source="polygon",
+                entity="logs",
+                paths=paths,
+            )
+            if paths is not None
+            else self.loaded_payload_hashes()
+        )
         log_rows: list[dict[str, Any]] = []
         ingest_rows: list[dict[str, Any]] = []
         raw_records = 0
         skipped = 0
         chain_logs = 0
         ingest_logs = 0
+        last_raw_path = ""
 
-        for record in iter_raw_records(raw_root, source="polygon", entity="logs"):
+        records = (
+            iter_raw_records_from_paths(paths, after_path=after_path)
+            if paths is not None
+            else iter_raw_records(
+                raw_root,
+                source="polygon",
+                entity="logs",
+                after_path=after_path,
+            )
+        )
+        for record in records:
             raw_records += 1
+            last_raw_path = str(record.get("_raw_path") or last_raw_path)
             payload = record.get("payload")
             digest = payload_hash(payload)
             already_loaded = digest in loaded_hashes
@@ -100,6 +140,8 @@ class ChainRawLoader:
         inserted_logs, inserted_ingest = self.flush(log_rows, ingest_rows)
         chain_logs += inserted_logs
         ingest_logs += inserted_ingest
+        if not force and last_raw_path:
+            self.save_loader_checkpoint_raw_path(last_raw_path)
         return ChainLoadResult(
             raw_records=raw_records,
             skipped_raw_records=skipped,
@@ -260,14 +302,25 @@ class ChainRawLoader:
         return log_count, ingest_count
 
     def loaded_payload_hashes(self) -> set[str]:
-        try:
-            output = self.clickhouse.query_text(
-                "SELECT payload_hash FROM raw_ingest_log "
-                "WHERE source = 'polygon' AND entity = 'logs' FORMAT TSV"
-            )
-        except Exception:
-            return set()
-        return {line.strip() for line in output.splitlines() if line.strip()}
+        return loaded_payload_hashes(self.clickhouse, source="polygon", entity="logs")
+
+    def loaded_max_raw_path(self) -> str | None:
+        return loaded_max_raw_path(self.clickhouse, source="polygon", entity="logs")
+
+    def loader_checkpoint_raw_path(self) -> str | None:
+        return loader_checkpoint_raw_path(
+            clickhouse_state_dir(self.clickhouse),
+            source="polygon",
+            entity="logs",
+        )
+
+    def save_loader_checkpoint_raw_path(self, raw_path: str) -> None:
+        save_loader_checkpoint_raw_path(
+            clickhouse_state_dir(self.clickhouse),
+            source="polygon",
+            entity="logs",
+            raw_path=raw_path,
+        )
 
 
 def chain_log_row(log: dict[str, Any], *, ingested_at: datetime) -> dict[str, Any]:

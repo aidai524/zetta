@@ -65,6 +65,8 @@ def test_product_api_stats_overview_returns_first_row() -> None:
 
     assert response.status == 200
     assert response.body == {"overview": {"events": 10, "markets": 20}}
+    assert "system.parts" in fake.queries[0]
+    assert " final" not in fake.queries[0].lower()
 
 
 def test_product_api_system_stats_route_does_not_query_clickhouse() -> None:

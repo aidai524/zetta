@@ -170,34 +170,46 @@ class PostgresTaskStore:
         lease_expires_at = datetime.now(UTC) + timedelta(seconds=self.lease_seconds)
         with psycopg.connect(self.dsn) as conn:
             with conn.cursor() as cursor:
-                cursor.execute(
-                    """
-                    with candidate as
-                    (
-                      select id
-                      from collector_tasks
-                      where status = 'pending'
-                         or (status = 'running' and lease_expires_at < now())
-                      order by priority asc, id asc
-                      limit 1
-                      for update skip locked
-                    )
-                    update collector_tasks as task
-                    set
-                      status = 'running',
-                      attempts = attempts + 1,
-                      lease_owner = %s,
-                      lease_expires_at = %s,
-                      updated_at = now()
-                    from candidate
-                    where task.id = candidate.id
-                    returning task.id, task.task_type, task.params, task.status, task.attempts,
-                      task.created_at, task.updated_at, task.last_error, task.max_attempts
-                    """,
-                    (self.node_id, lease_expires_at),
+                row = self._claim_with_status(
+                    cursor,
+                    where_sql="status = 'pending'",
+                    lease_expires_at=lease_expires_at,
                 )
-                row = cursor.fetchone()
+                if row is None:
+                    row = self._claim_with_status(
+                        cursor,
+                        where_sql="status = 'running' and lease_expires_at < now()",
+                        lease_expires_at=lease_expires_at,
+                    )
         return row_to_task(row) if row else None
+
+    def _claim_with_status(self, cursor, *, where_sql: str, lease_expires_at: datetime):
+        cursor.execute(
+            f"""
+            with candidate as
+            (
+              select id
+              from collector_tasks
+              where {where_sql}
+              order by priority asc, id asc
+              limit 1
+              for update skip locked
+            )
+            update collector_tasks as task
+            set
+              status = 'running',
+              attempts = attempts + 1,
+              lease_owner = %s,
+              lease_expires_at = %s,
+              updated_at = now()
+            from candidate
+            where task.id = candidate.id
+            returning task.id, task.task_type, task.params, task.status, task.attempts,
+              task.created_at, task.updated_at, task.last_error, task.max_attempts
+            """,
+            (self.node_id, lease_expires_at),
+        )
+        return cursor.fetchone()
 
     def complete(self, task_id: str) -> None:
         self._mark(task_id, "done")

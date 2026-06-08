@@ -14,6 +14,8 @@ class FakeClickHouse:
         return len(rows)
 
     def query_text(self, query):
+        if "startsWith(raw_path" in query:
+            return ""
         if "raw_ingest_log" in query:
             return "\n".join(sorted(self.loaded_hashes))
         return ""

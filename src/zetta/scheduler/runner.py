@@ -31,7 +31,11 @@ class TaskRunner:
         self.node_id = node_id
         self.run_store = run_store if run_store is not None else task_store
         self.client = PolymarketClient(settings)
-        self.raw_writer = RawJsonlWriter(settings.raw_data_dir)
+        self.raw_writer = RawJsonlWriter(
+            settings.raw_data_dir,
+            chunk_records=settings.raw_chunk_records,
+            chunk_seconds=settings.raw_chunk_seconds,
+        )
         self.state_store = LocalStateStore(settings.state_dir)
 
     def run_once(self) -> dict[str, Any]:
@@ -70,6 +74,7 @@ class TaskRunner:
         while max_tasks == 0 or completed < max_tasks:
             last_result = self.run_once()
             if last_result["status"] == "idle":
+                self.raw_writer.flush()
                 idle_cycles += 1
                 if stop_on_idle:
                     break

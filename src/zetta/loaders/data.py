@@ -7,9 +7,19 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
+from zetta.config import Settings
+from zetta.loaders.incremental import (
+    clickhouse_state_dir,
+    loaded_max_raw_path,
+    loaded_payload_hashes,
+    loaded_payload_hashes_for_paths,
+    loader_checkpoint_raw_path,
+    save_loader_checkpoint_raw_path,
+)
+from zetta.loaders.parallel import load_in_parallel, raw_paths
 from zetta.models.normalize import as_float, as_str, parse_dt
 from zetta.storage.clickhouse import ClickHouseWriter
-from zetta.storage.raw_reader import iter_raw_records
+from zetta.storage.raw_reader import iter_raw_records, iter_raw_records_from_paths
 
 
 @dataclass(frozen=True)
@@ -24,6 +34,11 @@ class DataLoadResult:
     ingest_logs: int
 
 
+@dataclass(frozen=True)
+class DataLoadStateResult(DataLoadResult):
+    last_raw_path: str = ""
+
+
 class DataRawLoader:
     def __init__(self, *, clickhouse: ClickHouseWriter) -> None:
         self.clickhouse = clickhouse
@@ -34,23 +49,98 @@ class DataRawLoader:
         raw_root: Path,
         force: bool = False,
         batch_size: int = 10_000,
+        workers: int = 1,
     ) -> DataLoadResult:
         if batch_size <= 0:
             raise ValueError("batch_size must be positive")
-        loaded_hashes = self.loaded_payload_hashes()
+        database_after_path = None if force else self.loaded_max_raw_path()
+        checkpoint_path = None if force else self.loader_checkpoint_raw_path()
+        after_path = checkpoint_path or database_after_path
+        paths = (
+            raw_paths(raw_root, source="data", entity="trades", after_path=after_path)
+            if not force and after_path is not None
+            else None
+        )
+        if not force and checkpoint_path is None and database_after_path is not None:
+            self.save_loader_checkpoint_raw_path(database_after_path)
+        if workers > 1 and paths is not None:
+            result = load_in_parallel(
+                worker=DataTradeLoadWorker(self.clickhouse.settings, batch_size),
+                paths=paths,
+                workers=workers,
+            )
+            if paths:
+                last_raw_path = result.last_raw_path if result is not None else None
+                self.save_loader_checkpoint_raw_path(last_raw_path or paths[-1])
+            return without_last_raw_path(result) if result is not None else empty_data_result()
+        loaded_hashes = (
+            loaded_payload_hashes_for_paths(
+                self.clickhouse,
+                source="data",
+                entity="trades",
+                paths=paths,
+            )
+            if paths is not None
+            else self.loaded_payload_hashes()
+        )
+        result = self._load_trades_records(
+            iter_raw_records_from_paths(paths, after_path=after_path)
+            if paths is not None
+            else iter_raw_records(
+                raw_root,
+                source="data",
+                entity="trades",
+                after_path=after_path,
+            ),
+            loaded_hashes=loaded_hashes,
+            batch_size=batch_size,
+            skip_loaded=not force,
+        )
+        if not force and result.last_raw_path:
+            self.save_loader_checkpoint_raw_path(result.last_raw_path)
+        return without_last_raw_path(result)
+
+    def load_trades_from_paths(
+        self,
+        paths: list[str],
+        *,
+        batch_size: int = 10_000,
+    ) -> DataLoadStateResult:
+        return self._load_trades_records(
+            iter_raw_records_from_paths(paths),
+            loaded_hashes=loaded_payload_hashes_for_paths(
+                self.clickhouse,
+                source="data",
+                entity="trades",
+                paths=paths,
+            ),
+            batch_size=batch_size,
+            skip_loaded=True,
+        )
+
+    def _load_trades_records(
+        self,
+        records,
+        *,
+        loaded_hashes: set[str],
+        batch_size: int,
+        skip_loaded: bool,
+    ) -> DataLoadStateResult:
         trade_rows: list[dict[str, Any]] = []
         log_rows: list[dict[str, Any]] = []
         raw_records = 0
         skipped = 0
         trades = 0
         logs = 0
+        last_raw_path = ""
 
-        for record in iter_raw_records(raw_root, source="data", entity="trades"):
+        for record in records:
             raw_records += 1
+            last_raw_path = str(record.get("_raw_path") or last_raw_path)
             payload = record.get("payload")
             digest = payload_hash(payload)
             already_loaded = digest in loaded_hashes
-            if already_loaded and not force:
+            if already_loaded and skip_loaded:
                 skipped += 1
                 continue
             ingested_at = parse_dt(record.get("collected_at")) or datetime.now(UTC)
@@ -106,7 +196,7 @@ class DataRawLoader:
         inserted_trades, inserted_logs = self.flush(trade_rows, log_rows)
         trades += inserted_trades
         logs += inserted_logs
-        return DataLoadResult(
+        return DataLoadStateResult(
             raw_records=raw_records,
             skipped_raw_records=skipped,
             trades=trades,
@@ -115,6 +205,7 @@ class DataRawLoader:
             market_positions=0,
             open_interest=0,
             ingest_logs=logs,
+            last_raw_path=last_raw_path,
         )
 
     def load_activity(
@@ -228,13 +319,44 @@ class DataRawLoader:
         force: bool,
         row_builder,
     ) -> tuple[list[dict[str, Any]], list[dict[str, Any]], int, int]:
-        loaded_hashes = self.loaded_payload_hashes(entity)
+        checkpoint_path = None if force else self.loader_checkpoint_raw_path(entity)
+        database_after_path = None if force else self.loaded_max_raw_path(entity)
+        after_path = checkpoint_path or database_after_path
+        paths = (
+            raw_paths(raw_root, source="data", entity=entity, after_path=after_path)
+            if not force and after_path is not None
+            else None
+        )
+        if not force and checkpoint_path is None and database_after_path is not None:
+            self.save_loader_checkpoint_raw_path(database_after_path, entity)
+        loaded_hashes = (
+            loaded_payload_hashes_for_paths(
+                self.clickhouse,
+                source="data",
+                entity=entity,
+                paths=paths,
+            )
+            if paths is not None
+            else self.loaded_payload_hashes(entity)
+        )
         rows: list[dict[str, Any]] = []
         logs: list[dict[str, Any]] = []
         raw_records = 0
         skipped = 0
-        for record in iter_raw_records(raw_root, source="data", entity=entity):
+        last_raw_path = ""
+        records = (
+            iter_raw_records_from_paths(paths, after_path=after_path)
+            if paths is not None
+            else iter_raw_records(
+                raw_root,
+                source="data",
+                entity=entity,
+                after_path=after_path,
+            )
+        )
+        for record in records:
             raw_records += 1
+            last_raw_path = str(record.get("_raw_path") or last_raw_path)
             payload = record.get("payload")
             digest = payload_hash(payload)
             already_loaded = digest in loaded_hashes
@@ -257,6 +379,8 @@ class DataRawLoader:
                 )
                 loaded_hashes.add(digest)
             rows.extend(built_rows)
+        if not force and last_raw_path:
+            self.save_loader_checkpoint_raw_path(last_raw_path, entity)
         return rows, logs, raw_records, skipped
 
     def _insert_data_rows(
@@ -292,14 +416,63 @@ class DataRawLoader:
         return DataLoadResult(**values)
 
     def loaded_payload_hashes(self, entity: str = "trades") -> set[str]:
-        try:
-            output = self.clickhouse.query_text(
-                "SELECT payload_hash FROM raw_ingest_log "
-                f"WHERE source = 'data' AND entity = '{entity}' FORMAT TSV"
-            )
-        except Exception:
-            return set()
-        return {line.strip() for line in output.splitlines() if line.strip()}
+        return loaded_payload_hashes(self.clickhouse, source="data", entity=entity)
+
+    def loaded_max_raw_path(self, entity: str = "trades") -> str | None:
+        return loaded_max_raw_path(self.clickhouse, source="data", entity=entity)
+
+    def loader_checkpoint_raw_path(self, entity: str = "trades") -> str | None:
+        return loader_checkpoint_raw_path(
+            clickhouse_state_dir(self.clickhouse),
+            source="data",
+            entity=entity,
+        )
+
+    def save_loader_checkpoint_raw_path(self, raw_path: str, entity: str = "trades") -> None:
+        save_loader_checkpoint_raw_path(
+            clickhouse_state_dir(self.clickhouse),
+            source="data",
+            entity=entity,
+            raw_path=raw_path,
+        )
+
+
+@dataclass(frozen=True)
+class DataTradeLoadWorker:
+    settings: Settings
+    batch_size: int
+
+    def __call__(self, paths: list[str]) -> DataLoadResult:
+        return DataRawLoader(clickhouse=ClickHouseWriter(self.settings)).load_trades_from_paths(
+            paths,
+            batch_size=self.batch_size,
+        )
+
+
+def empty_data_result() -> DataLoadResult:
+    return DataLoadResult(
+        raw_records=0,
+        skipped_raw_records=0,
+        trades=0,
+        activities=0,
+        holders=0,
+        market_positions=0,
+        open_interest=0,
+        ingest_logs=0,
+    )
+
+
+def without_last_raw_path(result: DataLoadStateResult) -> DataLoadResult:
+    return DataLoadResult(
+        raw_records=result.raw_records,
+        skipped_raw_records=result.skipped_raw_records,
+        trades=result.trades,
+        activities=result.activities,
+        holders=result.holders,
+        market_positions=result.market_positions,
+        open_interest=result.open_interest,
+        ingest_logs=result.ingest_logs,
+    )
 
 
 def trade_id(transaction_hash: str, token_id: str, timestamp: datetime, index: int) -> str:

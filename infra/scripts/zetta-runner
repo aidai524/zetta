@@ -17,6 +17,8 @@ COMMON_ARGS=(
   --polygon-rpc-url "$ZETTA_POLYGON_RPC_URL"
   --raw-data-dir "$ZETTA_RAW_DIR"
   --state-dir "$ZETTA_STATE_DIR"
+  --raw-chunk-records "${ZETTA_RAW_CHUNK_RECORDS:-1}"
+  --raw-chunk-seconds "${ZETTA_RAW_CHUNK_SECONDS:-60}"
 )
 
 if [[ -n "${ZETTA_HTTP_RESOLVE_OVERRIDES:-}" ]]; then
@@ -47,10 +49,10 @@ case "$MODE" in
     ;;
   load)
     "$ZETTA_PYTHON" -m zetta.cli "${COMMON_ARGS[@]}" load gamma-raw --batch-size "$ZETTA_LOADER_BATCH_SIZE"
-    "$ZETTA_PYTHON" -m zetta.cli "${COMMON_ARGS[@]}" load data-trades --batch-size "$ZETTA_LOADER_BATCH_SIZE"
+    "$ZETTA_PYTHON" -m zetta.cli "${COMMON_ARGS[@]}" load data-trades --batch-size "$ZETTA_LOADER_BATCH_SIZE" --workers "${ZETTA_LOADER_WORKERS:-1}"
     "$ZETTA_PYTHON" -m zetta.cli "${COMMON_ARGS[@]}" load clob-price-history --batch-size "$ZETTA_LOADER_BATCH_SIZE"
     "$ZETTA_PYTHON" -m zetta.cli "${COMMON_ARGS[@]}" load clob-books --batch-size "$ZETTA_LOADER_BATCH_SIZE"
-    "$ZETTA_PYTHON" -m zetta.cli "${COMMON_ARGS[@]}" load clob-ws-market-books --batch-size "$ZETTA_LOADER_BATCH_SIZE"
+    "$ZETTA_PYTHON" -m zetta.cli "${COMMON_ARGS[@]}" load clob-ws-market-books --batch-size "$ZETTA_LOADER_BATCH_SIZE" --workers "${ZETTA_LOADER_WORKERS:-1}"
     "$ZETTA_PYTHON" -m zetta.cli "${COMMON_ARGS[@]}" load chain-logs --batch-size "$ZETTA_LOADER_BATCH_SIZE"
     "$ZETTA_PYTHON" -m zetta.cli "${COMMON_ARGS[@]}" load exchange-fills --batch-size "$ZETTA_LOADER_BATCH_SIZE"
     "$ZETTA_PYTHON" -m zetta.cli "${COMMON_ARGS[@]}" load orders-matched --batch-size "$ZETTA_LOADER_BATCH_SIZE"

@@ -21,6 +21,14 @@ alter table collector_tasks
 create index if not exists idx_collector_tasks_claim
   on collector_tasks (status, priority, id);
 
+create index if not exists idx_collector_tasks_pending_claim
+  on collector_tasks (priority, id)
+  where status = 'pending';
+
+create index if not exists idx_collector_tasks_running_lease
+  on collector_tasks (priority, id, lease_expires_at)
+  where status = 'running';
+
 create index if not exists idx_collector_tasks_lease
   on collector_tasks (lease_expires_at)
   where lease_owner is not null;

@@ -19,6 +19,8 @@ class Settings:
     postgres_dsn: str = "postgresql://zetta:zetta@localhost:55432/zetta"
     raw_data_dir: Path = Path("data/raw")
     state_dir: Path = Path("data/state")
+    raw_chunk_records: int = 1
+    raw_chunk_seconds: float = 60.0
     request_timeout_seconds: float = 30.0
     user_agent: str = "ZettaPolymarketCollector/0.1"
     http_resolve_overrides: str = ""

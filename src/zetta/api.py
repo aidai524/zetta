@@ -63,14 +63,26 @@ class ProductApi:
     def stats_overview(self) -> dict[str, Any]:
         sql = """
             select
-              (select count() from dim_event final) as events,
-              (select count() from dim_market final) as markets,
-              (select count() from dim_outcome_token final) as outcome_tokens,
-              (select count() from fact_trade final) as trades,
-              (select count() from fact_price_history final) as price_points,
-              (select count() from fact_orderbook_snapshot) as orderbook_snapshots,
-              (select count() from fact_chain_log final) as chain_logs,
+              sumIf(rows, table = 'dim_event') as events,
+              sumIf(rows, table = 'dim_market') as markets,
+              sumIf(rows, table = 'dim_outcome_token') as outcome_tokens,
+              sumIf(rows, table = 'fact_trade') as trades,
+              sumIf(rows, table = 'fact_price_history') as price_points,
+              sumIf(rows, table = 'fact_orderbook_snapshot') as orderbook_snapshots,
+              sumIf(rows, table = 'fact_chain_log') as chain_logs,
               (select max(collected_at) from raw_ingest_log) as last_ingested_at
+            from system.parts
+            where database = currentDatabase()
+              and active
+              and table in (
+                'dim_event',
+                'dim_market',
+                'dim_outcome_token',
+                'fact_trade',
+                'fact_price_history',
+                'fact_orderbook_snapshot',
+                'fact_chain_log'
+              )
             format JSONEachRow
         """
         rows = rows_json(self.clickhouse.query_text(sql))

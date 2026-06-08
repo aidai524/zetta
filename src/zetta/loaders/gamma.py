@@ -4,9 +4,19 @@ import hashlib
 import json
 from dataclasses import dataclass
 from datetime import UTC, datetime
+from itertools import chain
 from pathlib import Path
 from typing import Any
 
+from zetta.loaders.incremental import (
+    clickhouse_state_dir,
+    loaded_max_raw_path,
+    loaded_payload_hashes,
+    loaded_payload_hashes_for_paths,
+    loader_checkpoint_raw_path,
+    save_loader_checkpoint_raw_path,
+)
+from zetta.loaders.parallel import raw_paths
 from zetta.models.normalize import (
     as_str,
     event_markets,
@@ -24,7 +34,7 @@ from zetta.models.normalize import (
     parse_dt,
 )
 from zetta.storage.clickhouse import ClickHouseWriter
-from zetta.storage.raw_reader import iter_raw_records
+from zetta.storage.raw_reader import iter_raw_records, iter_raw_records_from_paths
 
 
 @dataclass(frozen=True)
@@ -75,8 +85,57 @@ class GammaRawLoader:
     ) -> GammaLoadResult:
         if batch_size <= 0:
             raise ValueError("batch_size must be positive")
-        loaded_hashes = self.loaded_payload_hashes()
+        max_event_path = None if force else self.loader_checkpoint_raw_path("events")
+        max_event_path = max_event_path or (None if force else self.loaded_max_raw_path("events"))
+        max_market_path = None if force else self.loader_checkpoint_raw_path("markets")
+        max_market_path = max_market_path or (
+            None if force else self.loaded_max_raw_path("markets")
+        )
+        event_paths = (
+            raw_paths(raw_root, source="gamma", entity="events", after_path=max_event_path)
+            if not force and max_event_path is not None
+            else None
+        )
+        market_paths = (
+            raw_paths(raw_root, source="gamma", entity="markets", after_path=max_market_path)
+            if not force and max_market_path is not None
+            else None
+        )
+        if not force:
+            if self.loader_checkpoint_raw_path("events") is None and max_event_path is not None:
+                self.save_loader_checkpoint_raw_path("events", max_event_path)
+            if self.loader_checkpoint_raw_path("markets") is None and max_market_path is not None:
+                self.save_loader_checkpoint_raw_path("markets", max_market_path)
+        loaded_hashes = self.loaded_hashes_for_pending_paths(
+            event_paths=event_paths,
+            market_paths=market_paths,
+        )
+        if event_paths is None or market_paths is None:
+            loaded_hashes.update(self.loaded_payload_hashes())
+        records = (
+            iter_raw_records(raw_root, source="gamma")
+            if force
+            else chain(
+                iter_raw_records_from_paths(event_paths, after_path=max_event_path)
+                if event_paths is not None
+                else iter_raw_records(
+                    raw_root,
+                    source="gamma",
+                    entity="events",
+                    after_path=max_event_path,
+                ),
+                iter_raw_records_from_paths(market_paths, after_path=max_market_path)
+                if market_paths is not None
+                else iter_raw_records(
+                    raw_root,
+                    source="gamma",
+                    entity="markets",
+                    after_path=max_market_path,
+                ),
+            )
+        )
         batch = GammaLoadBatch()
+        last_raw_paths: dict[str, str] = {}
         result = GammaLoadResult(
             raw_records=0,
             skipped_raw_records=0,
@@ -91,9 +150,12 @@ class GammaRawLoader:
             ingest_logs=0,
         )
 
-        for record in iter_raw_records(raw_root, source="gamma"):
+        for record in records:
             object.__setattr__(result, "raw_records", result.raw_records + 1)
             entity = str(record.get("entity") or "")
+            raw_path = str(record.get("_raw_path") or "")
+            if raw_path:
+                last_raw_paths[entity] = raw_path
             payload = record.get("payload")
             digest = payload_hash(payload)
             already_loaded = digest in loaded_hashes
@@ -171,16 +233,61 @@ class GammaRawLoader:
                 batch.flush(self.clickhouse, result)
 
         batch.flush(self.clickhouse, result)
+        if not force:
+            for entity, raw_path in last_raw_paths.items():
+                self.save_loader_checkpoint_raw_path(entity, raw_path)
         return result
 
     def loaded_payload_hashes(self) -> set[str]:
-        try:
-            output = self.clickhouse.query_text(
-                "SELECT payload_hash FROM raw_ingest_log WHERE source = 'gamma' FORMAT TSV"
+        hashes: set[str] = set()
+        for entity in ("events", "markets"):
+            hashes.update(loaded_payload_hashes(self.clickhouse, source="gamma", entity=entity))
+        return hashes
+
+    def loaded_hashes_for_pending_paths(
+        self,
+        *,
+        event_paths: list[str] | None,
+        market_paths: list[str] | None,
+    ) -> set[str]:
+        hashes: set[str] = set()
+        if event_paths is not None:
+            hashes.update(
+                loaded_payload_hashes_for_paths(
+                    self.clickhouse,
+                    source="gamma",
+                    entity="events",
+                    paths=event_paths,
+                )
             )
-        except Exception:
-            return set()
-        return {line.strip() for line in output.splitlines() if line.strip()}
+        if market_paths is not None:
+            hashes.update(
+                loaded_payload_hashes_for_paths(
+                    self.clickhouse,
+                    source="gamma",
+                    entity="markets",
+                    paths=market_paths,
+                )
+            )
+        return hashes
+
+    def loaded_max_raw_path(self, entity: str) -> str | None:
+        return loaded_max_raw_path(self.clickhouse, source="gamma", entity=entity)
+
+    def loader_checkpoint_raw_path(self, entity: str) -> str | None:
+        return loader_checkpoint_raw_path(
+            clickhouse_state_dir(self.clickhouse),
+            source="gamma",
+            entity=entity,
+        )
+
+    def save_loader_checkpoint_raw_path(self, entity: str, raw_path: str) -> None:
+        save_loader_checkpoint_raw_path(
+            clickhouse_state_dir(self.clickhouse),
+            source="gamma",
+            entity=entity,
+            raw_path=raw_path,
+        )
 
 
 @dataclass
