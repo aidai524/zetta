@@ -38,6 +38,12 @@ class ProductApi:
             return ApiResponse(HTTPStatus.OK, {"system": collect_system_stats()})
         if path == "/tasks/progress":
             return ApiResponse(HTTPStatus.OK, self.tasks_progress(query))
+        if path == "/markets/overview":
+            return ApiResponse(HTTPStatus.OK, {"overview": self.market_overview()})
+        if path == "/markets/trending":
+            return ApiResponse(HTTPStatus.OK, {"markets": self.trending_markets(query)})
+        if path == "/categories/summary":
+            return ApiResponse(HTTPStatus.OK, {"categories": self.category_summary(query)})
         if path == "/markets/search":
             return ApiResponse(HTTPStatus.OK, {"markets": self.market_search(query)})
         if path == "/markets/detail":
@@ -49,13 +55,28 @@ class ProductApi:
             return ApiResponse(HTTPStatus.OK, {"trades": self.market_trades(query)})
         if path == "/events/timeline":
             return ApiResponse(HTTPStatus.OK, {"events": self.event_timeline(query)})
+        if path == "/events/wallet-flow":
+            return ApiResponse(HTTPStatus.OK, {"wallets": self.event_wallet_flow(query)})
+        if path == "/events/pnl-leaderboard":
+            return ApiResponse(HTTPStatus.OK, {"wallets": self.event_pnl_leaderboard(query)})
         if path == "/traders/profile":
             profile = self.trader_profile(query)
             if profile is None:
                 return ApiResponse(HTTPStatus.NOT_FOUND, {"error": "trader_not_found"})
             return ApiResponse(HTTPStatus.OK, {"profile": profile})
+        if path == "/wallets/reputation":
+            profile = self.wallet_reputation(query)
+            if profile is None:
+                return ApiResponse(HTTPStatus.NOT_FOUND, {"error": "wallet_not_found"})
+            return ApiResponse(HTTPStatus.OK, {"profile": profile})
+        if path == "/wallets/live-positions":
+            return ApiResponse(HTTPStatus.OK, {"positions": self.wallet_live_positions(query)})
+        if path == "/wallets/smart-money/activity":
+            return ApiResponse(HTTPStatus.OK, {"activity": self.smart_money_activity(query)})
         if path == "/markets/liquidity":
             return ApiResponse(HTTPStatus.OK, {"liquidity": self.market_liquidity(query)})
+        if path == "/signals/anomalies":
+            return ApiResponse(HTTPStatus.OK, {"signals": self.anomaly_signals(query)})
         if path == "/alerts":
             return ApiResponse(HTTPStatus.OK, {"alerts": self.alerts(query)})
         return ApiResponse(HTTPStatus.NOT_FOUND, {"error": "not_found"})
@@ -113,6 +134,164 @@ class ProductApi:
             node_id="api",
         ).progress(recent_limit=recent_limit)
 
+    def market_overview(self) -> dict[str, Any]:
+        sql = """
+            select
+              (select sum(rows) from system.parts where database = currentDatabase() and active and table = 'dim_event') as events,
+              (select sum(rows) from system.parts where database = currentDatabase() and active and table = 'dim_market') as markets,
+              (select count() from dim_market final where active = true and closed = false) as active_markets,
+              (select count() from dim_market final where closed = true) as completed_markets,
+              (select sum(rows) from system.parts where database = currentDatabase() and active and table = 'dim_outcome_token') as outcome_tokens,
+              (select sum(rows) from system.parts where database = currentDatabase() and active and table = 'fact_trade') as trades,
+              (select count() from mart_trader_profile final) as tracked_wallets,
+              (select uniqExact(user_address) from fact_trade where user_address != '' and timestamp >= now64(3) - interval 24 hour) as active_wallets_24h,
+              (select sum(notional) from fact_trade where timestamp >= now64(3) - interval 24 hour) as volume_24h,
+              (select sum(liquidity) from dim_market final where active = true and closed = false) as active_liquidity,
+              (select count() from mart_event_anomaly_signal final) as anomaly_signals,
+              (select countIf(severity = 'high') from mart_event_anomaly_signal final) as high_anomaly_signals,
+              (select max(collected_at) from raw_ingest_log) as last_ingested_at
+            format JSONEachRow
+        """
+        rows = rows_json(self.clickhouse.query_text(sql))
+        return rows[0] if rows else {}
+
+    def trending_markets(self, query: dict[str, list[str]]) -> list[dict[str, Any]]:
+        limit = int_param(query, "limit", 20, maximum=100)
+        status = param(query, "status")
+        category = param(query, "category")
+        where = "where base.market_id != ''"
+        if status == "active":
+            where += " and base.active = true and base.closed = false"
+        elif status == "closed":
+            where += " and base.closed = true"
+        if category:
+            where += f" and base.category = {ch_string(category)}"
+        sql = f"""
+            select
+              base.market_id as market_id,
+              base.event_id as event_id,
+              base.condition_id as condition_id,
+              base.question as question,
+              base.slug as slug,
+              base.category as category,
+              base.active as active,
+              base.closed as closed,
+              base.volume as volume,
+              base.liquidity as liquidity,
+              base.start_time as start_time,
+              base.end_time as end_time,
+              base.updated_at as updated_at,
+              ifNull(signal_count, 0) as signal_count,
+              ifNull(high_signal_count, 0) as high_signal_count,
+              ifNull(latest_trade_at, toDateTime64(0, 3, 'UTC')) as latest_trade_at,
+              ifNull(volume_24h, 0.0) as volume_24h,
+              ifNull(wallets_24h, 0) as wallets_24h
+            from
+            (
+              select
+                markets.market_id as market_id,
+                markets.event_id as event_id,
+                markets.condition_id as condition_id,
+                markets.question as question,
+                markets.slug as slug,
+                events.category as category,
+                markets.active as active,
+                markets.closed as closed,
+                markets.volume as volume,
+                markets.liquidity as liquidity,
+                markets.start_time as start_time,
+                markets.end_time as end_time,
+                markets.updated_at as updated_at
+              from dim_market as markets final
+              left join dim_event as events final on markets.event_id = events.event_id
+            ) as base
+            left join
+            (
+              select
+                condition_id,
+                max(timestamp) as latest_trade_at,
+                sum(notional) as volume_24h,
+                uniqExactIf(user_address, user_address != '') as wallets_24h
+              from fact_trade
+              where condition_id != ''
+                and timestamp >= now64(3) - interval 24 hour
+              group by condition_id
+            ) as trade_stats on base.condition_id = trade_stats.condition_id
+            left join
+            (
+              select
+                market_id,
+                count() as signal_count,
+                countIf(severity = 'high') as high_signal_count
+              from mart_event_anomaly_signal final
+              where market_id != ''
+              group by market_id
+            ) as signal_stats on base.market_id = signal_stats.market_id
+            {where}
+            order by
+              volume_24h desc,
+              high_signal_count desc,
+              signal_count desc,
+              volume desc
+            limit {limit}
+            format JSONEachRow
+        """
+        return rows_json(self.clickhouse.query_text(sql))
+
+    def category_summary(self, query: dict[str, list[str]]) -> list[dict[str, Any]]:
+        limit = int_param(query, "limit", 12, maximum=50)
+        sql = f"""
+            select
+              base.category as category,
+              base.market_count as market_count,
+              base.active_market_count as active_market_count,
+              base.closed_market_count as closed_market_count,
+              base.volume as volume,
+              base.liquidity as liquidity,
+              ifNull(flows.volume_24h, 0.0) as volume_24h,
+              ifNull(flows.active_wallets_24h, 0) as active_wallets_24h,
+              ifNull(signals.signal_count, 0) as signal_count
+            from
+            (
+              select
+                if(events.category = '', 'Uncategorized', events.category) as category,
+                count() as market_count,
+                countIf(markets.active = true and markets.closed = false) as active_market_count,
+                countIf(markets.closed = true) as closed_market_count,
+                sum(markets.volume) as volume,
+                sum(markets.liquidity) as liquidity
+              from dim_market as markets final
+              left join dim_event as events final on markets.event_id = events.event_id
+              group by category
+            ) as base
+            left join
+            (
+              select
+                if(events.category = '', 'Uncategorized', events.category) as category,
+                sum(trades.notional) as volume_24h,
+                uniqExact(trades.user_address) as active_wallets_24h
+              from fact_trade as trades
+              inner join dim_market as markets final on trades.condition_id = markets.condition_id
+              left join dim_event as events final on markets.event_id = events.event_id
+              where trades.timestamp >= now64(3) - interval 24 hour
+                and trades.user_address != ''
+              group by category
+            ) as flows on base.category = flows.category
+            left join
+            (
+              select
+                if(events.category = '', 'Uncategorized', events.category) as category,
+                count() as signal_count
+              from mart_event_anomaly_signal as signals final
+              left join dim_event as events final on signals.event_id = events.event_id
+              group by category
+            ) as signals on base.category = signals.category
+            order by volume_24h desc, base.volume desc
+            limit {limit}
+            format JSONEachRow
+        """
+        return rows_json(self.clickhouse.query_text(sql))
+
     def market_search(self, query: dict[str, list[str]]) -> list[dict[str, Any]]:
         text = param(query, "q").lower()
         limit = int_param(query, "limit", 25, maximum=100)
@@ -121,7 +300,9 @@ class ProductApi:
             escaped = ch_string(text)
             where += (
                 " and (positionCaseInsensitive(question, "
-                f"{escaped}) > 0 or positionCaseInsensitive(slug, {escaped}) > 0)"
+                f"{escaped}) > 0 or positionCaseInsensitive(slug, {escaped}) > 0"
+                f" or positionCaseInsensitive(condition_id, {escaped}) > 0"
+                f" or positionCaseInsensitive(category, {escaped}) > 0)"
             )
         sql = f"""
             select
@@ -130,11 +311,27 @@ class ProductApi:
               condition_id,
               question,
               slug,
+              category,
               active,
               closed,
               volume,
               liquidity
-            from dim_market final
+            from
+            (
+              select
+                markets.market_id as market_id,
+                markets.event_id as event_id,
+                markets.condition_id as condition_id,
+                markets.question as question,
+                markets.slug as slug,
+                if(events.category = '', 'Uncategorized', events.category) as category,
+                markets.active as active,
+                markets.closed as closed,
+                markets.volume as volume,
+                markets.liquidity as liquidity
+              from dim_market as markets final
+              left join dim_event as events final on markets.event_id = events.event_id
+            ) as base
             {where}
             order by volume desc, liquidity desc
             limit {limit}
@@ -147,31 +344,33 @@ class ProductApi:
         condition_id = param(query, "condition_id")
         where = "where 1 = 1"
         if market_id:
-            where += f" and market_id = {ch_string(market_id)}"
+            where += f" and markets.market_id = {ch_string(market_id)}"
         elif condition_id:
-            where += f" and condition_id = {ch_string(condition_id)}"
+            where += f" and markets.condition_id = {ch_string(condition_id)}"
         else:
             return None
         sql = f"""
             select
-              market_id,
-              condition_id,
-              question,
-              slug,
-              event_id,
-              active,
-              closed,
-              archived,
-              accepting_orders,
-              volume,
-              liquidity,
-              start_time,
-              end_time,
-              created_at,
-              updated_at
-            from dim_market final
+              markets.market_id as market_id,
+              markets.condition_id as condition_id,
+              markets.question as question,
+              markets.slug as slug,
+              markets.event_id as event_id,
+              if(events.category = '', 'Uncategorized', events.category) as category,
+              markets.active as active,
+              markets.closed as closed,
+              markets.archived as archived,
+              markets.accepting_orders as accepting_orders,
+              markets.volume as volume,
+              markets.liquidity as liquidity,
+              markets.start_time as start_time,
+              markets.end_time as end_time,
+              markets.created_at as created_at,
+              markets.updated_at as updated_at
+            from dim_market as markets final
+            left join dim_event as events final on markets.event_id = events.event_id
             {where}
-            order by updated_at desc
+            order by markets.updated_at desc
             limit 1
             format JSONEachRow
         """
@@ -259,6 +458,76 @@ class ProductApi:
         """
         return rows_json(self.clickhouse.query_text(sql))
 
+    def event_wallet_flow(self, query: dict[str, list[str]]) -> list[dict[str, Any]]:
+        event_id = param(query, "event_id")
+        market_id = param(query, "market_id")
+        condition_id = param(query, "condition_id")
+        limit = int_param(query, "limit", 50, maximum=500)
+        if event_id:
+            trade_filter = (
+                "market_id in "
+                f"(select market_id from dim_market final where event_id = {ch_string(event_id)})"
+            )
+        elif market_id:
+            trade_filter = f"market_id = {ch_string(market_id)}"
+        elif condition_id:
+            trade_filter = f"condition_id = {ch_string(condition_id)}"
+        else:
+            return []
+        sql = f"""
+            select
+              user_address,
+              count() as trade_count,
+              countIf(side = 'BUY') as buy_count,
+              countIf(side = 'SELL') as sell_count,
+              sumIf(notional, side = 'BUY') as buy_notional,
+              sumIf(notional, side = 'SELL') as sell_notional,
+              sum(notional) as traded_notional,
+              sum(if(side = 'BUY', size, -size)) as net_size,
+              sum(if(side = 'BUY', notional, -notional)) as net_buy_notional,
+              min(timestamp) as first_trade_at,
+              max(timestamp) as last_trade_at
+            from fact_trade
+            where user_address != ''
+              and {trade_filter}
+            group by user_address
+            order by traded_notional desc
+            limit {limit}
+            format JSONEachRow
+        """
+        return rows_json(self.clickhouse.query_text(sql))
+
+    def event_pnl_leaderboard(self, query: dict[str, list[str]]) -> list[dict[str, Any]]:
+        event_id = param(query, "event_id")
+        limit = int_param(query, "limit", 50, maximum=500)
+        if not event_id:
+            return []
+        sql = f"""
+            select
+              event_id,
+              user_address,
+              event_title,
+              category,
+              trade_count,
+              traded_notional,
+              buy_notional,
+              sell_notional,
+              net_cashflow,
+              final_position_value,
+              realized_pnl,
+              roi,
+              settlement_status,
+              data_quality,
+              first_trade_at,
+              last_trade_at
+            from mart_event_wallet_pnl final
+            where event_id = {ch_string(event_id)}
+            order by realized_pnl desc, traded_notional desc
+            limit {limit}
+            format JSONEachRow
+        """
+        return rows_json(self.clickhouse.query_text(sql))
+
     def trader_profile(self, query: dict[str, list[str]]) -> dict[str, Any] | None:
         user = param(query, "user").lower()
         if not user:
@@ -295,6 +564,177 @@ class ProductApi:
         rows = rows_json(self.clickhouse.query_text(sql))
         return rows[0] if rows else None
 
+    def wallet_reputation(self, query: dict[str, list[str]]) -> dict[str, Any] | None:
+        user = param(query, "user").lower()
+        if not user:
+            return None
+        sql = f"""
+            select
+              user_address,
+              completed_event_count,
+              profitable_event_count,
+              losing_event_count,
+              win_rate,
+              realized_pnl,
+              positive_pnl,
+              negative_pnl,
+              buy_notional,
+              sell_notional,
+              traded_notional,
+              trade_count,
+              avg_event_roi,
+              best_event_pnl,
+              worst_event_pnl,
+              active_position_count,
+              active_event_count,
+              active_unrealized_pnl_estimate,
+              favorite_category,
+              favorite_category_notional,
+              first_trade_at,
+              last_trade_at
+            from mart_wallet_reputation final
+            where user_address = {ch_string(user)}
+            limit 1
+            format JSONEachRow
+        """
+        rows = rows_json(self.clickhouse.query_text(sql))
+        if rows:
+            return rows[0]
+        fallback_sql = f"""
+            select
+              user_address,
+              0 as completed_event_count,
+              0 as profitable_event_count,
+              0 as losing_event_count,
+              0.0 as win_rate,
+              realized_pnl,
+              greatest(realized_pnl, 0.0) as positive_pnl,
+              least(realized_pnl, 0.0) as negative_pnl,
+              0.0 as buy_notional,
+              0.0 as sell_notional,
+              traded_notional,
+              trade_count,
+              0.0 as avg_event_roi,
+              0.0 as best_event_pnl,
+              0.0 as worst_event_pnl,
+              position_count as active_position_count,
+              0 as active_event_count,
+              total_pnl as active_unrealized_pnl_estimate,
+              '' as favorite_category,
+              0.0 as favorite_category_notional,
+              first_trade_at,
+              last_trade_at
+            from mart_trader_profile final
+            where user_address = {ch_string(user)}
+            limit 1
+            format JSONEachRow
+        """
+        fallback_rows = rows_json(self.clickhouse.query_text(fallback_sql))
+        return fallback_rows[0] if fallback_rows else None
+
+    def wallet_live_positions(self, query: dict[str, list[str]]) -> list[dict[str, Any]]:
+        user = param(query, "user").lower()
+        event_id = param(query, "event_id")
+        limit = int_param(query, "limit", 50, maximum=500)
+        where = "where 1 = 1"
+        if user:
+            where += f" and user_address = {ch_string(user)}"
+        if event_id:
+            where += f" and event_id = {ch_string(event_id)}"
+        if not user and not event_id:
+            where += " and 1 = 0"
+        sql = f"""
+            select
+              event_id,
+              market_id,
+              condition_id,
+              token_id,
+              outcome,
+              user_address,
+              position_size,
+              avg_entry_price,
+              mark_price,
+              mark_price_source,
+              mark_price_at,
+              current_value,
+              unrealized_pnl_estimate,
+              traded_notional,
+              net_size_24h,
+              net_notional_24h,
+              latest_action,
+              is_accumulating,
+              data_quality,
+              last_trade_at
+            from mart_live_wallet_position final
+            {where}
+            order by abs(unrealized_pnl_estimate) desc, traded_notional desc
+            limit {limit}
+            format JSONEachRow
+        """
+        return rows_json(self.clickhouse.query_text(sql))
+
+    def smart_money_activity(self, query: dict[str, list[str]]) -> list[dict[str, Any]]:
+        limit = int_param(query, "limit", 30, maximum=100)
+        sql = f"""
+            select
+              positions.event_id,
+              positions.market_id,
+              positions.condition_id,
+              positions.token_id,
+              positions.outcome,
+              positions.user_address,
+              positions.position_size,
+              positions.traded_notional,
+              positions.unrealized_pnl_estimate,
+              positions.net_size_24h,
+              positions.net_notional_24h,
+              positions.latest_action,
+              positions.last_trade_at,
+              ifNull(rep.win_rate, 0.0) as win_rate,
+              ifNull(rep.realized_pnl, 0.0) as realized_pnl,
+              ifNull(rep.completed_event_count, 0) as completed_event_count,
+              ifNull(rep.favorite_category, '') as favorite_category
+            from mart_live_wallet_position as positions final
+            left join mart_wallet_reputation as rep final
+              on positions.user_address = rep.user_address
+            where positions.user_address != ''
+            order by
+              rep.realized_pnl desc,
+              abs(positions.net_notional_24h) desc,
+              positions.traded_notional desc
+            limit {limit}
+            format JSONEachRow
+        """
+        rows = rows_json(self.clickhouse.query_text(sql))
+        if rows:
+            return rows
+        fallback_sql = f"""
+            select
+              '' as event_id,
+              '' as market_id,
+              '' as condition_id,
+              '' as token_id,
+              '' as outcome,
+              user_address,
+              0.0 as position_size,
+              traded_notional,
+              total_pnl as unrealized_pnl_estimate,
+              0.0 as net_size_24h,
+              0.0 as net_notional_24h,
+              'PROFILE' as latest_action,
+              last_trade_at,
+              0.0 as win_rate,
+              realized_pnl,
+              0 as completed_event_count,
+              '' as favorite_category
+            from mart_trader_profile final
+            where user_address != ''
+            order by traded_notional desc, trade_count desc
+            limit {limit}
+            format JSONEachRow
+        """
+        return rows_json(self.clickhouse.query_text(fallback_sql))
+
     def market_liquidity(self, query: dict[str, list[str]]) -> list[dict[str, Any]]:
         token_id = param(query, "token_id")
         limit = int_param(query, "limit", 25, maximum=100)
@@ -316,6 +756,52 @@ class ProductApi:
             {where}
             group by token_id
             order by captured_at desc
+            limit {limit}
+            format JSONEachRow
+        """
+        return rows_json(self.clickhouse.query_text(sql))
+
+    def anomaly_signals(self, query: dict[str, list[str]]) -> list[dict[str, Any]]:
+        signal_type = param(query, "type")
+        severity = param(query, "severity")
+        event_id = param(query, "event_id")
+        market_id = param(query, "market_id")
+        wallet = param(query, "user").lower()
+        limit = int_param(query, "limit", 50, maximum=500)
+        where = "where 1 = 1"
+        if signal_type:
+            where += f" and signal_type = {ch_string(signal_type)}"
+        if severity:
+            where += f" and severity = {ch_string(severity)}"
+        if event_id:
+            where += f" and event_id = {ch_string(event_id)}"
+        if market_id:
+            where += f" and market_id = {ch_string(market_id)}"
+        if wallet:
+            where += f" and user_address = {ch_string(wallet)}"
+        sql = f"""
+            select
+              signal_id,
+              signal_type,
+              severity,
+              event_id,
+              market_id,
+              condition_id,
+              token_id,
+              outcome,
+              user_address,
+              occurred_at,
+              metric_name,
+              metric_value,
+              baseline_value,
+              threshold,
+              evidence_json,
+              message,
+              uncertainty,
+              updated_at
+            from mart_event_anomaly_signal final
+            {where}
+            order by occurred_at desc
             limit {limit}
             format JSONEachRow
         """

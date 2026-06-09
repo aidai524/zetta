@@ -436,6 +436,36 @@ def build_parser() -> argparse.ArgumentParser:
     )
     trader_chain_pnl.set_defaults(func=cmd_build_trader_chain_pnl)
 
+    event_wallet_pnl = build_subparsers.add_parser(
+        "event-wallet-pnl", help="Build completed event wallet PnL mart."
+    )
+    event_wallet_pnl.set_defaults(func=cmd_build_event_wallet_pnl)
+
+    live_wallet_positions = build_subparsers.add_parser(
+        "live-wallet-positions", help="Build active event wallet position mart."
+    )
+    live_wallet_positions.set_defaults(func=cmd_build_live_wallet_positions)
+
+    wallet_reputation = build_subparsers.add_parser(
+        "wallet-reputation", help="Build wallet historical reputation mart."
+    )
+    wallet_reputation.set_defaults(func=cmd_build_wallet_reputation)
+
+    event_anomaly_signals = build_subparsers.add_parser(
+        "event-anomaly-signals", help="Build event anomaly signal mart."
+    )
+    event_anomaly_signals.add_argument("--large-trade-threshold", type=float, default=1_000.0)
+    event_anomaly_signals.add_argument("--liquidity-ratio-threshold", type=float, default=0.10)
+    event_anomaly_signals.add_argument("--coordinated-wallet-threshold", type=int, default=5)
+    event_anomaly_signals.add_argument("--coordinated-notional-threshold", type=float, default=5_000.0)
+    event_anomaly_signals.add_argument("--since-hours", type=int, default=168)
+    event_anomaly_signals.set_defaults(func=cmd_build_event_anomaly_signals)
+
+    analytics_core = build_subparsers.add_parser(
+        "analytics-core", help="Build core event, wallet, live position, and anomaly marts."
+    )
+    analytics_core.set_defaults(func=cmd_build_analytics_core)
+
     alerts = build_subparsers.add_parser("alerts", help="Build alert mart.")
     alerts.add_argument("--price-move-threshold", type=float, default=0.10)
     alerts.add_argument("--spread-threshold", type=float, default=0.05)
@@ -1270,6 +1300,33 @@ def cmd_build_trader_profiles(_args: argparse.Namespace, app_settings: Settings)
 
 def cmd_build_trader_chain_pnl(_args: argparse.Namespace, app_settings: Settings) -> Any:
     return MartBuilder(clickhouse=ClickHouseWriter(app_settings)).build_trader_chain_pnl()
+
+
+def cmd_build_event_wallet_pnl(_args: argparse.Namespace, app_settings: Settings) -> Any:
+    return MartBuilder(clickhouse=ClickHouseWriter(app_settings)).build_event_wallet_pnl()
+
+
+def cmd_build_live_wallet_positions(_args: argparse.Namespace, app_settings: Settings) -> Any:
+    return MartBuilder(clickhouse=ClickHouseWriter(app_settings)).build_live_wallet_positions()
+
+
+def cmd_build_wallet_reputation(_args: argparse.Namespace, app_settings: Settings) -> Any:
+    return MartBuilder(clickhouse=ClickHouseWriter(app_settings)).build_wallet_reputation()
+
+
+def cmd_build_event_anomaly_signals(args: argparse.Namespace, app_settings: Settings) -> Any:
+    return MartBuilder(clickhouse=ClickHouseWriter(app_settings)).build_event_anomaly_signals(
+        large_trade_threshold=args.large_trade_threshold,
+        liquidity_ratio_threshold=args.liquidity_ratio_threshold,
+        coordinated_wallet_threshold=args.coordinated_wallet_threshold,
+        coordinated_notional_threshold=args.coordinated_notional_threshold,
+        since_hours=args.since_hours,
+    )
+
+
+def cmd_build_analytics_core(_args: argparse.Namespace, app_settings: Settings) -> Any:
+    results = MartBuilder(clickhouse=ClickHouseWriter(app_settings)).build_analytics_core()
+    return {"marts": [asdict(result) for result in results]}
 
 
 def cmd_build_alerts(args: argparse.Namespace, app_settings: Settings) -> Any:

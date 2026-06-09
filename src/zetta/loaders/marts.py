@@ -359,6 +359,824 @@ class MartBuilder:
         )
         return MartBuildResult(mart="trader_chain_pnl", rows=rows)
 
+    def build_event_wallet_pnl(self) -> MartBuildResult:
+        self.clickhouse.execute(
+            """
+            insert into mart_event_wallet_pnl
+            select
+              event_id,
+              user_address,
+              event_title,
+              category,
+              market_count,
+              token_count,
+              trade_count,
+              buy_count,
+              sell_count,
+              buy_size,
+              sell_size,
+              traded_size,
+              buy_notional,
+              sell_notional,
+              traded_notional,
+              net_cashflow,
+              final_position_value,
+              net_cashflow + final_position_value as realized_pnl,
+              if(buy_notional = 0, 0.0, (net_cashflow + final_position_value) / buy_notional)
+                as roi,
+              first_trade_at,
+              last_trade_at,
+              closed_market_count,
+              resolved_market_count,
+              multiIf(
+                resolved_market_count = 0, 'unresolved',
+                resolved_market_count < closed_market_count, 'partial_resolution',
+                'resolved'
+              ) as settlement_status,
+              multiIf(
+                min_token_position < -0.000001, 'needs_chain_balance',
+                resolved_market_count < closed_market_count, 'partial_resolution',
+                'data_api_estimate'
+              ) as data_quality,
+              now64(3) as updated_at
+            from
+            (
+              select
+                wallet.event_id,
+                wallet.user_address,
+                anyLast(wallet.event_title) as event_title,
+                anyLast(wallet.category) as category,
+                uniqExact(wallet.market_id) as market_count,
+                count() as token_count,
+                sum(wallet.trade_count) as trade_count,
+                sum(wallet.buy_count) as buy_count,
+                sum(wallet.sell_count) as sell_count,
+                sum(wallet.buy_size) as buy_size,
+                sum(wallet.sell_size) as sell_size,
+                sum(wallet.traded_size) as traded_size,
+                sum(wallet.buy_notional) as buy_notional,
+                sum(wallet.sell_notional) as sell_notional,
+                sum(wallet.traded_notional) as traded_notional,
+                sum(wallet.net_cashflow) as net_cashflow,
+                sum(wallet.final_position_value) as final_position_value,
+                min(wallet.first_trade_at) as first_trade_at,
+                max(wallet.last_trade_at) as last_trade_at,
+                anyIf(stats.closed_market_count, stats.event_id != '') as closed_market_count,
+                anyIf(stats.resolved_market_count, stats.event_id != '') as resolved_market_count,
+                min(wallet.position_size) as min_token_position
+              from
+              (
+                select
+                  event_id,
+                  user_address,
+                  anyLast(event_title) as event_title,
+                  anyLast(category) as category,
+                  anyLast(market_id) as market_id,
+                  token_id,
+                  count() as trade_count,
+                  countIf(side = 'BUY') as buy_count,
+                  countIf(side = 'SELL') as sell_count,
+                  sumIf(size, side = 'BUY') as buy_size,
+                  sumIf(size, side = 'SELL') as sell_size,
+                  sum(size) as traded_size,
+                  sumIf(notional, side = 'BUY') as buy_notional,
+                  sumIf(notional, side = 'SELL') as sell_notional,
+                  sum(notional) as traded_notional,
+                  sum(if(side = 'SELL', notional, -notional)) as net_cashflow,
+                  sum(if(side = 'BUY', size, -size)) as position_size,
+                  sum(if(side = 'BUY', size, -size)) * anyLast(final_price)
+                    as final_position_value,
+                  min(timestamp) as first_trade_at,
+                  max(timestamp) as last_trade_at
+                  from
+                  (
+                    select
+                      trades.trade_id as trade_id,
+                      trades.timestamp as timestamp,
+                      trades.token_id as token_id,
+                      trades.user_address as user_address,
+                      trades.side as side,
+                      trades.price as price,
+                      trades.size as size,
+                      trades.notional as notional,
+                      markets.market_id as market_id,
+                      markets.event_id as event_id,
+                      if(events.title = '', markets.question, events.title) as event_title,
+                      events.category as category,
+                      resolved.final_price as final_price
+                  from
+                  (
+                    select
+                      trade_id,
+                      anyLast(raw_timestamp) as timestamp,
+                      anyLast(raw_condition_id) as condition_id,
+                      anyLast(raw_token_id) as token_id,
+                      anyLast(raw_user_address) as user_address,
+                      anyLast(raw_side) as side,
+                      anyLast(raw_price) as price,
+                      anyLast(raw_size) as size,
+                      anyLast(raw_notional) as notional
+                    from
+                    (
+                      select
+                        trade_id,
+                        timestamp as raw_timestamp,
+                        condition_id as raw_condition_id,
+                        token_id as raw_token_id,
+                        user_address as raw_user_address,
+                        side as raw_side,
+                        price as raw_price,
+                        size as raw_size,
+                        notional as raw_notional
+                      from fact_trade
+                      where user_address != '' and condition_id != '' and token_id != ''
+                    )
+                    group by trade_id
+                  ) as trades
+                  inner join
+                  (
+                    select
+                      raw_condition_id as condition_id,
+                      anyLast(raw_market_id) as market_id,
+                      anyLast(raw_event_id) as event_id,
+                      anyLast(raw_question) as question
+                    from
+                    (
+                      select
+                        condition_id as raw_condition_id,
+                        market_id as raw_market_id,
+                        event_id as raw_event_id,
+                        question as raw_question
+                      from dim_market as m final
+                      where condition_id != '' and event_id != '' and closed = true
+                    )
+                    group by condition_id
+                  ) as markets on trades.condition_id = markets.condition_id
+                  inner join
+                  (
+                    select
+                      resolved_prices.market_id as market_id,
+                      resolved_prices.condition_id as condition_id,
+                      tokens.token_id as token_id,
+                      resolved_prices.final_price as final_price
+                    from
+                    (
+                      select
+                        market_id,
+                        condition_id,
+                        price_index - 1 as outcome_index,
+                        toFloat64OrZero(JSONExtractString(price_raw)) as final_price
+                      from
+                      (
+                        select
+                          market_id,
+                          condition_id,
+                          JSONExtractString(raw_json, 'outcomePrices') as prices
+                        from dim_market as m final
+                        where closed = true and prices != ''
+                      )
+                      array join
+                        JSONExtractArrayRaw(prices) as price_raw,
+                        arrayEnumerate(JSONExtractArrayRaw(prices)) as price_index
+                    ) as resolved_prices
+                    inner join dim_outcome_token as tokens final
+                      on tokens.market_id = resolved_prices.market_id
+                     and tokens.outcome_index = resolved_prices.outcome_index
+                  ) as resolved
+                    on resolved.market_id = markets.market_id
+                   and resolved.condition_id = trades.condition_id
+                   and resolved.token_id = trades.token_id
+                  left join dim_event as events final on markets.event_id = events.event_id
+                )
+                group by event_id, user_address, token_id
+              ) as wallet
+              left join
+              (
+                select
+                  event_id,
+                  count() as closed_market_count,
+                  countIf(winner_count = 1) as resolved_market_count
+                from
+                (
+                  select
+                    event_id,
+                    market_id,
+                    arrayCount(
+                      price -> toFloat64OrZero(JSONExtractString(price)) >= 0.999,
+                      JSONExtractArrayRaw(JSONExtractString(raw_json, 'outcomePrices'))
+                    ) as winner_count
+                  from dim_market as m final
+                  where event_id != '' and closed = true
+                )
+                group by event_id
+              ) as stats on wallet.event_id = stats.event_id
+              group by wallet.event_id, wallet.user_address
+            )
+            where event_id != '' and user_address != ''
+            """
+        )
+        rows = int(self.clickhouse.query_text("select count() from mart_event_wallet_pnl").strip() or "0")
+        return MartBuildResult(mart="event_wallet_pnl", rows=rows)
+
+    def build_live_wallet_positions(self) -> MartBuildResult:
+        self.clickhouse.execute(
+            """
+            insert into mart_live_wallet_position
+            select
+              positions.event_id,
+              positions.market_id,
+              positions.condition_id,
+              positions.token_id,
+              positions.outcome,
+              positions.user_address,
+              positions.trade_count,
+              positions.buy_count,
+              positions.sell_count,
+              positions.buy_size,
+              positions.sell_size,
+              positions.position_size,
+              positions.buy_notional,
+              positions.sell_notional,
+              positions.traded_notional,
+              positions.net_cashflow,
+              if(positions.buy_size = 0, cast(null, 'Nullable(Float64)'), positions.buy_notional / positions.buy_size)
+                as avg_entry_price,
+              marks.mark_price,
+              marks.mark_price_source,
+              marks.mark_price_at,
+              positions.position_size * ifNull(marks.mark_price, 0.0) as current_value,
+              positions.net_cashflow + positions.position_size * ifNull(marks.mark_price, 0.0)
+                as unrealized_pnl_estimate,
+              positions.first_trade_at,
+              positions.last_trade_at,
+              positions.net_size_24h,
+              positions.net_notional_24h,
+              positions.latest_action,
+              positions.net_size_24h > 0 and positions.position_size > 0 as is_accumulating,
+              multiIf(
+                marks.mark_price_source = 'missing', 'missing_mark_price',
+                positions.position_size < -0.000001, 'needs_chain_balance',
+                'estimate'
+              ) as data_quality,
+              now64(3) as updated_at
+            from
+            (
+              select
+                markets.event_id as event_id,
+                markets.market_id as market_id,
+                trades.condition_id as condition_id,
+                trades.token_id as token_id,
+                anyLast(tokens.outcome) as outcome,
+                trades.user_address as user_address,
+                count() as trade_count,
+                countIf(trades.side = 'BUY') as buy_count,
+                countIf(trades.side = 'SELL') as sell_count,
+                sumIf(trades.size, trades.side = 'BUY') as buy_size,
+                sumIf(trades.size, trades.side = 'SELL') as sell_size,
+                sum(if(trades.side = 'BUY', trades.size, -trades.size)) as position_size,
+                sumIf(trades.notional, trades.side = 'BUY') as buy_notional,
+                sumIf(trades.notional, trades.side = 'SELL') as sell_notional,
+                sum(trades.notional) as traded_notional,
+                sum(if(trades.side = 'SELL', trades.notional, -trades.notional)) as net_cashflow,
+                min(trades.timestamp) as first_trade_at,
+                max(trades.timestamp) as last_trade_at,
+                sumIf(
+                  if(trades.side = 'BUY', trades.size, -trades.size),
+                  trades.timestamp >= now64(3) - interval 24 hour
+                ) as net_size_24h,
+                sumIf(
+                  if(trades.side = 'BUY', trades.notional, -trades.notional),
+                  trades.timestamp >= now64(3) - interval 24 hour
+                ) as net_notional_24h,
+                argMax(trades.side, trades.timestamp) as latest_action
+              from
+              (
+                select
+                  trade_id,
+                  anyLast(raw_timestamp) as timestamp,
+                  anyLast(raw_condition_id) as condition_id,
+                  anyLast(raw_token_id) as token_id,
+                  anyLast(raw_user_address) as user_address,
+                  anyLast(raw_side) as side,
+                  anyLast(raw_size) as size,
+                  anyLast(raw_notional) as notional
+                from
+                (
+                  select
+                    trade_id,
+                    timestamp as raw_timestamp,
+                    condition_id as raw_condition_id,
+                    token_id as raw_token_id,
+                    user_address as raw_user_address,
+                    side as raw_side,
+                    size as raw_size,
+                    notional as raw_notional
+                  from fact_trade
+                  where user_address != '' and condition_id != '' and token_id != ''
+                )
+                group by trade_id
+              ) as trades
+              inner join
+              (
+                select
+                  raw_condition_id as condition_id,
+                  anyLast(raw_market_id) as market_id,
+                  anyLast(raw_event_id) as event_id
+                from
+                (
+                  select
+                    condition_id as raw_condition_id,
+                    market_id as raw_market_id,
+                    event_id as raw_event_id
+                  from dim_market as m final
+                  where condition_id != ''
+                    and event_id != ''
+                    and active = true
+                    and closed = false
+                    and archived = false
+                )
+                group by condition_id
+              ) as markets on trades.condition_id = markets.condition_id
+              left join dim_outcome_token as tokens final
+                on tokens.market_id = markets.market_id
+               and tokens.token_id = trades.token_id
+              group by
+                markets.event_id,
+                markets.market_id,
+                trades.condition_id,
+                trades.token_id,
+                trades.user_address
+              having abs(position_size) > 0.000001
+            ) as positions
+            left join
+            (
+              select
+                token_ids.token_id as token_id,
+                multiIf(
+                  latest_book.best_bid is not null and latest_book.best_ask is not null,
+                    cast((latest_book.best_bid + latest_book.best_ask) / 2, 'Nullable(Float64)'),
+                  latest_price.mark_at > toDateTime64(0, 3, 'UTC'),
+                    cast(latest_price.price, 'Nullable(Float64)'),
+                  cast(null, 'Nullable(Float64)')
+                ) as mark_price,
+                multiIf(
+                  latest_book.best_bid is not null and latest_book.best_ask is not null,
+                    'orderbook_mid',
+                  latest_price.mark_at > toDateTime64(0, 3, 'UTC'),
+                    'price_history',
+                  'missing'
+                ) as mark_price_source,
+                multiIf(
+                  latest_book.best_bid is not null and latest_book.best_ask is not null,
+                    cast(latest_book.mark_at, 'Nullable(DateTime64(3, \\'UTC\\'))'),
+                  latest_price.mark_at > toDateTime64(0, 3, 'UTC'),
+                    cast(latest_price.mark_at, 'Nullable(DateTime64(3, \\'UTC\\'))'),
+                  cast(null, 'Nullable(DateTime64(3, \\'UTC\\'))')
+                ) as mark_price_at
+              from
+              (
+                select token_id
+                from dim_outcome_token as t final
+                where token_id != ''
+                group by token_id
+              ) as token_ids
+              left join
+              (
+                select
+                  token_id,
+                  argMax(price, ts) as price,
+                  max(ts) as mark_at
+                from
+                (
+                  select token_id, timestamp as ts, price
+                  from fact_price_history final
+                )
+                group by token_id
+              ) as latest_price on token_ids.token_id = latest_price.token_id
+              left join
+              (
+                select
+                  token_id,
+                  argMax(best_bid, captured_at) as best_bid,
+                  argMax(best_ask, captured_at) as best_ask,
+                  max(captured_at) as mark_at
+                from fact_orderbook_snapshot
+                group by token_id
+              ) as latest_book on token_ids.token_id = latest_book.token_id
+            ) as marks on positions.token_id = marks.token_id
+            """
+        )
+        rows = int(
+            self.clickhouse.query_text("select count() from mart_live_wallet_position").strip()
+            or "0"
+        )
+        return MartBuildResult(mart="live_wallet_position", rows=rows)
+
+    def build_wallet_reputation(self) -> MartBuildResult:
+        self.clickhouse.execute(
+            """
+            insert into mart_wallet_reputation
+            select
+              wallets.user_address,
+              ifNull(pnl.completed_event_count, 0) as completed_event_count,
+              ifNull(pnl.profitable_event_count, 0) as profitable_event_count,
+              ifNull(pnl.losing_event_count, 0) as losing_event_count,
+              if(completed_event_count = 0, 0.0, profitable_event_count / completed_event_count)
+                as win_rate,
+              ifNull(pnl.realized_pnl, 0.0) as realized_pnl,
+              ifNull(pnl.positive_pnl, 0.0) as positive_pnl,
+              ifNull(pnl.negative_pnl, 0.0) as negative_pnl,
+              ifNull(pnl.buy_notional, 0.0) as buy_notional,
+              ifNull(pnl.sell_notional, 0.0) as sell_notional,
+              ifNull(pnl.traded_notional, 0.0) as traded_notional,
+              ifNull(pnl.trade_count, 0) as trade_count,
+              ifNull(pnl.avg_event_roi, 0.0) as avg_event_roi,
+              ifNull(pnl.best_event_pnl, 0.0) as best_event_pnl,
+              ifNull(pnl.worst_event_pnl, 0.0) as worst_event_pnl,
+              ifNull(live.active_position_count, 0) as active_position_count,
+              ifNull(live.active_event_count, 0) as active_event_count,
+              ifNull(live.active_unrealized_pnl_estimate, 0.0)
+                as active_unrealized_pnl_estimate,
+              ifNull(category.favorite_category, '') as favorite_category,
+              ifNull(category.favorite_category_notional, 0.0) as favorite_category_notional,
+              bounds.first_trade_at,
+              bounds.last_trade_at,
+              now64(3) as updated_at
+            from
+            (
+              select user_address
+              from
+              (
+                select user_address from mart_event_wallet_pnl as p final
+                union all
+                select user_address from mart_live_wallet_position as l final
+              )
+              where user_address != ''
+              group by user_address
+            ) as wallets
+            left join
+            (
+              select
+                user_address,
+                count() as completed_event_count,
+                countIf(event_realized_pnl > 0) as profitable_event_count,
+                countIf(event_realized_pnl < 0) as losing_event_count,
+                sum(event_realized_pnl) as realized_pnl,
+                sumIf(event_realized_pnl, event_realized_pnl > 0) as positive_pnl,
+                sumIf(event_realized_pnl, event_realized_pnl < 0) as negative_pnl,
+                sum(event_buy_notional) as buy_notional,
+                sum(event_sell_notional) as sell_notional,
+                sum(event_traded_notional) as traded_notional,
+                sum(event_trade_count) as trade_count,
+                avgIf(event_roi, isFinite(event_roi)) as avg_event_roi,
+                max(event_realized_pnl) as best_event_pnl,
+                min(event_realized_pnl) as worst_event_pnl
+              from
+              (
+                select
+                  user_address,
+                  realized_pnl as event_realized_pnl,
+                  buy_notional as event_buy_notional,
+                  sell_notional as event_sell_notional,
+                  traded_notional as event_traded_notional,
+                  trade_count as event_trade_count,
+                  roi as event_roi
+                from mart_event_wallet_pnl as p final
+                where user_address != ''
+              )
+              group by user_address
+            ) as pnl on wallets.user_address = pnl.user_address
+            left join
+            (
+              select
+                user_address,
+                count() as active_position_count,
+                uniqExact(event_id) as active_event_count,
+                sum(unrealized_pnl_estimate) as active_unrealized_pnl_estimate
+              from mart_live_wallet_position as l final
+              where user_address != ''
+              group by user_address
+            ) as live on wallets.user_address = live.user_address
+            left join
+            (
+              select
+                user_address,
+                argMax(category, category_notional) as favorite_category,
+                max(category_notional) as favorite_category_notional
+              from
+              (
+                select
+                  user_address,
+                  category,
+                  sum(traded_notional) as category_notional
+                from mart_event_wallet_pnl as p final
+                where user_address != ''
+                group by user_address, category
+              )
+              group by user_address
+            ) as category on wallets.user_address = category.user_address
+            left join
+            (
+              select
+                user_address,
+                min(first_trade_at) as first_trade_at,
+                max(last_trade_at) as last_trade_at
+              from
+              (
+                select user_address, first_trade_at, last_trade_at
+                from mart_event_wallet_pnl as p final
+                union all
+                select user_address, first_trade_at, last_trade_at
+                from mart_live_wallet_position as l final
+              )
+              where user_address != ''
+              group by user_address
+            ) as bounds on wallets.user_address = bounds.user_address
+            """
+        )
+        rows = int(self.clickhouse.query_text("select count() from mart_wallet_reputation").strip() or "0")
+        return MartBuildResult(mart="wallet_reputation", rows=rows)
+
+    def build_event_anomaly_signals(
+        self,
+        *,
+        large_trade_threshold: float = 1_000.0,
+        liquidity_ratio_threshold: float = 0.10,
+        coordinated_wallet_threshold: int = 5,
+        coordinated_notional_threshold: float = 5_000.0,
+        since_hours: int = 168,
+    ) -> MartBuildResult:
+        if since_hours <= 0:
+            raise ValueError("since_hours must be positive")
+        if coordinated_wallet_threshold <= 0:
+            raise ValueError("coordinated_wallet_threshold must be positive")
+        self.clickhouse.execute(
+            f"""
+            insert into mart_event_anomaly_signal
+            select
+              toString(cityHash64('large_trade_low_liquidity', trade_id)) as signal_id,
+              'large_trade_low_liquidity' as signal_type,
+              if(
+                notional >= {large_trade_threshold * 5}
+                  or notional / greatest(liquidity, 1.0) >= {liquidity_ratio_threshold * 2},
+                'high',
+                'medium'
+              ) as severity,
+              event_id,
+              market_id,
+              condition_id,
+              token_id,
+              outcome,
+              user_address,
+              timestamp as occurred_at,
+              'trade_notional_to_liquidity' as metric_name,
+              cast(if(liquidity <= 0, notional, notional / greatest(liquidity, 1.0)), 'Float64')
+                as metric_value,
+              cast(liquidity, 'Float64') as baseline_value,
+              cast({liquidity_ratio_threshold}, 'Float64') as threshold,
+              concat(
+                '{{"trade_id":"', trade_id,
+                '","notional":', toString(notional),
+                ',"liquidity":', toString(liquidity),
+                ',"price":', toString(price),
+                ',"size":', toString(size),
+                '}}'
+              ) as evidence_json,
+              'Large trade in a low-liquidity market; treat as an abnormal activity signal.'
+                as message,
+              'medium' as uncertainty,
+              now64(3) as updated_at
+            from
+            (
+              select
+                trades.trade_id as trade_id,
+                trades.timestamp as timestamp,
+                trades.condition_id as condition_id,
+                trades.token_id as token_id,
+                trades.user_address as user_address,
+                trades.price as price,
+                trades.size as size,
+                trades.notional as notional,
+                markets.event_id as event_id,
+                markets.market_id as market_id,
+                markets.liquidity as liquidity,
+                ifNull(tokens.outcome, '') as outcome
+              from
+              (
+                select
+                  trade_id,
+                  anyLast(raw_timestamp) as timestamp,
+                  anyLast(raw_condition_id) as condition_id,
+                  anyLast(raw_token_id) as token_id,
+                  anyLast(raw_user_address) as user_address,
+                  anyLast(raw_price) as price,
+                  anyLast(raw_size) as size,
+                  anyLast(raw_notional) as notional
+                from
+                (
+                  select
+                    trade_id,
+                    timestamp as raw_timestamp,
+                    condition_id as raw_condition_id,
+                    token_id as raw_token_id,
+                    user_address as raw_user_address,
+                    price as raw_price,
+                    size as raw_size,
+                    notional as raw_notional
+                  from fact_trade
+                  where user_address != ''
+                    and condition_id != ''
+                    and token_id != ''
+                    and timestamp >= now64(3) - interval {since_hours} hour
+                )
+                group by trade_id
+              ) as trades
+              inner join
+              (
+                select
+                  raw_condition_id as condition_id,
+                  anyLast(raw_market_id) as market_id,
+                  anyLast(raw_event_id) as event_id,
+                  anyLast(raw_liquidity) as liquidity
+                from
+                (
+                  select
+                    condition_id as raw_condition_id,
+                    market_id as raw_market_id,
+                    event_id as raw_event_id,
+                    liquidity as raw_liquidity
+                  from dim_market as m final
+                  where condition_id != '' and event_id != ''
+                )
+                group by condition_id
+              ) as markets on trades.condition_id = markets.condition_id
+              left join dim_outcome_token as tokens final
+                on tokens.market_id = markets.market_id
+               and tokens.token_id = trades.token_id
+            )
+            where notional >= {large_trade_threshold}
+              and (
+                liquidity <= 0
+                or notional / greatest(liquidity, 1.0) >= {liquidity_ratio_threshold}
+              )
+            union all
+            select
+              toString(cityHash64('coordinated_like_buying', event_id, market_id, token_id, toString(bucket)))
+                as signal_id,
+              'coordinated_like_buying' as signal_type,
+              if(
+                wallet_count >= {coordinated_wallet_threshold * 2}
+                  or buy_notional >= {coordinated_notional_threshold * 2},
+                'high',
+                'medium'
+              ) as severity,
+              event_id,
+              market_id,
+              condition_id,
+              token_id,
+              outcome,
+              '' as user_address,
+              bucket as occurred_at,
+              'wallet_count' as metric_name,
+              cast(wallet_count, 'Float64') as metric_value,
+              cast(buy_notional, 'Float64') as baseline_value,
+              cast({coordinated_wallet_threshold}, 'Float64') as threshold,
+              concat(
+                '{{"wallet_count":', toString(wallet_count),
+                ',"buy_notional":', toString(buy_notional),
+                ',"trade_count":', toString(trade_count),
+                ',"window_minutes":10',
+                '}}'
+              ) as evidence_json,
+              'Multiple wallets bought the same outcome in a short window; coordinated-like signal only.'
+                as message,
+              'high' as uncertainty,
+              now64(3) as updated_at
+            from
+            (
+              select
+                markets.event_id as event_id,
+                markets.market_id as market_id,
+                trades.condition_id as condition_id,
+                trades.token_id as token_id,
+                anyLast(ifNull(tokens.outcome, '')) as outcome,
+                toStartOfInterval(trades.timestamp, interval 10 minute) as bucket,
+                uniqExact(trades.user_address) as wallet_count,
+                sum(trades.notional) as buy_notional,
+                count() as trade_count
+              from
+              (
+                select
+                  trade_id,
+                  anyLast(raw_timestamp) as timestamp,
+                  anyLast(raw_condition_id) as condition_id,
+                  anyLast(raw_token_id) as token_id,
+                  anyLast(raw_user_address) as user_address,
+                  anyLast(raw_side) as side,
+                  anyLast(raw_notional) as notional
+                from
+                (
+                  select
+                    trade_id,
+                    timestamp as raw_timestamp,
+                    condition_id as raw_condition_id,
+                    token_id as raw_token_id,
+                    user_address as raw_user_address,
+                    side as raw_side,
+                    notional as raw_notional
+                  from fact_trade
+                  where user_address != ''
+                    and condition_id != ''
+                    and token_id != ''
+                    and timestamp >= now64(3) - interval {since_hours} hour
+                )
+                group by trade_id
+              ) as trades
+              inner join
+              (
+                select
+                  raw_condition_id as condition_id,
+                  anyLast(raw_market_id) as market_id,
+                  anyLast(raw_event_id) as event_id
+                from
+                (
+                  select
+                    condition_id as raw_condition_id,
+                    market_id as raw_market_id,
+                    event_id as raw_event_id
+                  from dim_market as m final
+                  where condition_id != '' and event_id != ''
+                )
+                group by condition_id
+              ) as markets on trades.condition_id = markets.condition_id
+              left join dim_outcome_token as tokens final
+                on tokens.market_id = markets.market_id
+               and tokens.token_id = trades.token_id
+              where trades.side = 'BUY'
+              group by markets.event_id, markets.market_id, trades.condition_id, trades.token_id, bucket
+              having wallet_count >= {coordinated_wallet_threshold}
+                 and buy_notional >= {coordinated_notional_threshold}
+            )
+            union all
+            select
+              toString(cityHash64('closed_market_unresolved_outcome', market_id, toString(winner_count)))
+                as signal_id,
+              'closed_market_unresolved_outcome' as signal_type,
+              if(winner_count > 1, 'high', 'medium') as severity,
+              event_id,
+              market_id,
+              condition_id,
+              '' as token_id,
+              '' as outcome,
+              '' as user_address,
+              ifNull(updated_at, now64(3)) as occurred_at,
+              'winner_count' as metric_name,
+              cast(winner_count, 'Float64') as metric_value,
+              cast(1.0, 'Float64') as baseline_value,
+              cast(1.0, 'Float64') as threshold,
+              concat(
+                '{{"outcomePrices":', JSONExtractString(raw_json, 'outcomePrices'),
+                ',"outcomes":', JSONExtractString(raw_json, 'outcomes'),
+                '}}'
+              ) as evidence_json,
+              'Closed market does not have exactly one winning outcome in Gamma metadata.'
+                as message,
+              'medium' as uncertainty,
+              now64(3) as updated_at
+            from
+            (
+              select
+                event_id,
+                market_id,
+                condition_id,
+                raw_json,
+                updated_at,
+                arrayCount(
+                  price -> toFloat64OrZero(JSONExtractString(price)) >= 0.999,
+                  JSONExtractArrayRaw(JSONExtractString(raw_json, 'outcomePrices'))
+                ) as winner_count
+              from dim_market as m final
+              where event_id != ''
+                and closed = true
+                and JSONExtractString(raw_json, 'outcomePrices') != ''
+            )
+            where winner_count != 1
+            """
+        )
+        rows = int(
+            self.clickhouse.query_text("select count() from mart_event_anomaly_signal").strip()
+            or "0"
+        )
+        return MartBuildResult(mart="event_anomaly_signal", rows=rows)
+
+    def build_analytics_core(self) -> list[MartBuildResult]:
+        return [
+            self.build_event_wallet_pnl(),
+            self.build_live_wallet_positions(),
+            self.build_wallet_reputation(),
+            self.build_event_anomaly_signals(),
+        ]
+
     def build_alerts(
         self,
         *,

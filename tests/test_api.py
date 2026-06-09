@@ -119,3 +119,41 @@ def test_product_api_market_trades_requires_market_or_condition() -> None:
     assert response.status == 200
     assert "and 1 = 0" in fake.queries[0]
     assert response.body == {"trades": []}
+
+
+def test_product_api_analytics_routes_are_read_only() -> None:
+    fake = FakeClickHouse('{"x":1}\n')
+    api = ProductApi(clickhouse=fake)
+
+    routes = [
+        ("/markets/overview", {}),
+        ("/markets/trending", {"limit": ["3"], "status": ["active"]}),
+        ("/categories/summary", {"limit": ["3"]}),
+        ("/signals/anomalies", {"severity": ["high"], "limit": ["3"]}),
+        ("/wallets/smart-money/activity", {"limit": ["3"]}),
+    ]
+    for path, query in routes:
+        response = api.handle(path, query)
+        assert response.status == 200
+
+    joined = "\n".join(fake.queries).lower()
+    assert "delete" not in joined
+    assert "drop" not in joined
+    assert "insert" not in joined
+    assert "update" not in joined
+
+
+def test_event_and_wallet_analytics_require_scope() -> None:
+    fake = FakeClickHouse("")
+    api = ProductApi(clickhouse=fake)
+
+    flow = api.handle("/events/wallet-flow", {})
+    pnl = api.handle("/events/pnl-leaderboard", {})
+    positions = api.handle("/wallets/live-positions", {"limit": ["5"]})
+
+    assert flow.status == 200
+    assert flow.body == {"wallets": []}
+    assert pnl.status == 200
+    assert pnl.body == {"wallets": []}
+    assert positions.status == 200
+    assert "and 1 = 0" in fake.queries[0]

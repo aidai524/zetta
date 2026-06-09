@@ -15,3 +15,7 @@ apps/web/.env.local
 *.tsbuildinfo
 apps/web/node_modules/
 apps/web/dist/
+apps/analytics/.env
+apps/analytics/.env.local
+apps/analytics/node_modules/
+apps/analytics/dist/

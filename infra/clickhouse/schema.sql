@@ -466,6 +466,128 @@ create table if not exists zetta.mart_trader_chain_pnl
 engine = ReplacingMergeTree(updated_at)
 order by user_address;
 
+create table if not exists zetta.mart_event_wallet_pnl
+(
+  event_id String,
+  user_address String,
+  event_title String,
+  category LowCardinality(String),
+  market_count UInt64,
+  token_count UInt64,
+  trade_count UInt64,
+  buy_count UInt64,
+  sell_count UInt64,
+  buy_size Float64,
+  sell_size Float64,
+  traded_size Float64,
+  buy_notional Float64,
+  sell_notional Float64,
+  traded_notional Float64,
+  net_cashflow Float64,
+  final_position_value Float64,
+  realized_pnl Float64,
+  roi Float64,
+  first_trade_at Nullable(DateTime64(3, 'UTC')),
+  last_trade_at Nullable(DateTime64(3, 'UTC')),
+  closed_market_count UInt64,
+  resolved_market_count UInt64,
+  settlement_status LowCardinality(String),
+  data_quality LowCardinality(String),
+  updated_at DateTime64(3, 'UTC')
+)
+engine = ReplacingMergeTree(updated_at)
+order by (event_id, user_address);
+
+create table if not exists zetta.mart_live_wallet_position
+(
+  event_id String,
+  market_id String,
+  condition_id String,
+  token_id String,
+  outcome String,
+  user_address String,
+  trade_count UInt64,
+  buy_count UInt64,
+  sell_count UInt64,
+  buy_size Float64,
+  sell_size Float64,
+  position_size Float64,
+  buy_notional Float64,
+  sell_notional Float64,
+  traded_notional Float64,
+  net_cashflow Float64,
+  avg_entry_price Nullable(Float64),
+  mark_price Nullable(Float64),
+  mark_price_source LowCardinality(String),
+  mark_price_at Nullable(DateTime64(3, 'UTC')),
+  current_value Float64,
+  unrealized_pnl_estimate Float64,
+  first_trade_at Nullable(DateTime64(3, 'UTC')),
+  last_trade_at Nullable(DateTime64(3, 'UTC')),
+  net_size_24h Float64,
+  net_notional_24h Float64,
+  latest_action LowCardinality(String),
+  is_accumulating Bool,
+  data_quality LowCardinality(String),
+  updated_at DateTime64(3, 'UTC')
+)
+engine = ReplacingMergeTree(updated_at)
+order by (event_id, market_id, token_id, user_address);
+
+create table if not exists zetta.mart_wallet_reputation
+(
+  user_address String,
+  completed_event_count UInt64,
+  profitable_event_count UInt64,
+  losing_event_count UInt64,
+  win_rate Float64,
+  realized_pnl Float64,
+  positive_pnl Float64,
+  negative_pnl Float64,
+  buy_notional Float64,
+  sell_notional Float64,
+  traded_notional Float64,
+  trade_count UInt64,
+  avg_event_roi Float64,
+  best_event_pnl Float64,
+  worst_event_pnl Float64,
+  active_position_count UInt64,
+  active_event_count UInt64,
+  active_unrealized_pnl_estimate Float64,
+  favorite_category String,
+  favorite_category_notional Float64,
+  first_trade_at Nullable(DateTime64(3, 'UTC')),
+  last_trade_at Nullable(DateTime64(3, 'UTC')),
+  updated_at DateTime64(3, 'UTC')
+)
+engine = ReplacingMergeTree(updated_at)
+order by user_address;
+
+create table if not exists zetta.mart_event_anomaly_signal
+(
+  signal_id String,
+  signal_type LowCardinality(String),
+  severity LowCardinality(String),
+  event_id String,
+  market_id String,
+  condition_id String,
+  token_id String,
+  outcome String,
+  user_address String,
+  occurred_at DateTime64(3, 'UTC'),
+  metric_name LowCardinality(String),
+  metric_value Float64,
+  baseline_value Float64,
+  threshold Float64,
+  evidence_json String,
+  message String,
+  uncertainty LowCardinality(String),
+  updated_at DateTime64(3, 'UTC')
+)
+engine = ReplacingMergeTree(updated_at)
+partition by toYYYYMM(occurred_at)
+order by (signal_type, severity, event_id, occurred_at, signal_id);
+
 create table if not exists zetta.mart_alert
 (
   alert_id String,
