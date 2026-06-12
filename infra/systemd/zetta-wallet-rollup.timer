@@ -1,0 +1,11 @@
+[Unit]
+Description=Refresh Zetta wallet trade rollup every minute
+
+[Timer]
+OnBootSec=3min
+OnUnitInactiveSec=1min
+AccuracySec=10s
+Unit=zetta-wallet-rollup.service
+
+[Install]
+WantedBy=timers.target

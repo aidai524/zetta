@@ -1,13 +1,13 @@
 [Unit]
-Description=Zetta raw-to-ClickHouse loader
+Description=Zetta realtime trade task seeder
 After=network-online.target docker.service
 Wants=network-online.target
 
 [Service]
 Type=oneshot
 EnvironmentFile=/etc/zetta/zetta.env
-ExecStart=/usr/local/bin/zetta-runner load
+ExecStart=/usr/local/bin/zetta-runner frontier-trades
 MemoryAccounting=true
-MemoryMax=24G
-TasksMax=128
-TimeoutStartSec=30min
+MemoryMax=1G
+TasksMax=64
+TimeoutStartSec=2min

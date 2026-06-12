@@ -146,6 +146,50 @@ engine = ReplacingMergeTree(ingested_at)
 partition by toYYYYMM(timestamp)
 order by (market_id, token_id, timestamp, transaction_hash, log_index);
 
+create table if not exists zetta.fact_trade_by_user
+(
+  trade_id String,
+  transaction_hash String,
+  log_index UInt32,
+  timestamp DateTime64(3, 'UTC'),
+  market_id String,
+  condition_id String,
+  token_id String,
+  user_address String,
+  side LowCardinality(String),
+  price Float64,
+  size Float64,
+  notional Float64,
+  source LowCardinality(String),
+  raw_json String,
+  ingested_at DateTime64(3, 'UTC')
+)
+engine = ReplacingMergeTree(ingested_at)
+partition by toYYYYMM(timestamp)
+order by (user_address, timestamp, transaction_hash, log_index, token_id);
+
+create table if not exists zetta.fact_trade_by_time
+(
+  trade_id String,
+  transaction_hash String,
+  log_index UInt32,
+  timestamp DateTime64(3, 'UTC'),
+  market_id String,
+  condition_id String,
+  token_id String,
+  user_address String,
+  side LowCardinality(String),
+  price Float64,
+  size Float64,
+  notional Float64,
+  source LowCardinality(String),
+  raw_json String,
+  ingested_at DateTime64(3, 'UTC')
+)
+engine = ReplacingMergeTree(ingested_at)
+partition by toYYYYMM(timestamp)
+order by (timestamp, user_address, transaction_hash, log_index, token_id);
+
 create table if not exists zetta.fact_price_history
 (
   token_id String,
@@ -255,6 +299,34 @@ create table if not exists zetta.fact_market_position_snapshot
 engine = ReplacingMergeTree(ingested_at)
 partition by toYYYYMM(captured_at)
 order by (condition_id, token_id, user_address, captured_at);
+
+create table if not exists zetta.fact_wallet_portfolio_snapshot
+(
+  user_address String,
+  captured_at DateTime64(3, 'UTC'),
+  position_count UInt64,
+  positions_value Float64,
+  portfolio_value Float64,
+  available_balance Float64,
+  total_pnl Float64,
+  raw_json String,
+  ingested_at DateTime64(3, 'UTC')
+)
+engine = ReplacingMergeTree(ingested_at)
+partition by toYYYYMM(captured_at)
+order by (user_address, captured_at);
+
+create table if not exists zetta.fact_wallet_pnl_snapshot
+(
+  user_address String,
+  captured_at DateTime64(3, 'UTC'),
+  total_pnl Float64,
+  raw_json String,
+  ingested_at DateTime64(3, 'UTC')
+)
+engine = ReplacingMergeTree(ingested_at)
+partition by toYYYYMM(captured_at)
+order by (user_address, captured_at);
 
 create table if not exists zetta.fact_open_interest_snapshot
 (
@@ -433,6 +505,92 @@ create table if not exists zetta.mart_trader_profile
 )
 engine = ReplacingMergeTree(updated_at)
 order by user_address;
+
+create table if not exists zetta.mart_wallet_trade_rollup
+(
+  user_address String,
+  trade_count UInt64,
+  buy_count UInt64,
+  sell_count UInt64,
+  traded_size Float64,
+  traded_notional Float64,
+  buy_notional Float64,
+  sell_notional Float64,
+  first_trade_at Nullable(DateTime64(3, 'UTC')),
+  last_trade_at Nullable(DateTime64(3, 'UTC')),
+  traded_notional_24h Float64,
+  trade_count_24h UInt64,
+  buy_notional_24h Float64,
+  sell_notional_24h Float64,
+  net_notional_24h Float64,
+  latest_action LowCardinality(String),
+  whale_tier LowCardinality(String),
+  data_lag_seconds UInt32,
+  updated_at DateTime64(3, 'UTC')
+)
+engine = ReplacingMergeTree(updated_at)
+order by user_address;
+
+create table if not exists zetta.mart_wallet_screener
+(
+  user_address String,
+  trade_count UInt64,
+  buy_count UInt64,
+  sell_count UInt64,
+  traded_size Float64,
+  traded_notional Float64,
+  max_single_trade_notional Float64,
+  first_trade_at Nullable(DateTime64(3, 'UTC')),
+  last_trade_at Nullable(DateTime64(3, 'UTC')),
+  position_count UInt64,
+  positions_value Float64,
+  portfolio_value Float64,
+  available_balance Float64,
+  total_pnl Float64,
+  portfolio_captured_at Nullable(DateTime64(3, 'UTC')),
+  pnl_captured_at Nullable(DateTime64(3, 'UTC')),
+  pnl_roi Float64,
+  is_whale Bool,
+  is_smart Bool,
+  whale_reason String,
+  updated_at DateTime64(3, 'UTC')
+)
+engine = ReplacingMergeTree(updated_at)
+order by user_address;
+
+create table if not exists zetta.mart_wallet_screener_next
+(
+  user_address String,
+  trade_count UInt64,
+  buy_count UInt64,
+  sell_count UInt64,
+  traded_size Float64,
+  traded_notional Float64,
+  max_single_trade_notional Float64,
+  first_trade_at Nullable(DateTime64(3, 'UTC')),
+  last_trade_at Nullable(DateTime64(3, 'UTC')),
+  position_count UInt64,
+  positions_value Float64,
+  portfolio_value Float64,
+  available_balance Float64,
+  total_pnl Float64,
+  portfolio_captured_at Nullable(DateTime64(3, 'UTC')),
+  pnl_captured_at Nullable(DateTime64(3, 'UTC')),
+  pnl_roi Float64,
+  is_whale Bool,
+  is_smart Bool,
+  whale_reason String,
+  updated_at DateTime64(3, 'UTC')
+)
+engine = ReplacingMergeTree(updated_at)
+order by user_address;
+
+alter table zetta.mart_wallet_screener add column if not exists position_count UInt64 after last_trade_at;
+alter table zetta.mart_wallet_screener add column if not exists portfolio_captured_at Nullable(DateTime64(3, 'UTC')) after total_pnl;
+alter table zetta.mart_wallet_screener add column if not exists pnl_captured_at Nullable(DateTime64(3, 'UTC')) after portfolio_captured_at;
+alter table zetta.mart_wallet_screener_next add column if not exists position_count UInt64 after last_trade_at;
+alter table zetta.mart_wallet_screener_next add column if not exists portfolio_captured_at Nullable(DateTime64(3, 'UTC')) after total_pnl;
+alter table zetta.mart_wallet_screener_next add column if not exists pnl_captured_at Nullable(DateTime64(3, 'UTC')) after portfolio_captured_at;
 
 alter table zetta.mart_trader_profile add column if not exists position_count UInt64 after traded_notional;
 alter table zetta.mart_trader_profile add column if not exists open_position_size Float64 after position_count;

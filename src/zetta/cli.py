@@ -9,6 +9,16 @@ from pathlib import Path
 from typing import Any
 
 from zetta.api import serve_api
+from zetta.chain.polymarket import (
+    FEE_CHARGED_TOPIC,
+    ORDER_FILLED_TOPIC,
+    ORDERS_MATCHED_TOPIC,
+    PAYOUT_REDEMPTION_TOPIC,
+    POSITIONS_MERGE_TOPIC,
+    POSITION_SPLIT_TOPIC,
+    TRANSFER_BATCH_TOPIC,
+    TRANSFER_SINGLE_TOPIC,
+)
 from zetta.chain.rpc import PolygonRpcClient
 from zetta.collectors.chain import ChainCollector
 from zetta.collectors.clob import ClobCollector
@@ -33,9 +43,13 @@ from zetta.storage.state import LocalStateStore
 
 
 FRONTIER_GAMMA_PRIORITY = 1
-FRONTIER_TRADES_PRIORITY = 2
-FRONTIER_PRICE_HISTORY_PRIORITY = 3
-FRONTIER_BOOK_PRIORITY = 4
+FRONTIER_EVENT_PRIORITY = 2
+FRONTIER_TRADES_PRIORITY = 3
+FRONTIER_PRICE_HISTORY_PRIORITY = 4
+FRONTIER_BOOK_PRIORITY = 5
+WALLET_REFRESH_PRIORITY = 2
+WALLET_PORTFOLIO_PRIORITY = 0
+WALLET_PNL_PRIORITY = -1
 DISCOVERY_PRIORITY = 50
 HISTORY_BACKFILL_PRIORITY = 100
 CHAIN_BACKFILL_PRIORITY = 150
@@ -157,6 +171,22 @@ def build_parser() -> argparse.ArgumentParser:
     market_positions.add_argument("--limit", type=int, default=500)
     market_positions.set_defaults(func=cmd_market_positions)
 
+    positions = collect_subparsers.add_parser("positions", help="Collect wallet positions.")
+    positions.add_argument("--user", required=True)
+    positions.set_defaults(func=cmd_positions)
+
+    wallet_portfolio = collect_subparsers.add_parser(
+        "wallet-portfolio", help="Collect wallet portfolio value, PnL, and available balance."
+    )
+    wallet_portfolio.add_argument("--user", required=True)
+    wallet_portfolio.set_defaults(func=cmd_wallet_portfolio)
+
+    wallet_pnl = collect_subparsers.add_parser("wallet-pnl", help="Collect wallet PnL only.")
+    wallet_pnl.add_argument("--user", required=True)
+    wallet_pnl.add_argument("--interval", default="all")
+    wallet_pnl.add_argument("--fidelity", default="1d")
+    wallet_pnl.set_defaults(func=cmd_wallet_pnl)
+
     oi = collect_subparsers.add_parser("open-interest", help="Collect market open interest.")
     oi.add_argument("--market")
     oi.set_defaults(func=cmd_open_interest)
@@ -232,6 +262,18 @@ def build_parser() -> argparse.ArgumentParser:
     block_number = chain_subparsers.add_parser("block-number", help="Print latest Polygon block.")
     block_number.set_defaults(func=cmd_chain_block_number)
 
+    frontier = chain_subparsers.add_parser(
+        "frontier", help="Collect and decode recent Polymarket chain logs."
+    )
+    frontier.add_argument("--lookback-blocks", type=int, default=300)
+    frontier.add_argument("--confirmations", type=int, default=64)
+    frontier.add_argument("--overlap-blocks", type=int, default=20)
+    frontier.add_argument("--step-blocks", type=int, default=300)
+    frontier.add_argument("--exchange-address", action="append", dest="exchange_addresses", default=[])
+    frontier.add_argument("--conditional-tokens-address", default=POLYMARKET_CTF_ADDRESS)
+    frontier.add_argument("--batch-size", type=int, default=10_000)
+    frontier.set_defaults(func=cmd_chain_frontier)
+
     discover = subparsers.add_parser("discover", help="Discover work from analytical tables.")
     discover_subparsers = discover.add_subparsers(required=True)
 
@@ -263,6 +305,10 @@ def build_parser() -> argparse.ArgumentParser:
     seed_frontier.add_argument("--event-limit", type=int, default=50)
     seed_frontier.add_argument("--condition-limit", type=int, default=50)
     seed_frontier.add_argument("--token-limit", type=int, default=100)
+    seed_frontier.add_argument("--sync-mode", choices=["event", "typed"], default="event")
+    seed_frontier.add_argument(
+        "--include-gamma", action=argparse.BooleanOptionalAction, default=True
+    )
     seed_frontier.add_argument(
         "--active-only", action=argparse.BooleanOptionalAction, default=True
     )
@@ -283,8 +329,46 @@ def build_parser() -> argparse.ArgumentParser:
     seed_frontier.add_argument("--trade-max-pages", type=int, default=1)
     seed_frontier.add_argument("--price-interval", default="1d")
     seed_frontier.add_argument("--price-fidelity", type=int)
+    seed_frontier.add_argument("--holders-limit", type=int, default=500)
+    seed_frontier.add_argument("--positions-limit", type=int, default=500)
+    seed_frontier.add_argument(
+        "--include-holders", action=argparse.BooleanOptionalAction, default=True
+    )
+    seed_frontier.add_argument(
+        "--include-market-positions", action=argparse.BooleanOptionalAction, default=True
+    )
+    seed_frontier.add_argument(
+        "--include-open-interest", action=argparse.BooleanOptionalAction, default=True
+    )
     seed_frontier.add_argument("--refresh-run", help=argparse.SUPPRESS)
+    seed_frontier.add_argument("--requeue-done", action="store_true", help=argparse.SUPPRESS)
+    seed_frontier.add_argument("--include-global-trades", action="store_true", help=argparse.SUPPRESS)
     seed_frontier.set_defaults(func=cmd_tasks_seed_frontier)
+
+    seed_wallets = task_subparsers.add_parser(
+        "seed-wallets", help="Seed wallet-scoped trade and activity refresh tasks."
+    )
+    seed_wallets.add_argument("--wallet", action="append", dest="wallets", default=[])
+    seed_wallets.add_argument("--wallet-limit", type=int, default=100)
+    seed_wallets.add_argument("--since-hours", type=int, default=48)
+    seed_wallets.add_argument("--page-limit", type=int, default=500)
+    seed_wallets.add_argument("--max-pages", type=int, default=2)
+    seed_wallets.add_argument(
+        "--candidate-mode",
+        choices=["recent", "all", "smart-candidates", "whale-candidates"],
+        default="recent",
+        help="Choose wallets from recent activity, all history, smart candidates, or whale candidates.",
+    )
+    seed_wallets.add_argument("--min-notional", type=float, default=10_000.0)
+    seed_wallets.add_argument("--include-trades", action=argparse.BooleanOptionalAction, default=True)
+    seed_wallets.add_argument("--include-activity", action=argparse.BooleanOptionalAction, default=True)
+    seed_wallets.add_argument(
+        "--include-wallet-portfolio", action=argparse.BooleanOptionalAction, default=True
+    )
+    seed_wallets.add_argument("--include-wallet-pnl", action=argparse.BooleanOptionalAction, default=False)
+    seed_wallets.add_argument("--refresh-run", help=argparse.SUPPRESS)
+    seed_wallets.add_argument("--requeue-done", action="store_true", help=argparse.SUPPRESS)
+    seed_wallets.set_defaults(func=cmd_tasks_seed_wallets)
 
     seed_history = task_subparsers.add_parser(
         "seed-history", help="Seed deep historical backfill tasks from ClickHouse."
@@ -361,6 +445,8 @@ def build_parser() -> argparse.ArgumentParser:
     data_trades.add_argument("--force", action="store_true")
     data_trades.add_argument("--batch-size", type=int, default=10_000)
     data_trades.add_argument("--workers", type=int, default=1)
+    data_trades.add_argument("--max-paths", type=int)
+    data_trades.add_argument("--newest-first", action="store_true")
     data_trades.set_defaults(func=cmd_load_data_trades)
 
     data_activity = load_subparsers.add_parser("data-activity", help="Load raw user activity.")
@@ -380,6 +466,25 @@ def build_parser() -> argparse.ArgumentParser:
     data_market_positions.add_argument("--batch-size", type=int, default=10_000)
     data_market_positions.set_defaults(func=cmd_load_data_market_positions)
 
+    data_positions = load_subparsers.add_parser("data-positions", help="Load raw wallet positions.")
+    data_positions.add_argument("--force", action="store_true")
+    data_positions.add_argument("--batch-size", type=int, default=10_000)
+    data_positions.set_defaults(func=cmd_load_data_positions)
+
+    data_wallet_portfolio = load_subparsers.add_parser(
+        "data-wallet-portfolio", help="Load raw wallet portfolio snapshots."
+    )
+    data_wallet_portfolio.add_argument("--force", action="store_true")
+    data_wallet_portfolio.add_argument("--batch-size", type=int, default=10_000)
+    data_wallet_portfolio.set_defaults(func=cmd_load_data_wallet_portfolio)
+
+    data_user_pnl = load_subparsers.add_parser(
+        "data-user-pnl", help="Load raw wallet PnL snapshots."
+    )
+    data_user_pnl.add_argument("--force", action="store_true")
+    data_user_pnl.add_argument("--batch-size", type=int, default=10_000)
+    data_user_pnl.set_defaults(func=cmd_load_data_user_pnl)
+
     data_oi = load_subparsers.add_parser("data-open-interest", help="Load raw open interest.")
     data_oi.add_argument("--force", action="store_true")
     data_oi.add_argument("--batch-size", type=int, default=10_000)
@@ -393,30 +498,35 @@ def build_parser() -> argparse.ArgumentParser:
     exchange_fills = load_subparsers.add_parser(
         "exchange-fills", help="Decode CTF exchange OrderFilled logs into fact_exchange_fill."
     )
+    exchange_fills.add_argument("--force", action="store_true")
     exchange_fills.add_argument("--batch-size", type=int, default=10_000)
     exchange_fills.set_defaults(func=cmd_load_exchange_fills)
 
     orders_matched = load_subparsers.add_parser(
         "orders-matched", help="Decode CTF exchange OrdersMatched logs."
     )
+    orders_matched.add_argument("--force", action="store_true")
     orders_matched.add_argument("--batch-size", type=int, default=10_000)
     orders_matched.set_defaults(func=cmd_load_orders_matched)
 
     fees_charged = load_subparsers.add_parser(
         "fees-charged", help="Decode CTF exchange FeeCharged logs."
     )
+    fees_charged.add_argument("--force", action="store_true")
     fees_charged.add_argument("--batch-size", type=int, default=10_000)
     fees_charged.set_defaults(func=cmd_load_fees_charged)
 
     balance_movements = load_subparsers.add_parser(
         "balance-movements", help="Decode CTF ERC1155 TransferSingle/TransferBatch logs."
     )
+    balance_movements.add_argument("--force", action="store_true")
     balance_movements.add_argument("--batch-size", type=int, default=10_000)
     balance_movements.set_defaults(func=cmd_load_balance_movements)
 
     lifecycle_events = load_subparsers.add_parser(
         "lifecycle-events", help="Decode CTF split, merge, and redeem lifecycle logs."
     )
+    lifecycle_events.add_argument("--force", action="store_true")
     lifecycle_events.add_argument("--batch-size", type=int, default=10_000)
     lifecycle_events.set_defaults(func=cmd_load_lifecycle_events)
 
@@ -430,6 +540,12 @@ def build_parser() -> argparse.ArgumentParser:
         "trader-profiles", help="Build trader profile mart."
     )
     trader_profiles.set_defaults(func=cmd_build_trader_profiles)
+
+    wallet_trade_rollup = build_subparsers.add_parser(
+        "wallet-trade-rollup", help="Build recent wallet trade rollup mart."
+    )
+    wallet_trade_rollup.add_argument("--since-hours", type=int, default=48)
+    wallet_trade_rollup.set_defaults(func=cmd_build_wallet_trade_rollup)
 
     trader_chain_pnl = build_subparsers.add_parser(
         "trader-chain-pnl", help="Build chain-verified trader PnL mart."
@@ -450,6 +566,11 @@ def build_parser() -> argparse.ArgumentParser:
         "wallet-reputation", help="Build wallet historical reputation mart."
     )
     wallet_reputation.set_defaults(func=cmd_build_wallet_reputation)
+
+    wallet_screener = build_subparsers.add_parser(
+        "wallet-screener", help="Build all-wallet whale and smart wallet screener mart."
+    )
+    wallet_screener.set_defaults(func=cmd_build_wallet_screener)
 
     event_anomaly_signals = build_subparsers.add_parser(
         "event-anomaly-signals", help="Build event anomaly signal mart."
@@ -634,6 +755,31 @@ def cmd_market_positions(args: argparse.Namespace, app_settings: Settings) -> An
     ).collect_market_positions(market=args.market, limit=args.limit)
 
 
+def cmd_positions(args: argparse.Namespace, app_settings: Settings) -> Any:
+    return DataCollector(
+        client=PolymarketClient(app_settings),
+        raw_writer=raw_writer(app_settings),
+        state_store=LocalStateStore(app_settings.state_dir),
+    ).collect_positions(user=args.user)
+
+
+def cmd_wallet_portfolio(args: argparse.Namespace, app_settings: Settings) -> Any:
+    return DataCollector(
+        client=PolymarketClient(app_settings),
+        raw_writer=raw_writer(app_settings),
+        state_store=LocalStateStore(app_settings.state_dir),
+        rpc_client=PolygonRpcClient(app_settings),
+    ).collect_wallet_portfolio(user=args.user)
+
+
+def cmd_wallet_pnl(args: argparse.Namespace, app_settings: Settings) -> Any:
+    return DataCollector(
+        client=PolymarketClient(app_settings),
+        raw_writer=raw_writer(app_settings),
+        state_store=LocalStateStore(app_settings.state_dir),
+    ).collect_user_pnl(user=args.user, interval=args.interval, fidelity=args.fidelity)
+
+
 def cmd_open_interest(args: argparse.Namespace, app_settings: Settings) -> Any:
     return DataCollector(
         client=PolymarketClient(app_settings),
@@ -725,6 +871,140 @@ def cmd_chain_block_number(_args: argparse.Namespace, app_settings: Settings) ->
     return {"block_number": PolygonRpcClient(app_settings).block_number()}
 
 
+POLYMARKET_EXCHANGE_ADDRESSES = [
+    "0xe111180000d2663c0091e4f400237545b87b996b",
+    "0xe2222d279d744050d28e00520010520000310f59",
+]
+POLYMARKET_CTF_ADDRESS = "0x4d97dcd97ec945f40cf65f87097ace5ea0476045"
+CHAIN_FRONTIER_STATE_KEY = "chain_frontier/polymarket"
+EXCHANGE_LOG_TOPICS = [
+    ORDER_FILLED_TOPIC,
+    ORDERS_MATCHED_TOPIC,
+    FEE_CHARGED_TOPIC,
+]
+CTF_LOG_TOPICS = [
+    TRANSFER_SINGLE_TOPIC,
+    TRANSFER_BATCH_TOPIC,
+    POSITION_SPLIT_TOPIC,
+    POSITIONS_MERGE_TOPIC,
+    PAYOUT_REDEMPTION_TOPIC,
+]
+
+
+def cmd_chain_frontier(args: argparse.Namespace, app_settings: Settings) -> Any:
+    if args.lookback_blocks <= 0:
+        raise ValueError("--lookback-blocks must be positive")
+    if args.confirmations < 0:
+        raise ValueError("--confirmations cannot be negative")
+    if args.overlap_blocks < 0:
+        raise ValueError("--overlap-blocks cannot be negative")
+    if args.step_blocks <= 0:
+        raise ValueError("--step-blocks must be positive")
+    if args.batch_size <= 0:
+        raise ValueError("--batch-size must be positive")
+
+    client = PolygonRpcClient(app_settings)
+    latest_block = client.block_number()
+    to_block = latest_block - args.confirmations
+    if to_block <= 0:
+        raise ValueError("latest confirmed block is not positive")
+    state_store = LocalStateStore(app_settings.state_dir)
+    state = state_store.get(CHAIN_FRONTIER_STATE_KEY, {})
+    last_to_block = int(state.get("to_block") or 0) if isinstance(state, dict) else 0
+    if last_to_block >= to_block:
+        return {
+            "latest_block": latest_block,
+            "from_block": None,
+            "to_block": to_block,
+            "previous_to_block": last_to_block,
+            "skipped": True,
+            "reason": "no_new_confirmed_blocks",
+        }
+    if last_to_block > 0:
+        from_block = max(last_to_block - args.overlap_blocks + 1, to_block - args.lookback_blocks + 1)
+    else:
+        from_block = to_block - args.lookback_blocks + 1
+    from_block = max(0, from_block)
+    exchange_addresses = normalize_address_list(
+        args.exchange_addresses or POLYMARKET_EXCHANGE_ADDRESSES
+    )
+    ctf_address = str(args.conditional_tokens_address or POLYMARKET_CTF_ADDRESS).lower()
+
+    writer = raw_writer(app_settings)
+    collector = ChainCollector(client=client, raw_writer=writer)
+    collections = []
+    for start in range(from_block, to_block + 1, args.step_blocks):
+        end = min(start + args.step_blocks - 1, to_block)
+        for topic in EXCHANGE_LOG_TOPICS:
+            collections.append(
+                asdict(
+                    collector.collect_logs(
+                        from_block=start,
+                        to_block=end,
+                        addresses=exchange_addresses,
+                        topics=[topic],
+                    )
+                )
+            )
+        for topic in CTF_LOG_TOPICS:
+            collections.append(
+                asdict(
+                    collector.collect_logs(
+                        from_block=start,
+                        to_block=end,
+                        addresses=[ctf_address],
+                        topics=[topic],
+                    )
+                )
+            )
+
+    writer.flush()
+    loader = ChainRawLoader(clickhouse=ClickHouseWriter(app_settings))
+    load_result = loader.load_logs(raw_root=app_settings.raw_data_dir, batch_size=args.batch_size)
+    exchange_fills = loader.build_exchange_fills(batch_size=args.batch_size)
+    orders_matched = loader.build_orders_matched(batch_size=args.batch_size)
+    fees_charged = loader.build_fee_charged(batch_size=args.batch_size)
+    balance_movements = loader.build_balance_movements(batch_size=args.batch_size)
+    lifecycle_events = loader.build_lifecycle_events(batch_size=args.batch_size)
+    state_store.set(
+        CHAIN_FRONTIER_STATE_KEY,
+        {
+            "from_block": from_block,
+            "to_block": to_block,
+            "latest_block": latest_block,
+            "updated_at": datetime.now(UTC).isoformat(),
+        },
+    )
+    return {
+        "latest_block": latest_block,
+        "from_block": from_block,
+        "to_block": to_block,
+        "previous_to_block": last_to_block,
+        "requests": len(collections),
+        "collected_logs": sum(int(item.get("logs") or 0) for item in collections),
+        "load": asdict(load_result),
+        "decoded": {
+            "exchange_fills": asdict(exchange_fills),
+            "orders_matched": asdict(orders_matched),
+            "fees_charged": asdict(fees_charged),
+            "balance_movements": asdict(balance_movements),
+            "lifecycle_events": asdict(lifecycle_events),
+        },
+    }
+
+
+def normalize_address_list(values: list[str]) -> list[str]:
+    normalized = []
+    seen = set()
+    for value in values:
+        for item in str(value).split(","):
+            address = item.strip().lower()
+            if address and address not in seen:
+                normalized.append(address)
+                seen.add(address)
+    return normalized
+
+
 def cmd_discover_tokens(args: argparse.Namespace, app_settings: Settings) -> Any:
     where = "where t.token_id != ''"
     if args.active_only:
@@ -760,9 +1040,10 @@ def cmd_discover_markets(args: argparse.Namespace, app_settings: Settings) -> An
 
 def cmd_discover_wallets(args: argparse.Namespace, app_settings: Settings) -> Any:
     query = (
-        "select distinct user_address "
-        "from fact_trade "
+        "select user_address "
+        "from mart_trader_profile final "
         "where user_address != '' "
+        "order by traded_notional desc, last_trade_at desc "
         f"limit {args.limit} "
         "format JSONEachRow"
     )
@@ -784,7 +1065,7 @@ def discover_condition_ids_for_history(
     query = f"""
         with selected_events as
         (
-          select distinct event_id
+          select event_id
           from dim_market final
           {markets_where}
           order by updated_at desc, event_id
@@ -817,7 +1098,7 @@ def discover_token_ids_for_history(
     query = f"""
         with selected_events as
         (
-          select distinct event_id
+          select event_id
           from dim_market final
           {markets_where}
           order by updated_at desc, event_id
@@ -837,6 +1118,35 @@ def discover_token_ids_for_history(
     """
     return [
         json.loads(line)["token_id"]
+        for line in clickhouse.query_text(query).splitlines()
+        if line.strip()
+    ]
+
+
+def discover_frontier_events(
+    clickhouse: ClickHouseWriter,
+    *,
+    event_limit: int,
+    active_only: bool,
+) -> list[str]:
+    if event_limit <= 0:
+        raise ValueError("event_limit must be positive")
+
+    markets_where = "where event_id != '' and condition_id != ''"
+    if active_only:
+        markets_where += " and active = true and closed = false and archived = false"
+
+    query = f"""
+        select event_id
+        from dim_market final
+        {markets_where}
+        group by event_id
+        order by max(updated_at) desc, event_id
+        limit {event_limit}
+        format JSONEachRow
+    """
+    return [
+        json.loads(line)["event_id"]
         for line in clickhouse.query_text(query).splitlines()
         if line.strip()
     ]
@@ -867,7 +1177,8 @@ def discover_frontier_work(
           select distinct event_id
           from dim_market final
           {markets_where}
-          order by updated_at desc, event_id
+          group by event_id
+          order by max(updated_at) desc, event_id
           limit {event_limit}
         )
         select distinct condition_id
@@ -884,7 +1195,8 @@ def discover_frontier_work(
           select distinct event_id
           from dim_market final
           {markets_where}
-          order by updated_at desc, event_id
+          group by event_id
+          order by max(updated_at) desc, event_id
           limit {event_limit}
         )
         select distinct token_id
@@ -911,6 +1223,145 @@ def discover_frontier_work(
         if line.strip()
     ]
     return condition_ids, token_ids
+
+
+def discover_recent_wallets(
+    clickhouse: ClickHouseWriter,
+    *,
+    wallet_limit: int,
+    since_hours: int,
+) -> list[str]:
+    if wallet_limit <= 0:
+        raise ValueError("wallet_limit must be positive")
+    if since_hours <= 0:
+        raise ValueError("since_hours must be positive")
+    query = f"""
+        select user_address
+        from
+        (
+          select
+            user_address,
+            wallet_last_trade_at as source_last_trade_at,
+            traded_notional_24h
+          from
+          (
+            select
+              user_address,
+              max(last_trade_at) as wallet_last_trade_at,
+              sum(traded_notional_24h) as traded_notional_24h
+            from mart_wallet_trade_rollup final
+            where user_address != ''
+            group by user_address
+          )
+          where wallet_last_trade_at >= now64(3) - interval {since_hours} hour
+          union all
+          select
+            user_address,
+            profile_last_trade_at as source_last_trade_at,
+            0.0 as traded_notional_24h
+          from
+          (
+            select
+              user_address,
+              max(last_trade_at) as profile_last_trade_at
+            from mart_trader_profile final
+            where user_address != ''
+            group by user_address
+          )
+          where profile_last_trade_at >= now64(3) - interval {since_hours} hour
+        )
+        group by user_address
+        order by max(source_last_trade_at) desc, sum(traded_notional_24h) desc
+        limit {wallet_limit}
+        format JSONEachRow
+    """
+    return [
+        json.loads(line)["user_address"]
+        for line in clickhouse.query_text(query).splitlines()
+        if line.strip()
+    ]
+
+
+def discover_wallet_candidates(
+    clickhouse: ClickHouseWriter,
+    *,
+    wallet_limit: int,
+    mode: str,
+    since_hours: int,
+    min_notional: float = 10_000.0,
+) -> list[str]:
+    if mode == "recent":
+        return discover_recent_wallets(
+            clickhouse,
+            wallet_limit=wallet_limit,
+            since_hours=since_hours,
+        )
+    if wallet_limit <= 0:
+        raise ValueError("wallet_limit must be positive")
+    if min_notional < 0:
+        raise ValueError("min_notional must be non-negative")
+
+    if mode == "all":
+        query = f"""
+            select user_address
+            from mart_wallet_screener final
+            where user_address != ''
+            order by
+              isNull(portfolio_captured_at) desc,
+              portfolio_captured_at asc,
+              traded_notional desc,
+              last_trade_at desc
+            limit {wallet_limit}
+            format JSONEachRow
+        """
+    elif mode == "smart-candidates":
+        query = f"""
+            select user_address
+            from mart_wallet_screener final
+            where user_address != ''
+              and traded_notional >= {min_notional}
+            order by
+              isNull(pnl_captured_at) desc,
+              pnl_captured_at asc,
+              traded_notional desc,
+              last_trade_at desc
+            limit {wallet_limit}
+            format JSONEachRow
+        """
+    elif mode == "whale-candidates":
+        query = f"""
+            select user_address
+            from mart_wallet_screener final
+            where user_address != ''
+              and is_whale
+            order by
+              isNull(portfolio_captured_at) desc,
+              portfolio_captured_at asc,
+              traded_notional desc,
+              max_single_trade_notional desc
+            limit {wallet_limit}
+            format JSONEachRow
+        """
+    else:
+        raise ValueError(f"unsupported wallet candidate mode: {mode}")
+
+    return [
+        json.loads(line)["user_address"]
+        for line in clickhouse.query_text(query).splitlines()
+        if line.strip()
+    ]
+
+
+def merge_wallet_lists(primary: list[str], extra: list[str]) -> list[str]:
+    wallets: list[str] = []
+    seen: set[str] = set()
+    for wallet in [*extra, *primary]:
+        normalized = str(wallet or "").strip().lower()
+        if not normalized or normalized in seen:
+            continue
+        seen.add(normalized)
+        wallets.append(normalized)
+    return wallets
 
 
 def cmd_tasks_seed_basic(args: argparse.Namespace, app_settings: Settings) -> Any:
@@ -946,6 +1397,97 @@ def cmd_tasks_seed_basic(args: argparse.Namespace, app_settings: Settings) -> An
     return {"added": added, "summary": store.summary(), "task_store": args.task_store}
 
 
+def cmd_tasks_seed_wallets(args: argparse.Namespace, app_settings: Settings) -> Any:
+    if (
+        not args.include_trades
+        and not args.include_activity
+        and not args.include_wallet_portfolio
+        and not args.include_wallet_pnl
+    ):
+        raise ValueError(
+            "at least one of include_trades/include_activity/include_wallet_portfolio/include_wallet_pnl must be enabled"
+        )
+    store = task_store_for_args(args, app_settings)
+    refresh_run = args.refresh_run or datetime.now(UTC).replace(microsecond=0).isoformat()
+    wallets = discover_wallet_candidates(
+        ClickHouseWriter(app_settings),
+        wallet_limit=args.wallet_limit,
+        mode=args.candidate_mode,
+        since_hours=args.since_hours,
+        min_notional=args.min_notional,
+    )
+    wallets = merge_wallet_lists(wallets, args.wallets)
+    tasks: list[Task] = []
+    for wallet in wallets:
+        base_params = {
+            "user": wallet,
+            "page_limit": min(args.page_limit, 500),
+            "max_pages": args.max_pages,
+            "resume": False,
+            "_refresh_run": refresh_run,
+        }
+        if args.requeue_done:
+            base_params["_requeue_done"] = True
+        if args.include_trades:
+            tasks.append(
+                Task(
+                    kind="trades",
+                    params={**base_params, "market": None, "event_id": None},
+                    priority=WALLET_REFRESH_PRIORITY,
+                )
+            )
+        if args.include_activity:
+            tasks.append(
+                Task(
+                    kind="activity",
+                    params=dict(base_params),
+                    priority=WALLET_REFRESH_PRIORITY,
+                )
+            )
+        if args.include_wallet_portfolio:
+            portfolio_params = {"user": wallet, "_refresh_run": refresh_run}
+            if args.requeue_done:
+                portfolio_params["_requeue_done"] = True
+            tasks.append(
+                Task(
+                    kind="wallet-portfolio",
+                    params=portfolio_params,
+                    priority=WALLET_PORTFOLIO_PRIORITY,
+                )
+            )
+        if args.include_wallet_pnl:
+            pnl_params = {
+                "user": wallet,
+                "interval": "all",
+                "fidelity": "1d",
+                "_refresh_run": refresh_run,
+            }
+            if args.requeue_done:
+                pnl_params["_requeue_done"] = True
+            tasks.append(
+                Task(
+                    kind="wallet-pnl",
+                    params=pnl_params,
+                    priority=WALLET_PNL_PRIORITY,
+                )
+            )
+
+    added = store.add_many(tasks)
+    return {
+        "added": added,
+        "candidate_tasks": len(tasks),
+        "wallets": len(wallets),
+        "refresh_run": refresh_run,
+        "include_trades": args.include_trades,
+        "include_activity": args.include_activity,
+        "include_wallet_portfolio": args.include_wallet_portfolio,
+        "include_wallet_pnl": args.include_wallet_pnl,
+        "candidate_mode": args.candidate_mode,
+        "summary": store.summary(),
+        "task_store": args.task_store,
+    }
+
+
 def cmd_tasks_seed_frontier(args: argparse.Namespace, app_settings: Settings) -> Any:
     store = task_store_for_args(args, app_settings)
     refresh_run = args.refresh_run or datetime.now(UTC).replace(microsecond=0).isoformat()
@@ -959,14 +1501,47 @@ def cmd_tasks_seed_frontier(args: argparse.Namespace, app_settings: Settings) ->
         "active": True if args.active_only else None,
         "_refresh_run": refresh_run,
     }
-    tasks = [
-        Task(kind="gamma-events", params=dict(gamma_params), priority=FRONTIER_GAMMA_PRIORITY),
-        Task(kind="gamma-markets", params=dict(gamma_params), priority=FRONTIER_GAMMA_PRIORITY),
-    ]
+    tasks = []
+    if args.include_gamma:
+        tasks.extend(
+            [
+                Task(kind="gamma-events", params=dict(gamma_params), priority=FRONTIER_GAMMA_PRIORITY),
+                Task(kind="gamma-markets", params=dict(gamma_params), priority=FRONTIER_GAMMA_PRIORITY),
+            ]
+        )
 
+    event_ids: list[str] = []
     condition_ids: list[str] = []
     token_ids: list[str] = []
-    if (
+    if args.sync_mode == "event":
+        event_ids = discover_frontier_events(
+            ClickHouseWriter(app_settings),
+            event_limit=args.event_limit,
+            active_only=args.active_only,
+        )
+        tasks.extend(
+            Task(
+                kind="event-refresh",
+                params={
+                    "event_id": event_id,
+                    "refresh_run": refresh_run,
+                    "gamma_page_limit": args.gamma_page_limit,
+                    "trade_page_limit": args.trade_page_limit,
+                    "trade_max_pages": args.trade_max_pages,
+                    "price_interval": args.price_interval,
+                    "price_fidelity": args.price_fidelity,
+                    "holders_limit": args.holders_limit,
+                    "positions_limit": args.positions_limit,
+                    "include_gamma": False,
+                    "include_holders": args.include_holders,
+                    "include_market_positions": args.include_market_positions,
+                    "include_open_interest": args.include_open_interest,
+                },
+                priority=FRONTIER_EVENT_PRIORITY,
+            )
+            for event_id in event_ids
+        )
+    elif (
         args.include_trades
         or args.include_price_history
         or args.include_books
@@ -980,21 +1555,40 @@ def cmd_tasks_seed_frontier(args: argparse.Namespace, app_settings: Settings) ->
         )
 
     if args.include_trades:
+        trade_params = []
+        if args.include_global_trades:
+            params = {
+                "page_limit": args.trade_page_limit,
+                "max_pages": args.trade_max_pages,
+                "resume": False,
+                "user": None,
+                "market": None,
+                "event_id": None,
+                "_refresh_run": refresh_run,
+            }
+            if args.requeue_done:
+                params["_requeue_done"] = True
+            trade_params.append(params)
+        for condition_id in condition_ids:
+            params = {
+                "page_limit": args.trade_page_limit,
+                "max_pages": args.trade_max_pages,
+                "resume": False,
+                "user": None,
+                "market": condition_id,
+                "event_id": None,
+                "_refresh_run": refresh_run,
+            }
+            if args.requeue_done:
+                params["_requeue_done"] = True
+            trade_params.append(params)
         tasks.extend(
             Task(
                 kind="trades",
-                params={
-                    "page_limit": args.trade_page_limit,
-                    "max_pages": args.trade_max_pages,
-                    "resume": False,
-                    "user": None,
-                    "market": condition_id,
-                    "event_id": None,
-                    "_refresh_run": refresh_run,
-                },
+                params=params,
                 priority=FRONTIER_TRADES_PRIORITY,
             )
-            for condition_id in condition_ids
+            for params in trade_params
         )
     if args.include_price_history:
         tasks.extend(
@@ -1026,9 +1620,12 @@ def cmd_tasks_seed_frontier(args: argparse.Namespace, app_settings: Settings) ->
     return {
         "added": added,
         "candidate_tasks": len(tasks),
+        "event_ids": len(event_ids),
         "condition_ids": len(condition_ids),
         "token_ids": len(token_ids),
         "refresh_run": refresh_run,
+        "sync_mode": args.sync_mode,
+        "include_gamma": args.include_gamma,
         "summary": store.summary(),
         "task_store": args.task_store,
     }
@@ -1217,6 +1814,8 @@ def cmd_load_data_trades(args: argparse.Namespace, app_settings: Settings) -> An
         force=args.force,
         batch_size=args.batch_size,
         workers=args.workers,
+        max_paths=args.max_paths,
+        newest_first=args.newest_first,
     )
 
 
@@ -1244,6 +1843,30 @@ def cmd_load_data_market_positions(args: argparse.Namespace, app_settings: Setti
     )
 
 
+def cmd_load_data_positions(args: argparse.Namespace, app_settings: Settings) -> Any:
+    return DataRawLoader(clickhouse=ClickHouseWriter(app_settings)).load_positions(
+        raw_root=app_settings.raw_data_dir,
+        force=args.force,
+        batch_size=args.batch_size,
+    )
+
+
+def cmd_load_data_wallet_portfolio(args: argparse.Namespace, app_settings: Settings) -> Any:
+    return DataRawLoader(clickhouse=ClickHouseWriter(app_settings)).load_wallet_portfolio(
+        raw_root=app_settings.raw_data_dir,
+        force=args.force,
+        batch_size=args.batch_size,
+    )
+
+
+def cmd_load_data_user_pnl(args: argparse.Namespace, app_settings: Settings) -> Any:
+    return DataRawLoader(clickhouse=ClickHouseWriter(app_settings)).load_user_pnl(
+        raw_root=app_settings.raw_data_dir,
+        force=args.force,
+        batch_size=args.batch_size,
+    )
+
+
 def cmd_load_data_open_interest(args: argparse.Namespace, app_settings: Settings) -> Any:
     return DataRawLoader(clickhouse=ClickHouseWriter(app_settings)).load_open_interest(
         raw_root=app_settings.raw_data_dir,
@@ -1263,30 +1886,35 @@ def cmd_load_chain_logs(args: argparse.Namespace, app_settings: Settings) -> Any
 def cmd_load_exchange_fills(args: argparse.Namespace, app_settings: Settings) -> Any:
     return ChainRawLoader(clickhouse=ClickHouseWriter(app_settings)).build_exchange_fills(
         batch_size=args.batch_size,
+        force=args.force,
     )
 
 
 def cmd_load_orders_matched(args: argparse.Namespace, app_settings: Settings) -> Any:
     return ChainRawLoader(clickhouse=ClickHouseWriter(app_settings)).build_orders_matched(
         batch_size=args.batch_size,
+        force=args.force,
     )
 
 
 def cmd_load_fees_charged(args: argparse.Namespace, app_settings: Settings) -> Any:
     return ChainRawLoader(clickhouse=ClickHouseWriter(app_settings)).build_fee_charged(
         batch_size=args.batch_size,
+        force=args.force,
     )
 
 
 def cmd_load_balance_movements(args: argparse.Namespace, app_settings: Settings) -> Any:
     return ChainRawLoader(clickhouse=ClickHouseWriter(app_settings)).build_balance_movements(
         batch_size=args.batch_size,
+        force=args.force,
     )
 
 
 def cmd_load_lifecycle_events(args: argparse.Namespace, app_settings: Settings) -> Any:
     return ChainRawLoader(clickhouse=ClickHouseWriter(app_settings)).build_lifecycle_events(
         batch_size=args.batch_size,
+        force=args.force,
     )
 
 
@@ -1296,6 +1924,12 @@ def cmd_build_market_1m(_args: argparse.Namespace, app_settings: Settings) -> An
 
 def cmd_build_trader_profiles(_args: argparse.Namespace, app_settings: Settings) -> Any:
     return MartBuilder(clickhouse=ClickHouseWriter(app_settings)).build_trader_profiles()
+
+
+def cmd_build_wallet_trade_rollup(args: argparse.Namespace, app_settings: Settings) -> Any:
+    return MartBuilder(clickhouse=ClickHouseWriter(app_settings)).build_wallet_trade_rollup(
+        since_hours=args.since_hours,
+    )
 
 
 def cmd_build_trader_chain_pnl(_args: argparse.Namespace, app_settings: Settings) -> Any:
@@ -1312,6 +1946,10 @@ def cmd_build_live_wallet_positions(_args: argparse.Namespace, app_settings: Set
 
 def cmd_build_wallet_reputation(_args: argparse.Namespace, app_settings: Settings) -> Any:
     return MartBuilder(clickhouse=ClickHouseWriter(app_settings)).build_wallet_reputation()
+
+
+def cmd_build_wallet_screener(_args: argparse.Namespace, app_settings: Settings) -> Any:
+    return MartBuilder(clickhouse=ClickHouseWriter(app_settings)).build_wallet_screener()
 
 
 def cmd_build_event_anomaly_signals(args: argparse.Namespace, app_settings: Settings) -> Any:

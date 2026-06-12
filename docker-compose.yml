@@ -1,6 +1,8 @@
 services:
   postgres:
     image: postgres:16-alpine
+    restart: unless-stopped
+    mem_limit: 4g
     environment:
       POSTGRES_DB: zetta
       POSTGRES_USER: zetta
@@ -13,6 +15,8 @@ services:
 
   clickhouse:
     image: clickhouse/clickhouse-server:24.8
+    restart: unless-stopped
+    mem_limit: 48g
     environment:
       CLICKHOUSE_DB: zetta
       CLICKHOUSE_USER: zetta
@@ -24,9 +28,12 @@ services:
     volumes:
       - clickhouse-data:/var/lib/clickhouse
       - ./infra/clickhouse/schema.sql:/docker-entrypoint-initdb.d/001-schema.sql:ro
+      - ./infra/clickhouse/recovery.xml:/etc/clickhouse-server/config.d/99-recovery.xml:ro
 
   redpanda:
     image: redpandadata/redpanda:v24.2.7
+    restart: unless-stopped
+    mem_limit: 2g
     command:
       - redpanda
       - start
@@ -52,6 +59,8 @@ services:
 
   minio:
     image: minio/minio:RELEASE.2025-05-24T17-08-30Z
+    restart: unless-stopped
+    mem_limit: 2g
     command: server /data --console-address ":9001"
     environment:
       MINIO_ROOT_USER: zettaadmin

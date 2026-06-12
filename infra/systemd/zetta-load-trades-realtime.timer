@@ -1,0 +1,11 @@
+[Unit]
+Description=Load latest Zetta trades every minute
+
+[Timer]
+OnBootSec=2min
+OnUnitInactiveSec=1min
+AccuracySec=10s
+Unit=zetta-load-trades-realtime.service
+
+[Install]
+WantedBy=timers.target

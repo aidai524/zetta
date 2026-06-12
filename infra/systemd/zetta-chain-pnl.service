@@ -1,13 +1,13 @@
 [Unit]
-Description=Zetta raw-to-ClickHouse loader
+Description=Zetta chain-verified wallet PnL mart
 After=network-online.target docker.service
 Wants=network-online.target
 
 [Service]
 Type=oneshot
 EnvironmentFile=/etc/zetta/zetta.env
-ExecStart=/usr/local/bin/zetta-runner load
+ExecStart=/usr/local/bin/zetta-runner chain-pnl
 MemoryAccounting=true
-MemoryMax=24G
-TasksMax=128
-TimeoutStartSec=30min
+MemoryMax=8G
+TasksMax=64
+TimeoutStartSec=10min

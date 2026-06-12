@@ -27,11 +27,34 @@ fi
 
 case "$MODE" in
   worker)
-    exec "$ZETTA_PYTHON" -m zetta.cli \
-      "${COMMON_ARGS[@]}" \
-      --task-store postgres \
-      --node-id "$ZETTA_NODE_ID" \
-      tasks run-loop --idle-sleep-seconds "$ZETTA_WORKER_IDLE_SECONDS"
+    WORKER_PROCESSES="${ZETTA_WORKER_PROCESSES:-1}"
+    if [[ "$WORKER_PROCESSES" -le 1 ]]; then
+      exec "$ZETTA_PYTHON" -m zetta.cli \
+        "${COMMON_ARGS[@]}" \
+        --task-store postgres \
+        --node-id "$ZETTA_NODE_ID" \
+        tasks run-loop --idle-sleep-seconds "$ZETTA_WORKER_IDLE_SECONDS"
+    fi
+    pids=()
+    stop_workers() {
+      for pid in "${pids[@]}"; do
+        kill "$pid" 2>/dev/null || true
+      done
+      wait || true
+    }
+    trap stop_workers TERM INT
+    for index in $(seq 1 "$WORKER_PROCESSES"); do
+      "$ZETTA_PYTHON" -m zetta.cli \
+        "${COMMON_ARGS[@]}" \
+        --task-store postgres \
+        --node-id "${ZETTA_NODE_ID}-${index}" \
+        tasks run-loop --idle-sleep-seconds "$ZETTA_WORKER_IDLE_SECONDS" &
+      pids+=("$!")
+    done
+    wait -n
+    status="$?"
+    stop_workers
+    exit "$status"
     ;;
   api)
     exec "$ZETTA_PYTHON" -m zetta.cli \
@@ -62,9 +85,165 @@ case "$MODE" in
         --trade-max-pages "${ZETTA_FRONTIER_TRADE_MAX_PAGES:-1}" \
         --price-interval "${ZETTA_FRONTIER_PRICE_INTERVAL:-1d}"
     ;;
+  frontier-trades)
+    "$ZETTA_PYTHON" -m zetta.cli \
+      "${COMMON_ARGS[@]}" \
+      --task-store postgres \
+      --node-id "$ZETTA_NODE_ID" \
+      tasks seed-frontier \
+        --sync-mode typed \
+        --no-include-gamma \
+        --include-trades \
+        --include-global-trades \
+        --no-include-price-history \
+        --no-include-books \
+        --refresh-run realtime-trades \
+        --requeue-done \
+        --event-limit "${ZETTA_TRADES_FRONTIER_EVENT_LIMIT:-50}" \
+        --condition-limit "${ZETTA_TRADES_FRONTIER_CONDITION_LIMIT:-100}" \
+        --token-limit 0 \
+        --trade-page-limit "${ZETTA_TRADES_FRONTIER_TRADE_PAGE_LIMIT:-500}" \
+        --trade-max-pages "${ZETTA_TRADES_FRONTIER_TRADE_MAX_PAGES:-1}"
+    "$ZETTA_PYTHON" -m zetta.cli "${COMMON_ARGS[@]}" collect trades \
+      --page-limit "${ZETTA_GLOBAL_TRADE_PAGE_LIMIT:-500}" \
+      --max-pages "${ZETTA_GLOBAL_TRADE_MAX_PAGES:-1}"
+    ;;
+  wallets)
+    WALLET_ARGS=()
+    if [[ -n "${ZETTA_WALLET_WATCHLIST:-}" ]]; then
+      IFS=',' read -r -a WATCHED_WALLETS <<< "$ZETTA_WALLET_WATCHLIST"
+      for wallet in "${WATCHED_WALLETS[@]}"; do
+        wallet="${wallet//[[:space:]]/}"
+        if [[ -n "$wallet" ]]; then
+          WALLET_ARGS+=(--wallet "$wallet")
+        fi
+      done
+    fi
+    "$ZETTA_PYTHON" -m zetta.cli \
+      "${COMMON_ARGS[@]}" \
+      --task-store postgres \
+      --node-id "$ZETTA_NODE_ID" \
+      tasks seed-wallets \
+        "${WALLET_ARGS[@]}" \
+        --wallet-limit "${ZETTA_WALLET_REFRESH_LIMIT:-100}" \
+        --since-hours "${ZETTA_WALLET_REFRESH_SINCE_HOURS:-48}" \
+        --page-limit "${ZETTA_WALLET_REFRESH_PAGE_LIMIT:-500}" \
+        --max-pages "${ZETTA_WALLET_REFRESH_MAX_PAGES:-2}" \
+        --candidate-mode "${ZETTA_WALLET_REFRESH_CANDIDATE_MODE:-recent}" \
+        --min-notional "${ZETTA_WALLET_REFRESH_MIN_NOTIONAL:-10000}" \
+        --include-trades \
+        --include-activity \
+        --include-wallet-portfolio \
+        --refresh-run realtime-wallets \
+        --requeue-done
+    ;;
+  wallet-candidates)
+    "$ZETTA_PYTHON" -m zetta.cli \
+      "${COMMON_ARGS[@]}" \
+      --task-store postgres \
+      --node-id "$ZETTA_NODE_ID" \
+      tasks seed-wallets \
+        --wallet-limit "${ZETTA_WALLET_CANDIDATE_REFRESH_LIMIT:-500}" \
+        --since-hours "${ZETTA_WALLET_REFRESH_SINCE_HOURS:-48}" \
+        --page-limit "${ZETTA_WALLET_REFRESH_PAGE_LIMIT:-500}" \
+        --max-pages "${ZETTA_WALLET_REFRESH_MAX_PAGES:-2}" \
+        --candidate-mode "${ZETTA_WALLET_CANDIDATE_MODE:-smart-candidates}" \
+        --min-notional "${ZETTA_WALLET_CANDIDATE_MIN_NOTIONAL:-10000}" \
+        --no-include-trades \
+        --no-include-activity \
+        --include-wallet-portfolio \
+        --refresh-run "${ZETTA_WALLET_CANDIDATE_REFRESH_RUN:-wallet-candidates}" \
+        --requeue-done
+    ;;
+  wallet-pnl-candidates)
+    PNL_REFRESH_RUN="${ZETTA_WALLET_PNL_CANDIDATE_REFRESH_RUN:-wallet-pnl-candidates-$(date -u +%Y%m%d%H)}"
+    PNL_REQUEUE_ARGS=()
+    if [[ "${ZETTA_WALLET_PNL_CANDIDATE_REQUEUE_DONE:-0}" == "1" ]]; then
+      PNL_REQUEUE_ARGS+=(--requeue-done)
+    fi
+    "$ZETTA_PYTHON" -m zetta.cli \
+      "${COMMON_ARGS[@]}" \
+      --task-store postgres \
+      --node-id "$ZETTA_NODE_ID" \
+      tasks seed-wallets \
+        --wallet-limit "${ZETTA_WALLET_PNL_CANDIDATE_REFRESH_LIMIT:-5000}" \
+        --since-hours "${ZETTA_WALLET_REFRESH_SINCE_HOURS:-48}" \
+        --page-limit "${ZETTA_WALLET_REFRESH_PAGE_LIMIT:-500}" \
+        --max-pages "${ZETTA_WALLET_REFRESH_MAX_PAGES:-2}" \
+        --candidate-mode "${ZETTA_WALLET_PNL_CANDIDATE_MODE:-smart-candidates}" \
+        --min-notional "${ZETTA_WALLET_PNL_CANDIDATE_MIN_NOTIONAL:-10000}" \
+        --no-include-trades \
+        --no-include-activity \
+        --no-include-wallet-portfolio \
+        --include-wallet-pnl \
+        --refresh-run "$PNL_REFRESH_RUN" \
+        "${PNL_REQUEUE_ARGS[@]}"
+    ;;
+  wallet-pnl-load)
+    "$ZETTA_PYTHON" -m zetta.cli "${COMMON_ARGS[@]}" load data-user-pnl \
+      --batch-size "${ZETTA_WALLET_PNL_LOAD_BATCH_SIZE:-20000}"
+    ;;
+  load-trades-realtime)
+    "$ZETTA_PYTHON" -m zetta.cli "${COMMON_ARGS[@]}" load data-trades \
+      --batch-size "${ZETTA_REALTIME_TRADE_BATCH_SIZE:-1000}" \
+      --workers 1 \
+      --max-paths "${ZETTA_REALTIME_TRADE_MAX_PATHS:-1000}" \
+      --newest-first
+    "$ZETTA_PYTHON" -m zetta.cli "${COMMON_ARGS[@]}" load data-activity \
+      --batch-size "${ZETTA_REALTIME_TRADE_BATCH_SIZE:-1000}"
+    "$ZETTA_PYTHON" -m zetta.cli "${COMMON_ARGS[@]}" load data-positions \
+      --batch-size "${ZETTA_REALTIME_TRADE_BATCH_SIZE:-1000}"
+    "$ZETTA_PYTHON" -m zetta.cli "${COMMON_ARGS[@]}" load data-wallet-portfolio \
+      --batch-size "${ZETTA_REALTIME_TRADE_BATCH_SIZE:-1000}"
+    "$ZETTA_PYTHON" -m zetta.cli "${COMMON_ARGS[@]}" load data-user-pnl \
+      --batch-size "${ZETTA_REALTIME_TRADE_BATCH_SIZE:-1000}"
+    ;;
+  wallet-rollup)
+    "$ZETTA_PYTHON" -m zetta.cli "${COMMON_ARGS[@]}" build wallet-trade-rollup \
+      --since-hours "${ZETTA_WALLET_ROLLUP_SINCE_HOURS:-48}"
+    ;;
+  wallet-screener)
+    "$ZETTA_PYTHON" -m zetta.cli \
+      "${COMMON_ARGS[@]}" \
+      --timeout "${ZETTA_WALLET_SCREENER_TIMEOUT_SECONDS:-1800}" \
+      build wallet-screener
+    ;;
+  chain-frontier)
+    EXCHANGE_ARGS=()
+    if [[ -n "${ZETTA_CHAIN_EXCHANGE_ADDRESSES:-}" ]]; then
+      IFS=',' read -r -a CHAIN_EXCHANGE_ADDRESSES <<< "$ZETTA_CHAIN_EXCHANGE_ADDRESSES"
+      for address in "${CHAIN_EXCHANGE_ADDRESSES[@]}"; do
+        address="${address//[[:space:]]/}"
+        if [[ -n "$address" ]]; then
+          EXCHANGE_ARGS+=(--exchange-address "$address")
+        fi
+      done
+    fi
+    "$ZETTA_PYTHON" -m zetta.cli "${COMMON_ARGS[@]}" chain frontier \
+      --lookback-blocks "${ZETTA_CHAIN_FRONTIER_LOOKBACK_BLOCKS:-80}" \
+      --confirmations "${ZETTA_CHAIN_FRONTIER_CONFIRMATIONS:-64}" \
+      --overlap-blocks "${ZETTA_CHAIN_FRONTIER_OVERLAP_BLOCKS:-10}" \
+      --step-blocks "${ZETTA_CHAIN_FRONTIER_STEP_BLOCKS:-80}" \
+      --conditional-tokens-address "${ZETTA_CHAIN_CTF_ADDRESS:-0x4d97dcd97ec945f40cf65f87097ace5ea0476045}" \
+      --batch-size "${ZETTA_CHAIN_FRONTIER_BATCH_SIZE:-2000}" \
+      "${EXCHANGE_ARGS[@]}"
+    ;;
+  chain-pnl)
+    "$ZETTA_PYTHON" -m zetta.cli "${COMMON_ARGS[@]}" build trader-chain-pnl
+    ;;
   load)
     "$ZETTA_PYTHON" -m zetta.cli "${COMMON_ARGS[@]}" load gamma-raw --batch-size "$ZETTA_LOADER_BATCH_SIZE"
-    "$ZETTA_PYTHON" -m zetta.cli "${COMMON_ARGS[@]}" load data-trades --batch-size "$ZETTA_LOADER_BATCH_SIZE" --workers "${ZETTA_LOADER_WORKERS:-1}"
+    "$ZETTA_PYTHON" -m zetta.cli "${COMMON_ARGS[@]}" load data-trades \
+      --batch-size "$ZETTA_LOADER_BATCH_SIZE" \
+      --workers "${ZETTA_LOADER_WORKERS:-1}" \
+      --max-paths "${ZETTA_LOADER_MAX_PATHS:-5000}"
+    "$ZETTA_PYTHON" -m zetta.cli "${COMMON_ARGS[@]}" load data-activity --batch-size "$ZETTA_LOADER_BATCH_SIZE"
+    "$ZETTA_PYTHON" -m zetta.cli "${COMMON_ARGS[@]}" load data-holders --batch-size "$ZETTA_LOADER_BATCH_SIZE"
+    "$ZETTA_PYTHON" -m zetta.cli "${COMMON_ARGS[@]}" load data-market-positions --batch-size "$ZETTA_LOADER_BATCH_SIZE"
+    "$ZETTA_PYTHON" -m zetta.cli "${COMMON_ARGS[@]}" load data-positions --batch-size "$ZETTA_LOADER_BATCH_SIZE"
+    "$ZETTA_PYTHON" -m zetta.cli "${COMMON_ARGS[@]}" load data-wallet-portfolio --batch-size "$ZETTA_LOADER_BATCH_SIZE"
+    "$ZETTA_PYTHON" -m zetta.cli "${COMMON_ARGS[@]}" load data-user-pnl --batch-size "$ZETTA_LOADER_BATCH_SIZE"
+    "$ZETTA_PYTHON" -m zetta.cli "${COMMON_ARGS[@]}" load data-open-interest --batch-size "$ZETTA_LOADER_BATCH_SIZE"
     "$ZETTA_PYTHON" -m zetta.cli "${COMMON_ARGS[@]}" load clob-price-history --batch-size "$ZETTA_LOADER_BATCH_SIZE"
     "$ZETTA_PYTHON" -m zetta.cli "${COMMON_ARGS[@]}" load clob-books --batch-size "$ZETTA_LOADER_BATCH_SIZE"
     "$ZETTA_PYTHON" -m zetta.cli "${COMMON_ARGS[@]}" load clob-ws-market-books --batch-size "$ZETTA_LOADER_BATCH_SIZE" --workers "${ZETTA_LOADER_WORKERS:-1}"
@@ -76,13 +255,27 @@ case "$MODE" in
     "$ZETTA_PYTHON" -m zetta.cli "${COMMON_ARGS[@]}" load lifecycle-events --batch-size "$ZETTA_LOADER_BATCH_SIZE"
     ;;
   marts)
-    "$ZETTA_PYTHON" -m zetta.cli "${COMMON_ARGS[@]}" build market-1m
-    "$ZETTA_PYTHON" -m zetta.cli "${COMMON_ARGS[@]}" build trader-profiles
-    "$ZETTA_PYTHON" -m zetta.cli "${COMMON_ARGS[@]}" build trader-chain-pnl
-    "$ZETTA_PYTHON" -m zetta.cli "${COMMON_ARGS[@]}" build trade-reconciliation
-    "$ZETTA_PYTHON" -m zetta.cli "${COMMON_ARGS[@]}" build settlement-audit
-    "$ZETTA_PYTHON" -m zetta.cli "${COMMON_ARGS[@]}" build alerts --since-hours 24
-    "$ZETTA_PYTHON" -m zetta.cli "${COMMON_ARGS[@]}" build collector-health
+    MART_ARGS=("${COMMON_ARGS[@]}" --timeout "${ZETTA_MART_TIMEOUT_SECONDS:-1800}")
+    "$ZETTA_PYTHON" -m zetta.cli "${MART_ARGS[@]}" build market-1m
+    if [[ "${ZETTA_MART_BUILD_TRADER_PROFILES:-0}" == "1" ]]; then
+      "$ZETTA_PYTHON" -m zetta.cli "${MART_ARGS[@]}" build trader-profiles
+    else
+      printf '{"mart":"trader_profile","skipped":true,"reason":"disabled_for_regular_marts"}\n'
+    fi
+    "$ZETTA_PYTHON" -m zetta.cli "${MART_ARGS[@]}" build trader-chain-pnl
+    if [[ "${ZETTA_MART_BUILD_WALLET_SCREENER:-0}" == "1" ]]; then
+      "$ZETTA_PYTHON" -m zetta.cli "${MART_ARGS[@]}" build wallet-screener
+    else
+      printf '{"mart":"wallet_screener","skipped":true,"reason":"disabled_for_regular_marts"}\n'
+    fi
+    if [[ "${ZETTA_MART_BUILD_TRADE_RECONCILIATION:-0}" == "1" ]]; then
+      "$ZETTA_PYTHON" -m zetta.cli "${MART_ARGS[@]}" build trade-reconciliation
+    else
+      printf '{"mart":"trade_reconciliation","skipped":true,"reason":"disabled_for_regular_marts"}\n'
+    fi
+    "$ZETTA_PYTHON" -m zetta.cli "${MART_ARGS[@]}" build settlement-audit
+    "$ZETTA_PYTHON" -m zetta.cli "${MART_ARGS[@]}" build alerts --since-hours 24
+    "$ZETTA_PYTHON" -m zetta.cli "${MART_ARGS[@]}" build collector-health
     ;;
   *)
     echo "unknown mode: $MODE" >&2

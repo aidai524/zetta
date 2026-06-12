@@ -46,3 +46,14 @@ def test_iter_raw_records_reads_all_records_in_chunk(tmp_path) -> None:
         f"{final_path}#000000001",
         f"{final_path}#000000002",
     ]
+
+
+def test_iter_raw_paths_can_read_newest_first(tmp_path) -> None:
+    writer = RawJsonlWriter(tmp_path)
+    first = writer.write(source="data", entity="trades", request_url="u1", payload=[])
+    time.sleep(0.001)
+    second = writer.write(source="data", entity="trades", request_url="u2", payload=[])
+
+    paths = list(iter_raw_paths(tmp_path, source="data", entity="trades", newest_first=True))
+
+    assert paths == [second, first]

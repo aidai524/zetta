@@ -158,15 +158,53 @@ class MartBuilder:
                 from
                 (
                   select
-                    trade_id,
-                    anyLast(user_address) as trader,
-                    anyLast(side) as side,
-                    anyLast(size) as size,
-                    anyLast(notional) as notional,
-                    anyLast(timestamp) as timestamp
-                  from fact_trade
-                  where user_address != ''
-                  group by trade_id
+                    lower(user_address) as trader,
+                    transaction_hash,
+                    condition_id,
+                    token_id,
+                    timestamp,
+                    side,
+                    price,
+                    size,
+                    notional
+                  from
+                  (
+                    select
+                      normalized_user_address as user_address,
+                      transaction_hash,
+                      condition_id,
+                      token_id,
+                      timestamp,
+                      side,
+                      price,
+                      size,
+                      anyLast(notional) as notional
+                    from
+                    (
+                      select
+                        lower(user_address) as normalized_user_address,
+                        transaction_hash,
+                        condition_id,
+                        token_id,
+                        timestamp,
+                        side,
+                        price,
+                        size,
+                        notional
+                      from fact_trade
+                      where user_address != ''
+                        and timestamp <= now64(3) + interval 10 minute
+                    )
+                    group by
+                      normalized_user_address,
+                      transaction_hash,
+                      condition_id,
+                      token_id,
+                      timestamp,
+                      side,
+                      price,
+                      size
+                  )
                 )
                 where trader != ''
                 group by trader
@@ -245,6 +283,343 @@ class MartBuilder:
         )
         rows = int(self.clickhouse.query_text("select count() from mart_trader_profile").strip() or "0")
         return MartBuildResult(mart="trader_profile", rows=rows)
+
+    def build_wallet_trade_rollup(self, *, since_hours: int = 48) -> MartBuildResult:
+        if since_hours <= 0:
+            raise ValueError("since_hours must be positive")
+        self.clickhouse.execute(
+            f"""
+            insert into mart_wallet_trade_rollup
+            select
+              user_address,
+              trade_count,
+              buy_count,
+              sell_count,
+              traded_size,
+              traded_notional,
+              buy_notional,
+              sell_notional,
+              first_trade_at,
+              last_trade_at,
+              traded_notional_24h,
+              trade_count_24h,
+              buy_notional_24h,
+              sell_notional_24h,
+              sell_notional_24h - buy_notional_24h as net_notional_24h,
+              latest_action,
+              multiIf(
+                traded_notional >= 10000000, '10m_plus',
+                traded_notional >= 5000000, '5m_plus',
+                traded_notional >= 1000000, '1m_plus',
+                traded_notional >= 100000, '100k_plus',
+                'standard'
+              ) as whale_tier,
+              greatest(0, toUInt32(dateDiff('second', last_trade_at, now64(3)))) as data_lag_seconds,
+              now64(3) as updated_at
+            from
+            (
+              select
+                user_address,
+                count() as trade_count,
+                countIf(side = 'BUY') as buy_count,
+                countIf(side = 'SELL') as sell_count,
+                sum(size) as traded_size,
+                sum(notional) as traded_notional,
+                sumIf(notional, side = 'BUY') as buy_notional,
+                sumIf(notional, side = 'SELL') as sell_notional,
+                min(timestamp) as first_trade_at,
+                max(timestamp) as last_trade_at,
+                sumIf(notional, timestamp >= now64(3) - interval 24 hour) as traded_notional_24h,
+                countIf(timestamp >= now64(3) - interval 24 hour) as trade_count_24h,
+                sumIf(notional, side = 'BUY' and timestamp >= now64(3) - interval 24 hour)
+                  as buy_notional_24h,
+                sumIf(notional, side = 'SELL' and timestamp >= now64(3) - interval 24 hour)
+                  as sell_notional_24h,
+                argMax(side, timestamp) as latest_action
+              from
+              (
+                select
+                  normalized_user_address as user_address,
+                  transaction_hash,
+                  condition_id,
+                  token_id,
+                  timestamp,
+                  side,
+                  price,
+                  size,
+                  anyLast(notional) as notional
+                from
+                (
+                  select
+                    lower(user_address) as normalized_user_address,
+                    transaction_hash,
+                    condition_id,
+                    token_id,
+                    timestamp,
+                    side,
+                    price,
+                    size,
+                    notional
+                  from fact_trade_by_time
+                  where user_address != ''
+                    and timestamp <= now64(3) + interval 10 minute
+                    and timestamp >= now64(3) - interval {since_hours} hour
+                )
+                group by
+                  normalized_user_address,
+                  transaction_hash,
+                  condition_id,
+                  token_id,
+                  timestamp,
+                  side,
+                  price,
+                  size
+              )
+              group by user_address
+            )
+            """
+        )
+        rows = int(
+            self.clickhouse.query_text("select count() from mart_wallet_trade_rollup").strip()
+            or "0"
+        )
+        return MartBuildResult(mart="wallet_trade_rollup", rows=rows)
+
+    def build_wallet_screener(self) -> MartBuildResult:
+        self.clickhouse.execute("truncate table mart_wallet_screener_next")
+        self.clickhouse.execute(
+            """
+            insert into mart_wallet_screener_next
+            (
+              user_address,
+              trade_count,
+              buy_count,
+              sell_count,
+              traded_size,
+              traded_notional,
+              max_single_trade_notional,
+              first_trade_at,
+              last_trade_at,
+              position_count,
+              positions_value,
+              portfolio_value,
+              available_balance,
+              total_pnl,
+              portfolio_captured_at,
+              pnl_captured_at,
+              pnl_roi,
+              is_whale,
+              is_smart,
+              whale_reason,
+              updated_at
+            )
+            select
+              user_address,
+              trade_count,
+              buy_count,
+              sell_count,
+              traded_size,
+              traded_notional,
+              max_single_trade_notional,
+              first_trade_at,
+              last_trade_at,
+              position_count,
+              positions_value,
+              portfolio_value,
+              available_balance,
+              total_pnl,
+              portfolio_captured_at,
+              pnl_captured_at,
+              pnl_roi,
+              traded_notional >= 1000000 or max_single_trade_notional >= 100000 as is_whale,
+              traded_notional >= 10000 and pnl_roi >= 0.55 as is_smart,
+              multiIf(
+                traded_notional >= 1000000 and max_single_trade_notional >= 100000,
+                  'total_volume_and_single_trade',
+                traded_notional >= 1000000, 'total_volume',
+                max_single_trade_notional >= 100000, 'single_trade',
+                ''
+              ) as whale_reason,
+              now64(3) as updated_at
+            from
+            (
+              select
+                trades.user_address as user_address,
+                trades.trade_count as trade_count,
+                trades.buy_count as buy_count,
+                trades.sell_count as sell_count,
+                trades.traded_size as traded_size,
+                trades.traded_notional as traded_notional,
+                trades.max_single_trade_notional as max_single_trade_notional,
+                trades.first_trade_at as first_trade_at,
+                trades.last_trade_at as last_trade_at,
+                ifNull(portfolio.position_count, 0) as position_count,
+                ifNull(portfolio.positions_value, 0.0) as positions_value,
+                ifNull(portfolio.portfolio_value, 0.0) as portfolio_value,
+                ifNull(portfolio.available_balance, 0.0) as available_balance,
+                ifNull(pnl.total_pnl, 0.0) as total_pnl,
+                if(
+                  portfolio.user_address = '',
+                  cast(null, 'Nullable(DateTime64(3, \\'UTC\\'))'),
+                  portfolio.portfolio_captured_at
+                ) as portfolio_captured_at,
+                if(
+                  pnl.user_address = '' or pnl.pnl_captured_at = toDateTime64(0, 3, 'UTC'),
+                  cast(null, 'Nullable(DateTime64(3, \\'UTC\\'))'),
+                  pnl.pnl_captured_at
+                ) as pnl_captured_at,
+                if(trades.traded_notional = 0, 0.0, ifNull(pnl.total_pnl, 0.0) / trades.traded_notional)
+                  as pnl_roi
+              from
+              (
+                select
+                  coalesce(profile.user_address, rollup.user_address) as user_address,
+                  if(
+                    isNull(profile.last_trade_at) or profile.last_trade_at < rollup.first_trade_at,
+                    ifNull(profile.trade_count, 0) + ifNull(rollup.trade_count, 0),
+                    greatest(ifNull(profile.trade_count, 0), ifNull(rollup.trade_count, 0))
+                  ) as trade_count,
+                  if(
+                    isNull(profile.last_trade_at) or profile.last_trade_at < rollup.first_trade_at,
+                    ifNull(profile.buy_count, 0) + ifNull(rollup.buy_count, 0),
+                    greatest(ifNull(profile.buy_count, 0), ifNull(rollup.buy_count, 0))
+                  ) as buy_count,
+                  if(
+                    isNull(profile.last_trade_at) or profile.last_trade_at < rollup.first_trade_at,
+                    ifNull(profile.sell_count, 0) + ifNull(rollup.sell_count, 0),
+                    greatest(ifNull(profile.sell_count, 0), ifNull(rollup.sell_count, 0))
+                  ) as sell_count,
+                  if(
+                    isNull(profile.last_trade_at) or profile.last_trade_at < rollup.first_trade_at,
+                    ifNull(profile.traded_size, 0.0) + ifNull(rollup.traded_size, 0.0),
+                    greatest(ifNull(profile.traded_size, 0.0), ifNull(rollup.traded_size, 0.0))
+                  ) as traded_size,
+                  if(
+                    isNull(profile.last_trade_at) or profile.last_trade_at < rollup.first_trade_at,
+                    ifNull(profile.traded_notional, 0.0) + ifNull(rollup.traded_notional, 0.0),
+                    greatest(ifNull(profile.traded_notional, 0.0), ifNull(rollup.traded_notional, 0.0))
+                  ) as traded_notional,
+                  ifNull(high_single.max_single_trade_notional, 0.0) as max_single_trade_notional,
+                  multiIf(
+                    isNull(profile.first_trade_at), rollup.first_trade_at,
+                    isNull(rollup.first_trade_at), profile.first_trade_at,
+                    least(profile.first_trade_at, rollup.first_trade_at)
+                  ) as first_trade_at,
+                  multiIf(
+                    isNull(profile.last_trade_at), rollup.last_trade_at,
+                    isNull(rollup.last_trade_at), profile.last_trade_at,
+                    greatest(profile.last_trade_at, rollup.last_trade_at)
+                  ) as last_trade_at
+                from mart_trader_profile as profile final
+                full outer join mart_wallet_trade_rollup as rollup final
+                  on profile.user_address = rollup.user_address
+                left join
+                (
+                  select
+                    normalized_user_address as user_address,
+                    max(notional) as max_single_trade_notional
+                  from
+                  (
+                    select
+                      lower(user_address) as normalized_user_address,
+                      notional
+                    from fact_trade
+                    where user_address != ''
+                      and notional >= 100000
+                      and timestamp <= now64(3) + interval 10 minute
+                  )
+                  group by normalized_user_address
+                ) as high_single
+                  on coalesce(profile.user_address, rollup.user_address) = high_single.user_address
+              ) as trades
+              left join
+              (
+                select
+                  normalized_user_address as user_address,
+                  argMax(position_count, captured_at) as position_count,
+                  argMax(positions_value, captured_at) as positions_value,
+                  argMax(portfolio_value, captured_at) as portfolio_value,
+                  argMax(available_balance, captured_at) as available_balance,
+                  argMax(total_pnl, captured_at) as total_pnl,
+                  max(captured_at) as portfolio_captured_at
+                from
+                (
+                  select
+                    lower(user_address) as normalized_user_address,
+                    position_count,
+                    positions_value,
+                    portfolio_value,
+                    available_balance,
+                    total_pnl,
+                    captured_at
+                  from fact_wallet_portfolio_snapshot
+                  where user_address != ''
+                )
+                group by normalized_user_address
+              ) as portfolio
+                on trades.user_address = portfolio.user_address
+              left join
+              (
+                select
+                  coalesce(portfolio.user_address, pnl_only.user_address) as user_address,
+                  if(
+                    ifNull(pnl_only.pnl_captured_at, toDateTime64(0, 3, 'UTC'))
+                      > ifNull(portfolio.portfolio_captured_at, toDateTime64(0, 3, 'UTC')),
+                    pnl_only.total_pnl,
+                    portfolio.total_pnl
+                  ) as total_pnl,
+                  greatest(
+                    ifNull(portfolio.portfolio_captured_at, toDateTime64(0, 3, 'UTC')),
+                    ifNull(pnl_only.pnl_captured_at, toDateTime64(0, 3, 'UTC'))
+                  ) as pnl_captured_at
+                from
+                (
+                  select
+                    normalized_user_address as user_address,
+                    argMax(total_pnl, captured_at) as total_pnl,
+                    max(captured_at) as portfolio_captured_at
+                  from
+                  (
+                    select
+                      lower(user_address) as normalized_user_address,
+                      total_pnl,
+                      captured_at
+                    from fact_wallet_portfolio_snapshot
+                    where user_address != ''
+                  )
+                  group by normalized_user_address
+                ) as portfolio
+                full outer join
+                (
+                  select
+                    normalized_user_address as user_address,
+                    argMax(total_pnl, captured_at) as total_pnl,
+                    max(captured_at) as pnl_captured_at
+                  from
+                  (
+                    select
+                      lower(user_address) as normalized_user_address,
+                      total_pnl,
+                      captured_at
+                    from fact_wallet_pnl_snapshot
+                    where user_address != ''
+                  )
+                  group by normalized_user_address
+                ) as pnl_only
+                  on portfolio.user_address = pnl_only.user_address
+              ) as pnl
+                on trades.user_address = pnl.user_address
+              where trades.user_address != ''
+            )
+            settings join_use_nulls = 1, max_threads = 4
+            """
+        )
+        self.clickhouse.execute("exchange tables mart_wallet_screener and mart_wallet_screener_next")
+        rows = int(
+            self.clickhouse.query_text("select count() from mart_wallet_screener final").strip()
+            or "0"
+        )
+        return MartBuildResult(mart="wallet_screener", rows=rows)
 
     def build_trader_chain_pnl(self) -> MartBuildResult:
         self.clickhouse.execute(
@@ -1502,7 +1877,7 @@ class MartBuilder:
                 for bucket, node_id, status, runs, pages, items, errors in cursor.fetchall():
                     rows.append(
                         {
-                            "bucket": bucket,
+                            "bucket": ch_datetime(bucket),
                             "node_id": str(node_id),
                             "status": str(status),
                             "runs": int(runs),
@@ -1513,7 +1888,7 @@ class MartBuilder:
                     )
         updated_at = datetime.now(UTC)
         for row in rows:
-            row["updated_at"] = updated_at
+            row["updated_at"] = ch_datetime64(updated_at)
         if rows:
             self.clickhouse.insert("mart_collector_health", rows)
         return MartBuildResult(mart="collector_health", rows=len(rows))
@@ -1527,3 +1902,11 @@ def import_psycopg():
             "Collector health build requires psycopg. Install project dependencies with `pip install -e .`."
         ) from exc
     return psycopg
+
+
+def ch_datetime(value: datetime) -> str:
+    return value.astimezone(UTC).strftime("%Y-%m-%d %H:%M:%S")
+
+
+def ch_datetime64(value: datetime) -> str:
+    return value.astimezone(UTC).strftime("%Y-%m-%d %H:%M:%S.%f")[:-3]

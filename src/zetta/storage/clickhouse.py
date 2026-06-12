@@ -4,7 +4,7 @@ import base64
 import json
 import re
 from collections.abc import Sequence
-from datetime import date, datetime
+from datetime import UTC, date, datetime
 from typing import Any
 from urllib.error import HTTPError
 from urllib.parse import urlencode
@@ -109,7 +109,7 @@ def split_sql_statements(sql: str) -> list[str]:
 
 def json_default(value: Any) -> str:
     if isinstance(value, datetime):
-        return value.astimezone().strftime("%Y-%m-%d %H:%M:%S.%f")[:-3]
+        return value.astimezone(UTC).strftime("%Y-%m-%d %H:%M:%S.%f")[:-3]
     if isinstance(value, date):
         return value.isoformat()
     raise TypeError(f"Object of type {type(value).__name__} is not JSON serializable")

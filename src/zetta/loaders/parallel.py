@@ -18,16 +18,21 @@ def raw_paths(
     source: str,
     entity: str,
     after_path: str | None,
+    max_paths: int | None = None,
+    newest_first: bool = False,
 ) -> list[str]:
-    return [
-        str(path)
-        for path in iter_raw_paths(
-            raw_root,
-            source=source,
-            entity=entity,
-            after_path=after_path,
-        )
-    ]
+    paths: list[str] = []
+    for path in iter_raw_paths(
+        raw_root,
+        source=source,
+        entity=entity,
+        after_path=after_path,
+        newest_first=newest_first,
+    ):
+        paths.append(str(path))
+        if max_paths is not None and len(paths) >= max_paths:
+            break
+    return paths
 
 
 def load_in_parallel(

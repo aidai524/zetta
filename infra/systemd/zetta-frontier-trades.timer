@@ -1,0 +1,11 @@
+[Unit]
+Description=Seed Zetta trade tasks every minute
+
+[Timer]
+OnBootSec=90s
+OnUnitInactiveSec=1min
+AccuracySec=10s
+Unit=zetta-frontier-trades.service
+
+[Install]
+WantedBy=timers.target

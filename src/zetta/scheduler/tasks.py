@@ -56,6 +56,25 @@ class LocalTaskStore:
         for task in new_tasks:
             key = (task.kind, _stable_json(task.params))
             if key in existing:
+                existing_task = next(
+                    (
+                        item
+                        for item in tasks
+                        if item.kind == task.kind and _stable_json(item.params) == key[1]
+                    ),
+                    None,
+                )
+                if (
+                    existing_task is not None
+                    and requeue_done_task(task.params)
+                    and existing_task.status == "done"
+                ):
+                    existing_task.status = "pending"
+                    existing_task.priority = task.priority
+                    existing_task.attempts = 0
+                    existing_task.last_error = None
+                    existing_task.updated_at = datetime.now(UTC).isoformat()
+                    added += 1
                 continue
             tasks.append(task)
             existing.add(key)
@@ -149,6 +168,17 @@ class PostgresTaskStore:
             with conn.cursor() as cursor:
                 for task in new_tasks:
                     source, entity = task_source_entity(task.kind)
+                    task_values = (
+                        task.kind,
+                        source,
+                        entity,
+                        Jsonb(task.params),
+                        task.status,
+                        task.priority,
+                        task.attempts,
+                        task.max_attempts,
+                        task.last_error,
+                    )
                     cursor.execute(
                         """
                         insert into collector_tasks
@@ -159,19 +189,38 @@ class PostgresTaskStore:
                         values (%s, %s, %s, %s, %s, %s, %s, %s, %s)
                         on conflict do nothing
                         """,
-                        (
-                            task.kind,
-                            source,
-                            entity,
-                            Jsonb(task.params),
-                            task.status,
-                            task.priority,
-                            task.attempts,
-                            task.max_attempts,
-                            task.last_error,
-                        ),
+                        task_values,
                     )
-                    added += cursor.rowcount
+                    changed = cursor.rowcount
+                    if changed == 0 and requeue_done_task(task.params):
+                        cursor.execute(
+                            """
+                            update collector_tasks
+                            set status = 'pending',
+                                priority = %s,
+                                attempts = 0,
+                                max_attempts = %s,
+                                lease_owner = null,
+                                lease_expires_at = null,
+                                last_error = null,
+                                updated_at = now()
+                            where task_type = %s
+                              and source = %s
+                              and entity = %s
+                              and md5(params::text) = md5(%s::jsonb::text)
+                              and status = 'done'
+                            """,
+                            (
+                                task.priority,
+                                task.max_attempts,
+                                task.kind,
+                                source,
+                                entity,
+                                Jsonb(task.params),
+                            ),
+                        )
+                        changed = cursor.rowcount
+                    added += changed
         return added
 
     def claim_next(self) -> Task | None:
@@ -383,6 +432,51 @@ class PostgresTaskStore:
                     (self.node_id, error, task_id),
                 )
 
+    def record_event_sync(self, record: EventSyncRecord) -> None:
+        psycopg, Jsonb = import_psycopg()
+
+        with psycopg.connect(self.dsn) as conn:
+            with conn.cursor() as cursor:
+                cursor.execute(
+                    """
+                    insert into event_sync_runs
+                      (
+                        event_id, refresh_run, task_id, node_id, status, started_at,
+                        finished_at, markets, condition_ids, token_ids, raw_paths,
+                        error, details
+                      )
+                    values (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+                    on conflict (event_id, refresh_run) do update
+                    set task_id = excluded.task_id,
+                        node_id = excluded.node_id,
+                        status = excluded.status,
+                        started_at = excluded.started_at,
+                        finished_at = excluded.finished_at,
+                        markets = excluded.markets,
+                        condition_ids = excluded.condition_ids,
+                        token_ids = excluded.token_ids,
+                        raw_paths = excluded.raw_paths,
+                        error = excluded.error,
+                        details = excluded.details,
+                        updated_at = now()
+                    """,
+                    (
+                        record.event_id,
+                        record.refresh_run,
+                        int(record.task_id),
+                        record.node_id,
+                        record.status,
+                        record.started_at,
+                        record.finished_at,
+                        record.markets,
+                        record.condition_ids,
+                        record.token_ids,
+                        record.raw_paths,
+                        record.error,
+                        Jsonb(record.details),
+                    ),
+                )
+
 
 @dataclass(frozen=True)
 class TaskRunRecord:
@@ -396,6 +490,23 @@ class TaskRunRecord:
     items: int = 0
     raw_paths: list[str] = field(default_factory=list)
     error: str | None = None
+
+
+@dataclass(frozen=True)
+class EventSyncRecord:
+    event_id: str
+    refresh_run: str
+    task_id: str
+    node_id: str
+    status: str
+    started_at: datetime
+    finished_at: datetime
+    markets: int = 0
+    condition_ids: int = 0
+    token_ids: int = 0
+    raw_paths: list[str] = field(default_factory=list)
+    error: str | None = None
+    details: dict[str, Any] = field(default_factory=dict)
 
 
 class LocalRunStore:
@@ -472,15 +583,30 @@ def task_progress_from_rows(
 
 
 def task_source_entity(kind: str) -> tuple[str, str]:
+    if kind == "event-refresh":
+        return "event", "refresh"
     if kind.startswith("gamma-"):
         return "gamma", kind.removeprefix("gamma-").replace("-", "_")
-    if kind in {"trades", "activity", "holders", "market-positions", "open-interest"}:
+    if kind in {
+        "trades",
+        "activity",
+        "holders",
+        "market-positions",
+        "positions",
+        "wallet-portfolio",
+        "wallet-pnl",
+        "open-interest",
+    }:
         return "data", kind.replace("-", "_")
     if kind in {"prices-history", "book"}:
         return "clob", kind.replace("-", "_")
     if kind == "chain-logs":
         return "polygon", "logs"
     return "unknown", kind.replace("-", "_")
+
+
+def requeue_done_task(params: dict[str, Any]) -> bool:
+    return bool(params.get("_requeue_done"))
 
 
 def row_to_task(row: Any) -> Task:

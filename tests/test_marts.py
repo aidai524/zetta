@@ -70,6 +70,31 @@ def test_build_wallet_reputation_depends_on_event_and_live_marts() -> None:
     assert "mart_live_wallet_position" in joined_sql
 
 
+def test_build_wallet_trade_rollup_uses_time_indexed_trades() -> None:
+    fake = FakeClickHouse()
+
+    result = MartBuilder(clickhouse=fake).build_wallet_trade_rollup(since_hours=24)
+
+    assert result.mart == "wallet_trade_rollup"
+    joined_sql = "\n".join(fake.executed)
+    assert "insert into mart_wallet_trade_rollup" in joined_sql
+    assert "from fact_trade_by_time" in joined_sql
+
+
+def test_build_wallet_screener_uses_full_trade_history_and_portfolio_snapshot() -> None:
+    fake = FakeClickHouse()
+
+    result = MartBuilder(clickhouse=fake).build_wallet_screener()
+
+    assert result.mart == "wallet_screener"
+    joined_sql = "\n".join(fake.executed)
+    assert "insert into mart_wallet_screener" in joined_sql
+    assert "from fact_trade" in joined_sql
+    assert "fact_wallet_portfolio_snapshot" in joined_sql
+    assert "max_single_trade_notional" in joined_sql
+    assert "pnl_roi >= 0.55" in joined_sql
+
+
 def test_build_event_anomaly_signals_are_evidence_signals() -> None:
     fake = FakeClickHouse()
 

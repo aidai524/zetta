@@ -59,6 +59,10 @@ class PolygonRpcClient:
     def block_number(self) -> int:
         return int(str(self.call("eth_blockNumber", []).result), 16)
 
+    def eth_call(self, *, to: str, data: str, block: str = "latest") -> str:
+        result = self.call("eth_call", [{"to": to, "data": data}, block]).result
+        return str(result or "0x")
+
     def get_logs(
         self,
         *,

@@ -30,6 +30,8 @@ class DataLoadResult:
     activities: int
     holders: int
     market_positions: int
+    wallet_portfolios: int
+    wallet_pnls: int
     open_interest: int
     ingest_logs: int
 
@@ -50,26 +52,37 @@ class DataRawLoader:
         force: bool = False,
         batch_size: int = 10_000,
         workers: int = 1,
+        max_paths: int | None = None,
+        newest_first: bool = False,
     ) -> DataLoadResult:
         if batch_size <= 0:
             raise ValueError("batch_size must be positive")
-        database_after_path = None if force else self.loaded_max_raw_path()
-        checkpoint_path = None if force else self.loader_checkpoint_raw_path()
+        if max_paths is not None and max_paths <= 0:
+            raise ValueError("max_paths must be positive")
+        database_after_path = None if force or newest_first else self.loaded_max_raw_path()
+        checkpoint_path = None if force or newest_first else self.loader_checkpoint_raw_path()
         after_path = checkpoint_path or database_after_path
         paths = (
-            raw_paths(raw_root, source="data", entity="trades", after_path=after_path)
-            if not force and after_path is not None
+            raw_paths(
+                raw_root,
+                source="data",
+                entity="trades",
+                after_path=after_path,
+                max_paths=max_paths,
+                newest_first=newest_first,
+            )
+            if not force and (after_path is not None or max_paths is not None or newest_first)
             else None
         )
         if not force and checkpoint_path is None and database_after_path is not None:
             self.save_loader_checkpoint_raw_path(database_after_path)
-        if workers > 1 and paths is not None:
+        if workers > 1 and paths is not None and len(paths) > 1:
             result = load_in_parallel(
                 worker=DataTradeLoadWorker(self.clickhouse.settings, batch_size),
                 paths=paths,
                 workers=workers,
             )
-            if paths:
+            if paths and not newest_first:
                 last_raw_path = result.last_raw_path if result is not None else None
                 self.save_loader_checkpoint_raw_path(last_raw_path or paths[-1])
             return without_last_raw_path(result) if result is not None else empty_data_result()
@@ -91,12 +104,13 @@ class DataRawLoader:
                 source="data",
                 entity="trades",
                 after_path=after_path,
+                newest_first=newest_first,
             ),
             loaded_hashes=loaded_hashes,
             batch_size=batch_size,
             skip_loaded=not force,
         )
-        if not force and result.last_raw_path:
+        if not force and not newest_first and result.last_raw_path:
             self.save_loader_checkpoint_raw_path(result.last_raw_path)
         return without_last_raw_path(result)
 
@@ -203,6 +217,8 @@ class DataRawLoader:
             activities=0,
             holders=0,
             market_positions=0,
+            wallet_portfolios=0,
+            wallet_pnls=0,
             open_interest=0,
             ingest_logs=logs,
             last_raw_path=last_raw_path,
@@ -277,6 +293,75 @@ class DataRawLoader:
             batch_size=batch_size,
         )
 
+    def load_positions(
+        self,
+        *,
+        raw_root: Path,
+        force: bool = False,
+        batch_size: int = 10_000,
+    ) -> DataLoadResult:
+        rows, logs, raw_records, skipped = self._load_rows(
+            raw_root=raw_root,
+            entity="positions",
+            force=force,
+            row_builder=market_position_rows,
+        )
+        return self._insert_data_rows(
+            table="fact_market_position_snapshot",
+            rows=rows,
+            logs=logs,
+            raw_records=raw_records,
+            skipped=skipped,
+            field="market_positions",
+            batch_size=batch_size,
+        )
+
+    def load_wallet_portfolio(
+        self,
+        *,
+        raw_root: Path,
+        force: bool = False,
+        batch_size: int = 10_000,
+    ) -> DataLoadResult:
+        rows, logs, raw_records, skipped = self._load_rows(
+            raw_root=raw_root,
+            entity="wallet_portfolio",
+            force=force,
+            row_builder=wallet_portfolio_rows,
+        )
+        return self._insert_data_rows(
+            table="fact_wallet_portfolio_snapshot",
+            rows=rows,
+            logs=logs,
+            raw_records=raw_records,
+            skipped=skipped,
+            field="wallet_portfolios",
+            batch_size=batch_size,
+        )
+
+    def load_user_pnl(
+        self,
+        *,
+        raw_root: Path,
+        force: bool = False,
+        batch_size: int = 10_000,
+    ) -> DataLoadResult:
+        rows, logs, raw_records, skipped = self._load_rows(
+            raw_root=raw_root,
+            entity="user_pnl",
+            force=force,
+            row_builder=wallet_pnl_snapshot_rows,
+        )
+        return self._insert_data_rows(
+            table="fact_wallet_pnl_snapshot",
+            rows=rows,
+            logs=logs,
+            raw_records=raw_records,
+            skipped=skipped,
+            field="wallet_pnls",
+            batch_size=batch_size,
+        )
+
     def load_open_interest(
         self,
         *,
@@ -306,6 +391,8 @@ class DataRawLoader:
         log_rows: list[dict[str, Any]],
     ) -> tuple[int, int]:
         trade_count = self.clickhouse.insert("fact_trade", trade_rows)
+        self.clickhouse.insert("fact_trade_by_user", trade_rows)
+        self.clickhouse.insert("fact_trade_by_time", trade_rows)
         log_count = self.clickhouse.insert("raw_ingest_log", log_rows)
         trade_rows.clear()
         log_rows.clear()
@@ -409,6 +496,8 @@ class DataRawLoader:
             "activities": 0,
             "holders": 0,
             "market_positions": 0,
+            "wallet_portfolios": 0,
+            "wallet_pnls": 0,
             "open_interest": 0,
             "ingest_logs": log_count,
         }
@@ -457,6 +546,8 @@ def empty_data_result() -> DataLoadResult:
         activities=0,
         holders=0,
         market_positions=0,
+        wallet_portfolios=0,
+        wallet_pnls=0,
         open_interest=0,
         ingest_logs=0,
     )
@@ -470,6 +561,8 @@ def without_last_raw_path(result: DataLoadStateResult) -> DataLoadResult:
         activities=result.activities,
         holders=result.holders,
         market_positions=result.market_positions,
+        wallet_portfolios=result.wallet_portfolios,
+        wallet_pnls=result.wallet_pnls,
         open_interest=result.open_interest,
         ingest_logs=result.ingest_logs,
     )
@@ -546,10 +639,15 @@ def market_position_rows(payload: Any, ingested_at: datetime) -> list[dict[str, 
         if not isinstance(token_group, dict):
             continue
         token_id = as_str(token_group.get("token"))
-        positions = token_group.get("positions") if isinstance(token_group.get("positions"), list) else []
+        positions = token_group.get("positions") if isinstance(token_group.get("positions"), list) else [token_group]
         for position in positions:
             if not isinstance(position, dict):
                 continue
+            cash_pnl = as_float(position.get("cashPnl"))
+            realized_pnl = as_float(position.get("realizedPnl"))
+            total_pnl = as_float(position.get("totalPnl"))
+            if "totalPnl" not in position:
+                total_pnl = cash_pnl + realized_pnl
             rows.append(
                 {
                     "condition_id": as_str(position.get("conditionId")),
@@ -558,11 +656,11 @@ def market_position_rows(payload: Any, ingested_at: datetime) -> list[dict[str, 
                     "captured_at": ingested_at,
                     "size": as_float(position.get("size")),
                     "avg_price": as_float(position.get("avgPrice")),
-                    "curr_price": as_float(position.get("currPrice")),
+                    "curr_price": as_float(position.get("currPrice", position.get("curPrice"))),
                     "current_value": as_float(position.get("currentValue")),
-                    "cash_pnl": as_float(position.get("cashPnl")),
-                    "realized_pnl": as_float(position.get("realizedPnl")),
-                    "total_pnl": as_float(position.get("totalPnl")),
+                    "cash_pnl": cash_pnl,
+                    "realized_pnl": realized_pnl,
+                    "total_pnl": total_pnl,
                     "total_bought": as_float(position.get("totalBought")),
                     "outcome": as_str(position.get("outcome")),
                     "outcome_index": int(as_float(position.get("outcomeIndex"))),
@@ -571,6 +669,142 @@ def market_position_rows(payload: Any, ingested_at: datetime) -> list[dict[str, 
                 }
             )
     return rows
+
+
+def wallet_portfolio_rows(payload: Any, ingested_at: datetime) -> list[dict[str, Any]]:
+    if isinstance(payload, list):
+        return wallet_portfolio_rows_from_list(payload, ingested_at)
+    if not isinstance(payload, dict):
+        return []
+    if isinstance(payload.get("positions"), list) or isinstance(payload.get("value"), list) or isinstance(payload.get("pnl"), list):
+        return wallet_aggregate_rows(payload, ingested_at)
+    if isinstance(payload.get("points"), list):
+        return wallet_pnl_rows(payload, ingested_at)
+    if payload.get("rawBalance") is not None or payload.get("balance") is not None:
+        return [
+            wallet_portfolio_row(
+                user=as_str(payload.get("user")),
+                ingested_at=ingested_at,
+                available_balance=as_float(payload.get("balance")),
+                raw_payload=payload,
+            )
+        ]
+    return []
+
+
+def wallet_aggregate_rows(payload: dict[str, Any], ingested_at: datetime) -> list[dict[str, Any]]:
+    user = as_str(payload.get("user")).lower()
+    positions = [item for item in payload.get("positions", []) if isinstance(item, dict)]
+    value_items = [item for item in payload.get("value", []) if isinstance(item, dict)]
+    pnl_points = [item for item in payload.get("pnl", []) if isinstance(item, dict)]
+    if not user and positions:
+        user = as_str(positions[0].get("proxyWallet")).lower()
+    active_positions = [item for item in positions if as_float(item.get("currentValue")) > 0.000001]
+    positions_value = sum(as_float(item.get("currentValue")) for item in active_positions)
+    if value_items:
+        positions_value = as_float(value_items[0].get("value")) or positions_value
+    available_balance = as_float(payload.get("availableBalance"))
+    latest_pnl = (
+        max(pnl_points, key=lambda item: as_float(item.get("t"))) if pnl_points else {}
+    )
+    return [
+        wallet_portfolio_row(
+            user=user,
+            ingested_at=ingested_at,
+            position_count=len(active_positions),
+            positions_value=positions_value,
+            portfolio_value=positions_value + available_balance,
+            available_balance=available_balance,
+            total_pnl=as_float(latest_pnl.get("p")),
+            raw_payload=payload,
+        )
+    ]
+
+
+def wallet_portfolio_rows_from_list(payload: list[Any], ingested_at: datetime) -> list[dict[str, Any]]:
+    dicts = [item for item in payload if isinstance(item, dict)]
+    if not dicts:
+        return []
+    if dicts[0].get("proxyWallet") is not None:
+        user = as_str(dicts[0].get("proxyWallet")).lower()
+        active_positions = [item for item in dicts if as_float(item.get("currentValue")) > 0.000001]
+        return [
+            wallet_portfolio_row(
+                user=user,
+                ingested_at=ingested_at,
+                position_count=len(active_positions),
+                positions_value=sum(as_float(item.get("currentValue")) for item in active_positions),
+                raw_payload={"positions": dicts},
+            )
+        ]
+    if dicts[0].get("user") is not None and dicts[0].get("value") is not None:
+        user = as_str(dicts[0].get("user")).lower()
+        return [
+            wallet_portfolio_row(
+                user=user,
+                ingested_at=ingested_at,
+                positions_value=as_float(dicts[0].get("value")),
+                raw_payload={"value": dicts[0]},
+            )
+        ]
+    return []
+
+
+def wallet_pnl_rows(payload: dict[str, Any], ingested_at: datetime) -> list[dict[str, Any]]:
+    user = as_str(payload.get("user")).lower()
+    points = [item for item in payload.get("points", []) if isinstance(item, dict)]
+    if not user or not points:
+        return []
+    latest = max(points, key=lambda item: as_float(item.get("t")))
+    return [
+        wallet_portfolio_row(
+            user=user,
+            ingested_at=ingested_at,
+            total_pnl=as_float(latest.get("p")),
+            raw_payload=payload,
+        )
+    ]
+
+
+def wallet_pnl_snapshot_rows(payload: dict[str, Any], ingested_at: datetime) -> list[dict[str, Any]]:
+    user = as_str(payload.get("user")).lower()
+    points = [item for item in payload.get("points", []) if isinstance(item, dict)]
+    if not user or not points:
+        return []
+    latest = max(points, key=lambda item: as_float(item.get("t")))
+    return [
+        {
+            "user_address": user,
+            "captured_at": ingested_at,
+            "total_pnl": as_float(latest.get("p")),
+            "raw_json": json.dumps(payload, ensure_ascii=False, separators=(",", ":")),
+            "ingested_at": ingested_at,
+        }
+    ]
+
+
+def wallet_portfolio_row(
+    *,
+    user: str,
+    ingested_at: datetime,
+    position_count: int = 0,
+    positions_value: float = 0.0,
+    portfolio_value: float = 0.0,
+    available_balance: float = 0.0,
+    total_pnl: float = 0.0,
+    raw_payload: Any,
+) -> dict[str, Any]:
+    return {
+        "user_address": user.lower(),
+        "captured_at": ingested_at,
+        "position_count": position_count,
+        "positions_value": positions_value,
+        "portfolio_value": portfolio_value,
+        "available_balance": available_balance,
+        "total_pnl": total_pnl,
+        "raw_json": json.dumps(raw_payload, ensure_ascii=False, separators=(",", ":")),
+        "ingested_at": ingested_at,
+    }
 
 
 def open_interest_rows(payload: Any, ingested_at: datetime) -> list[dict[str, Any]]:

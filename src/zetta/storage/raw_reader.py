@@ -14,8 +14,15 @@ def iter_raw_records(
     source: str | None = None,
     entity: str | None = None,
     after_path: str | None = None,
+    newest_first: bool = False,
 ) -> Iterator[dict[str, Any]]:
-    for path in iter_raw_paths(root, source=source, entity=entity, after_path=after_path):
+    for path in iter_raw_paths(
+        root,
+        source=source,
+        entity=entity,
+        after_path=after_path,
+        newest_first=newest_first,
+    ):
         yield from iter_raw_records_from_paths([path], after_path=after_path)
 
 
@@ -46,17 +53,19 @@ def iter_raw_paths(
     source: str | None = None,
     entity: str | None = None,
     after_path: str | None = None,
+    newest_first: bool = False,
 ) -> Iterator[Path]:
     if source and entity:
         base = root / f"source={source}" / f"entity={entity}"
-        yield from iter_entity_paths(base, after_path=after_path)
+        yield from iter_entity_paths(base, after_path=after_path, newest_first=newest_first)
         return
 
     base = root / f"source={source}" if source else root
     if not base.exists():
         return
     after_file = raw_file_path(after_path) if after_path and is_raw_record_path(after_path) else None
-    for path in sorted(base.rglob("*.jsonl.gz")):
+    paths = sorted(base.rglob("*.jsonl.gz"), reverse=newest_first)
+    for path in paths:
         path_text = str(path)
         if entity and f"entity={entity}" not in path_text:
             continue
@@ -67,17 +76,24 @@ def iter_raw_paths(
         yield path
 
 
-def iter_entity_paths(base: Path, *, after_path: str | None = None) -> Iterator[Path]:
+def iter_entity_paths(
+    base: Path,
+    *,
+    after_path: str | None = None,
+    newest_first: bool = False,
+) -> Iterator[Path]:
     if not base.exists():
         return
     after_file = raw_file_path(after_path) if after_path and is_raw_record_path(after_path) else None
     after_dir = str(Path(after_file or after_path).parent) if after_path else None
-    for partition in sorted(base.glob("dt=*")):
+    for partition in sorted(base.glob("dt=*"), reverse=newest_first):
         if not partition.is_dir():
             continue
-        if after_dir and str(partition) < after_dir:
+        if after_dir and not newest_first and str(partition) < after_dir:
             continue
-        for path in sorted(partition.glob("*.jsonl.gz")):
+        if after_dir and newest_first and str(partition) > after_dir:
+            continue
+        for path in sorted(partition.glob("*.jsonl.gz"), reverse=newest_first):
             path_text = str(path)
             if after_path and after_file and path_text < after_file:
                 continue

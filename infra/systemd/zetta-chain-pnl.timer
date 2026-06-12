@@ -1,0 +1,11 @@
+[Unit]
+Description=Refresh chain-verified wallet PnL every five minutes
+
+[Timer]
+OnBootSec=5min
+OnUnitInactiveSec=5min
+AccuracySec=30s
+Unit=zetta-chain-pnl.service
+
+[Install]
+WantedBy=timers.target

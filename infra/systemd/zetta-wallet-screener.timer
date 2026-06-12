@@ -1,0 +1,11 @@
+[Unit]
+Description=Refresh Zetta all-wallet screener every 5 minutes
+
+[Timer]
+OnBootSec=5min
+OnUnitInactiveSec=5min
+AccuracySec=30s
+Unit=zetta-wallet-screener.service
+
+[Install]
+WantedBy=timers.target

@@ -226,6 +226,15 @@ h3 {
   background: #227c9d;
 }
 
+.progressMeta {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px 16px;
+  margin: -2px 0 12px;
+  color: #66727f;
+  font-size: 12px;
+}
+
 .resourceGrid {
   display: grid;
   grid-template-columns: repeat(3, minmax(0, 1fr));
@@ -421,9 +430,102 @@ th {
   white-space: nowrap;
 }
 
+.walletPage {
+  align-items: start;
+}
+
+.walletMetrics {
+  grid-template-columns: repeat(4, minmax(0, 1fr));
+}
+
+.walletStatus {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px 18px;
+  color: #66727f;
+  font-size: 12px;
+}
+
+.walletListGrid {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 16px;
+}
+
+.walletListPanel {
+  min-width: 0;
+}
+
+.tableScroller {
+  overflow-x: auto;
+}
+
+.walletTable {
+  min-width: 760px;
+}
+
+.walletCell {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  white-space: nowrap;
+}
+
+.walletLink {
+  color: #18202a;
+  text-decoration: none;
+}
+
+.walletLink:hover {
+  color: #227c9d;
+}
+
+.iconMini {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 26px;
+  height: 26px;
+  min-height: 26px;
+  border: 1px solid #d5dee7;
+  border-radius: 6px;
+  background: #fff;
+  color: #4f5d6a;
+  padding: 0;
+  text-decoration: none;
+}
+
+.iconMini:hover {
+  border-color: #227c9d;
+  color: #227c9d;
+}
+
+.statusTag {
+  display: inline-flex;
+  align-items: center;
+  min-height: 24px;
+  border: 1px solid #dce3ea;
+  border-radius: 999px;
+  color: #4f5d6a;
+  padding: 0 8px;
+  white-space: nowrap;
+}
+
+.valuePositive {
+  color: #1f7a62;
+}
+
+.valueNegative {
+  color: #b4233c;
+}
+
 .empty {
   color: #66727f;
   padding: 24px 0;
+}
+
+.empty.compact {
+  padding: 12px 0;
 }
 
 .spin {
@@ -465,7 +567,9 @@ th {
 
   .gridPage,
   .metrics,
-  .resourceGrid {
+  .resourceGrid,
+  .walletMetrics,
+  .walletListGrid {
     grid-template-columns: 1fr;
   }
 }

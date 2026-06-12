@@ -1,13 +1,13 @@
 [Unit]
-Description=Zetta recent event task seeder
+Description=Zetta whale and smart wallet candidate portfolio seeder
 After=network-online.target docker.service
 Wants=network-online.target
 
 [Service]
 Type=oneshot
 EnvironmentFile=/etc/zetta/zetta.env
-ExecStart=/usr/local/bin/zetta-runner frontier
+ExecStart=/usr/local/bin/zetta-runner wallet-candidates
 MemoryAccounting=true
 MemoryMax=1G
 TasksMax=64
-TimeoutStartSec=3min
+TimeoutStartSec=5min

@@ -4,16 +4,26 @@ import json
 from zetta.config import Settings
 from zetta.cli import (
     DISCOVERY_PRIORITY,
+    FRONTIER_EVENT_PRIORITY,
     FRONTIER_BOOK_PRIORITY,
     FRONTIER_GAMMA_PRIORITY,
     FRONTIER_PRICE_HISTORY_PRIORITY,
     FRONTIER_TRADES_PRIORITY,
+    WALLET_REFRESH_PRIORITY,
     cmd_tasks_seed_basic,
     cmd_tasks_seed_frontier,
     cmd_tasks_seed_history,
+    cmd_tasks_seed_wallets,
 )
 from zetta.scheduler.runner import TaskRunner, task_execution_params
-from zetta.scheduler.tasks import LocalRunStore, LocalTaskStore, Task, row_to_task, task_source_entity
+from zetta.scheduler.tasks import (
+    LocalRunStore,
+    LocalTaskStore,
+    Task,
+    requeue_done_task,
+    row_to_task,
+    task_source_entity,
+)
 
 
 def test_local_task_store_deduplicates_and_claims(tmp_path) -> None:
@@ -56,9 +66,13 @@ def test_local_task_store_claims_lowest_priority_first(tmp_path) -> None:
 
 
 def test_task_source_entity_maps_known_task_kinds() -> None:
+    assert task_source_entity("event-refresh") == ("event", "refresh")
     assert task_source_entity("gamma-events") == ("gamma", "events")
     assert task_source_entity("prices-history") == ("clob", "prices_history")
+    assert task_source_entity("activity") == ("data", "activity")
     assert task_source_entity("market-positions") == ("data", "market_positions")
+    assert task_source_entity("positions") == ("data", "positions")
+    assert task_source_entity("wallet-portfolio") == ("data", "wallet_portfolio")
     assert task_source_entity("chain-logs") == ("polygon", "logs")
 
 
@@ -137,6 +151,93 @@ def test_seed_basic_keeps_global_trade_sample_finite_when_gamma_is_unbounded(tmp
     assert trade_task.params["max_pages"] == 1
     assert trade_task.params["resume"] is False
     assert {task.priority for task in tasks} == {DISCOVERY_PRIORITY}
+
+
+def test_seed_wallets_adds_wallet_trade_and_activity_tasks(monkeypatch, tmp_path) -> None:
+    class FakeClickHouse:
+        def __init__(self, _settings):
+            pass
+
+        def query_text(self, query):
+            assert "mart_wallet_trade_rollup" in query
+            return '{"user_address":"0xabc"}\n{"user_address":"0xdef"}\n'
+
+    monkeypatch.setattr("zetta.cli.ClickHouseWriter", FakeClickHouse)
+    args = type(
+        "Args",
+        (),
+        {
+            "task_store": "local",
+            "task_file": str(tmp_path / "tasks.json"),
+            "node_id": "node-1",
+            "lease_seconds": 300,
+            "wallet_limit": 10,
+            "since_hours": 48,
+            "page_limit": 500,
+            "max_pages": 2,
+            "candidate_mode": "recent",
+            "min_notional": 10_000.0,
+            "include_trades": True,
+            "include_activity": True,
+            "include_wallet_portfolio": False,
+            "refresh_run": "realtime-wallets",
+            "requeue_done": True,
+        },
+    )()
+
+    result = cmd_tasks_seed_wallets(args, Settings())
+    tasks = LocalTaskStore(tmp_path / "tasks.json").load()
+
+    assert result["candidate_tasks"] == 4
+    assert result["added"] == 4
+    assert [task.kind for task in tasks].count("trades") == 2
+    assert [task.kind for task in tasks].count("activity") == 2
+    assert {task.priority for task in tasks} == {WALLET_REFRESH_PRIORITY}
+    assert all(task.params["user"] in {"0xabc", "0xdef"} for task in tasks)
+    assert all(requeue_done_task(task.params) for task in tasks)
+
+
+def test_seed_wallets_can_use_smart_candidate_wallets(monkeypatch, tmp_path) -> None:
+    class FakeClickHouse:
+        def __init__(self, _settings):
+            pass
+
+        def query_text(self, query):
+            assert "mart_trader_profile final" in query
+            assert "traded_notional >= 10000.0" in query
+            return '{"user_address":"0xabc"}\n{"user_address":"0xdef"}\n'
+
+    monkeypatch.setattr("zetta.cli.ClickHouseWriter", FakeClickHouse)
+    args = type(
+        "Args",
+        (),
+        {
+            "task_store": "local",
+            "task_file": str(tmp_path / "tasks.json"),
+            "node_id": "node-1",
+            "lease_seconds": 300,
+            "wallet_limit": 10,
+            "since_hours": 48,
+            "page_limit": 500,
+            "max_pages": 2,
+            "candidate_mode": "smart-candidates",
+            "min_notional": 10_000.0,
+            "include_trades": False,
+            "include_activity": False,
+            "include_wallet_portfolio": True,
+            "refresh_run": "smart-candidates",
+            "requeue_done": True,
+        },
+    )()
+
+    result = cmd_tasks_seed_wallets(args, Settings())
+    tasks = LocalTaskStore(tmp_path / "tasks.json").load()
+
+    assert result["candidate_tasks"] == 2
+    assert result["candidate_mode"] == "smart-candidates"
+    assert [task.kind for task in tasks] == ["wallet-portfolio", "wallet-portfolio"]
+    assert all(task.priority == 0 for task in tasks)
+    assert all(requeue_done_task(task.params) for task in tasks)
 
 
 def test_local_task_store_retries_then_dead_letters(tmp_path) -> None:
@@ -235,7 +336,69 @@ def test_seed_history_adds_partitioned_tasks(monkeypatch, tmp_path) -> None:
     assert chain_task.params["addresses"] == ["0xabc"]
 
 
-def test_seed_frontier_adds_refreshable_high_priority_tasks(monkeypatch, tmp_path) -> None:
+def test_seed_frontier_adds_event_refresh_tasks_by_default(monkeypatch, tmp_path) -> None:
+    class FakeClickHouse:
+        def __init__(self, _settings):
+            pass
+
+        def query_text(self, query):
+            if "select event_id" in query:
+                return '{"event_id":"event-1"}\n{"event_id":"event-2"}\n'
+            return ""
+
+    monkeypatch.setattr("zetta.cli.ClickHouseWriter", FakeClickHouse)
+    args = type(
+        "Args",
+        (),
+        {
+            "task_store": "local",
+            "task_file": str(tmp_path / "tasks.json"),
+            "node_id": "node-1",
+            "lease_seconds": 300,
+            "event_limit": 10,
+            "condition_limit": 2,
+            "token_limit": 2,
+            "sync_mode": "event",
+            "include_gamma": True,
+            "active_only": True,
+            "include_trades": True,
+            "include_price_history": True,
+            "include_books": True,
+            "gamma_page_limit": 100,
+            "gamma_max_pages": 1,
+            "gamma_resume": False,
+            "gamma_sleep_seconds": 0.0,
+            "trade_page_limit": 500,
+            "trade_max_pages": 1,
+            "price_interval": "1d",
+            "price_fidelity": None,
+            "holders_limit": 500,
+            "positions_limit": 500,
+            "include_holders": True,
+            "include_market_positions": True,
+            "include_open_interest": True,
+            "refresh_run": "2026-06-08T00:00:00+00:00",
+            "requeue_done": False,
+            "include_global_trades": False,
+        },
+    )()
+
+    result = cmd_tasks_seed_frontier(args, Settings())
+    tasks = LocalTaskStore(tmp_path / "tasks.json").load()
+
+    assert result["sync_mode"] == "event"
+    assert result["event_ids"] == 2
+    assert result["candidate_tasks"] == 4
+    assert [task.kind for task in tasks].count("gamma-events") == 1
+    assert [task.kind for task in tasks].count("gamma-markets") == 1
+    assert [task.kind for task in tasks].count("event-refresh") == 2
+    event_task = next(task for task in tasks if task.kind == "event-refresh")
+    assert event_task.priority == FRONTIER_EVENT_PRIORITY
+    assert event_task.params["refresh_run"] == args.refresh_run
+    assert event_task.params["include_holders"] is True
+
+
+def test_seed_frontier_can_add_typed_refreshable_tasks(monkeypatch, tmp_path) -> None:
     class FakeClickHouse:
         def __init__(self, _settings):
             pass
@@ -259,6 +422,8 @@ def test_seed_frontier_adds_refreshable_high_priority_tasks(monkeypatch, tmp_pat
             "event_limit": 10,
             "condition_limit": 2,
             "token_limit": 2,
+            "sync_mode": "typed",
+            "include_gamma": True,
             "active_only": True,
             "include_trades": True,
             "include_price_history": True,
@@ -271,7 +436,14 @@ def test_seed_frontier_adds_refreshable_high_priority_tasks(monkeypatch, tmp_pat
             "trade_max_pages": 1,
             "price_interval": "1d",
             "price_fidelity": None,
+            "holders_limit": 500,
+            "positions_limit": 500,
+            "include_holders": True,
+            "include_market_positions": True,
+            "include_open_interest": True,
             "refresh_run": "2026-06-08T00:00:00+00:00",
+            "requeue_done": False,
+            "include_global_trades": False,
         },
     )()
 
@@ -300,3 +472,77 @@ def test_seed_frontier_adds_refreshable_high_priority_tasks(monkeypatch, tmp_pat
     }
     assert {task.priority for task in tasks if task.kind == "book"} == {FRONTIER_BOOK_PRIORITY}
     assert all(task.params["_refresh_run"] == args.refresh_run for task in tasks)
+
+
+def test_seed_frontier_can_seed_trade_tasks_without_gamma(monkeypatch, tmp_path) -> None:
+    class FakeClickHouse:
+        def __init__(self, _settings):
+            pass
+
+        def query_text(self, query):
+            if "select distinct condition_id" in query:
+                return '{"condition_id":"condition-1"}\n{"condition_id":"condition-2"}\n'
+            return ""
+
+    monkeypatch.setattr("zetta.cli.ClickHouseWriter", FakeClickHouse)
+    args = type(
+        "Args",
+        (),
+        {
+            "task_store": "local",
+            "task_file": str(tmp_path / "tasks.json"),
+            "node_id": "node-1",
+            "lease_seconds": 300,
+            "event_limit": 10,
+            "condition_limit": 2,
+            "token_limit": 0,
+            "sync_mode": "typed",
+            "include_gamma": False,
+            "active_only": True,
+            "include_trades": True,
+            "include_price_history": False,
+            "include_books": False,
+            "gamma_page_limit": 100,
+            "gamma_max_pages": 1,
+            "gamma_resume": False,
+            "gamma_sleep_seconds": 0.0,
+            "trade_page_limit": 500,
+            "trade_max_pages": 1,
+            "price_interval": "1d",
+            "price_fidelity": None,
+            "holders_limit": 500,
+            "positions_limit": 500,
+            "include_holders": False,
+            "include_market_positions": False,
+            "include_open_interest": False,
+            "refresh_run": "realtime-trades",
+            "requeue_done": True,
+            "include_global_trades": True,
+        },
+    )()
+
+    result = cmd_tasks_seed_frontier(args, Settings())
+    tasks = LocalTaskStore(tmp_path / "tasks.json").load()
+
+    assert result["candidate_tasks"] == 3
+    assert result["include_gamma"] is False
+    assert {task.kind for task in tasks} == {"trades"}
+    assert [task.params["market"] for task in tasks] == [None, "condition-1", "condition-2"]
+    assert all(requeue_done_task(task.params) for task in tasks)
+
+
+def test_local_task_store_requeues_done_realtime_task(tmp_path) -> None:
+    store = LocalTaskStore(tmp_path / "tasks.json")
+    task = Task(kind="trades", params={"market": "condition-1", "_requeue_done": True})
+    assert store.add_many([task]) == 1
+    store.complete(task.id)
+
+    added = store.add_many(
+        [Task(kind="trades", params={"market": "condition-1", "_requeue_done": True})]
+    )
+    tasks = store.load()
+
+    assert added == 1
+    assert len(tasks) == 1
+    assert tasks[0].status == "pending"
+    assert tasks[0].attempts == 0

@@ -119,6 +119,27 @@ class PolymarketClient:
         )
         return Page(response=response, items=_list_body(response.body))
 
+    def data_positions(self, *, user: str) -> Page:
+        response = self.http.get(
+            f"{self.settings.data_base_url}/positions",
+            {"user": user, "sortBy": "CURRENT", "sortDirection": "DESC"},
+        )
+        return Page(response=response, items=_list_body(response.body))
+
+    def data_value(self, *, user: str) -> Page:
+        response = self.http.get(
+            f"{self.settings.data_base_url}/value",
+            {"user": user},
+        )
+        return Page(response=response, items=_list_body(response.body))
+
+    def user_pnl(self, *, user: str, interval: str = "all", fidelity: str = "1d") -> Page:
+        response = self.http.get(
+            "https://user-pnl-api.polymarket.com/user-pnl",
+            {"user_address": user, "interval": interval, "fidelity": fidelity},
+        )
+        return Page(response=response, items=_list_body(response.body))
+
     def data_open_interest(self, *, market: str | None = None) -> Page:
         response = self.http.get(
             f"{self.settings.data_base_url}/oi",

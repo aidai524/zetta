@@ -10,10 +10,13 @@ import {
   LineChart,
   Loader2,
   MemoryStick,
+  Copy,
+  ExternalLink,
   Search,
   Server,
   Table2,
   UserRound,
+  WalletCards,
 } from "lucide-react";
 import {
   Bar,
@@ -41,6 +44,8 @@ type Overview = {
   orderbook_snapshots?: number;
   chain_logs?: number;
   last_ingested_at?: string;
+  latest_data_at?: string;
+  latest_trade_at?: string;
 };
 
 type IngestionRow = {
@@ -103,6 +108,45 @@ type Trade = {
 
 type TraderProfile = Record<string, string | number | null>;
 
+type WalletSummary = {
+  total_wallets?: number;
+  wallets_over_10k?: number;
+  smart_wallets?: number;
+  whale_wallets?: number;
+  pnl_covered_wallets?: number;
+  over_10k_with_pnl?: number;
+  over_10k_without_pnl?: number;
+  updated_at?: string;
+};
+
+type WalletRow = {
+  user_address: string;
+  trade_count: number;
+  traded_notional: number;
+  max_single_trade_notional?: number;
+  position_count?: number;
+  positions_value?: number;
+  portfolio_value?: number;
+  available_balance?: number;
+  total_pnl?: number;
+  portfolio_captured_at?: string | null;
+  pnl_captured_at?: string | null;
+  pnl_roi?: number;
+  is_whale?: boolean | number;
+  is_smart?: boolean | number;
+  whale_reason?: string;
+  traded_notional_24h: number;
+  trade_count_24h: number;
+  net_notional_24h: number;
+  latest_action: string;
+  whale_tier: string;
+  data_lag_seconds: number;
+  last_trade_at: string;
+  realized_pnl: number;
+  win_rate: number;
+  updated_at?: string;
+};
+
 type Progress = {
   summary: Record<string, number>;
   total_tasks: number;
@@ -133,7 +177,7 @@ type Progress = {
   }>;
 };
 
-type View = "dashboard" | "hardware" | "markets" | "traders" | "operations";
+type View = "dashboard" | "wallets" | "hardware" | "markets" | "traders" | "operations";
 
 function App() {
   const [view, setView] = useState<View>("dashboard");
@@ -147,14 +191,20 @@ function App() {
   const [query, setQuery] = useState("election");
   const [wallet, setWallet] = useState("");
   const [profile, setProfile] = useState<TraderProfile | null>(null);
+  const [whaleWallets, setWhaleWallets] = useState<WalletRow[]>([]);
+  const [walletSummary, setWalletSummary] = useState<WalletSummary>({});
+  const [smartWallets, setSmartWallets] = useState<WalletRow[]>([]);
+  const [listedWhaleWallets, setListedWhaleWallets] = useState<WalletRow[]>([]);
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState("");
 
   useEffect(() => {
     void refreshDashboard();
+    void refreshWallets();
     void searchMarkets("election");
     const timer = window.setInterval(() => {
       void refreshDashboard();
+      void refreshWallets();
     }, DASHBOARD_REFRESH_MS);
     return () => window.clearInterval(timer);
   }, []);
@@ -176,13 +226,39 @@ function App() {
         getJson<Progress>("/tasks/progress?recent_limit=8"),
         getJson<{ system: SystemStats }>("/stats/system"),
       ]);
+      const whaleData = await getJson<{ wallets: WalletRow[] }>("/wallets/screener?mode=whale&limit=8");
       setOverview(overviewData.overview || {});
       setIngestion(ingestionData.ingestion || []);
       setProgress(progressData);
       setSystem(systemData.system || null);
+      setWhaleWallets(whaleData.wallets || []);
     } catch (exc) {
       setError(errorMessage(exc));
     }
+  }
+
+  async function refreshWallets() {
+    setError("");
+    try {
+      const [summaryData, smartData, whaleData] = await Promise.all([
+        getJson<{ summary: WalletSummary }>("/wallets/summary"),
+        getJson<{ wallets: WalletRow[] }>("/wallets/screener?mode=smart&limit=100"),
+        getJson<{ wallets: WalletRow[] }>("/wallets/screener?mode=whale&limit=100"),
+      ]);
+      setWalletSummary(summaryData.summary || {});
+      setSmartWallets(smartData.wallets || []);
+      setListedWhaleWallets(whaleData.wallets || []);
+    } catch (exc) {
+      setError(errorMessage(exc));
+    }
+  }
+
+  function refreshCurrentView() {
+    if (view === "wallets") {
+      void refreshWallets();
+      return;
+    }
+    void refreshDashboard();
   }
 
   async function searchMarkets(nextQuery = query) {
@@ -210,7 +286,9 @@ function App() {
     try {
       const [detail, trades] = await Promise.all([
         getJson<{ market: Market }>(`/markets/detail?market_id=${encodeURIComponent(market.market_id)}`),
-        getJson<{ trades: Trade[] }>(`/markets/trades?market_id=${encodeURIComponent(market.market_id)}&limit=20`),
+        getJson<{ trades: Trade[] }>(
+          `/markets/trades?condition_id=${encodeURIComponent(market.condition_id)}&limit=20`,
+        ),
       ]);
       setSelectedMarket(detail.market);
       setMarketTrades(trades.trades || []);
@@ -250,6 +328,7 @@ function App() {
         </div>
         <nav>
           <NavButton active={view === "dashboard"} icon={<BarChart3 size={18} />} label="Dashboard" onClick={() => setView("dashboard")} />
+          <NavButton active={view === "wallets"} icon={<WalletCards size={18} />} label="Wallets" onClick={() => setView("wallets")} />
           <NavButton active={view === "hardware"} icon={<Cpu size={18} />} label="Hardware" onClick={() => setView("hardware")} />
           <NavButton active={view === "markets"} icon={<Table2 size={18} />} label="Markets" onClick={() => setView("markets")} />
           <NavButton active={view === "traders"} icon={<UserRound size={18} />} label="Traders" onClick={() => setView("traders")} />
@@ -263,7 +342,7 @@ function App() {
             <h1>{viewTitle(view)}</h1>
             <p>{API_BASE}</p>
           </div>
-          <button className="iconButton" onClick={refreshDashboard} title="Refresh">
+          <button className="iconButton" onClick={refreshCurrentView} title="Refresh">
             <Activity size={18} />
           </button>
         </header>
@@ -271,7 +350,11 @@ function App() {
         {error ? <div className="notice"><AlertTriangle size={16} />{error}</div> : null}
 
         {view === "dashboard" ? (
-          <Dashboard overview={overview} ingestion={ingestion} progress={progress} progressRows={progressRows} system={system} />
+          <Dashboard overview={overview} ingestion={ingestion} progress={progress} progressRows={progressRows} system={system} whaleWallets={whaleWallets} />
+        ) : null}
+
+        {view === "wallets" ? (
+          <Wallets summary={walletSummary} smartWallets={smartWallets} whaleWallets={listedWhaleWallets} />
         ) : null}
 
         {view === "hardware" ? <Hardware system={system} /> : null}
@@ -351,13 +434,19 @@ function Dashboard({
   progress,
   progressRows,
   system,
+  whaleWallets,
 }: {
   overview: Overview;
   ingestion: IngestionRow[];
   progress: Progress | null;
   progressRows: Array<{ kind: string; total: number; done: number; running: number; dead_lettered: number }>;
   system: SystemStats | null;
+  whaleWallets: WalletRow[];
 }) {
+  const closedPercent = boundedPercent(progress?.closed_percent);
+  const donePercent = boundedPercent(progress?.done_percent);
+  const deadLettered = progress?.summary?.dead_lettered ?? 0;
+  const latestDataAt = overview.latest_data_at || overview.last_ingested_at;
   const statCards = [
     ["Events", overview.events],
     ["Markets", overview.markets],
@@ -380,19 +469,47 @@ function Dashboard({
       <SystemPressure system={system} />
 
       <div className="panel wide">
+        <PanelTitle icon={<WalletCards size={18} />} title="Whale Wallets" />
+        <table>
+          <thead>
+            <tr><th>Wallet</th><th>Tier</th><th>Total Volume</th><th>24h Volume</th><th>24h Net</th><th>Trades</th><th>Last Trade</th></tr>
+          </thead>
+          <tbody>
+            {whaleWallets.map((wallet) => (
+              <tr key={wallet.user_address}>
+                <td><WalletIdentity wallet={wallet.user_address} /></td>
+                <td>{wallet.whale_tier}</td>
+                <td className="num">{formatCurrency(wallet.traded_notional)}</td>
+                <td className="num">{formatCurrency(wallet.traded_notional_24h)}</td>
+                <td className="num">{formatCurrency(wallet.net_notional_24h)}</td>
+                <td className="num">{formatNumber(wallet.trade_count)}</td>
+                <td>{formatDate(wallet.last_trade_at) || "--"}</td>
+              </tr>
+            ))}
+          </tbody>
+        </table>
+      </div>
+
+      <div className="panel wide">
         <PanelTitle icon={<LineChart size={18} />} title="Backfill Progress" />
         <div className="progressLine">
           <div>
-            <strong>{progress?.done_percent ?? 0}%</strong>
-            <span>done</span>
+            <strong>{formatPercent(closedPercent)}</strong>
+            <span>complete</span>
           </div>
           <div className="progressTrack">
-            <div style={{ width: `${Math.min(progress?.closed_percent ?? 0, 100)}%` }} />
+            <div style={{ width: `${closedPercent}%` }} />
           </div>
           <div>
             <strong>{formatNumber(progress?.total_tasks)}</strong>
             <span>tasks</span>
           </div>
+        </div>
+        <div className="progressMeta">
+          <span>Done {formatPercent(donePercent)}</span>
+          <span>Dead-lettered {formatNumber(deadLettered)}</span>
+          <span>Latest data {formatDate(latestDataAt) || "--"}</span>
+          <span>Latest trade {formatDate(overview.latest_trade_at) || "--"}</span>
         </div>
         <ResponsiveContainer width="100%" height={260}>
           <BarChart data={progressRows}>
@@ -442,6 +559,121 @@ function Dashboard({
         </ResponsiveContainer>
       </div>
     </section>
+  );
+}
+
+function Wallets({
+  summary,
+  smartWallets,
+  whaleWallets,
+}: {
+  summary: WalletSummary;
+  smartWallets: WalletRow[];
+  whaleWallets: WalletRow[];
+}) {
+  const coveragePercent = ratioPercent(summary.over_10k_with_pnl, summary.wallets_over_10k);
+  const cards = [
+    ["All Wallets", summary.total_wallets],
+    ["> $10K Volume", summary.wallets_over_10k],
+    ["Smart Wallets", summary.smart_wallets],
+    ["Whale Wallets", summary.whale_wallets],
+  ];
+  return (
+    <section className="gridPage walletPage">
+      <div className="metrics walletMetrics wide">
+        {cards.map(([label, value]) => (
+          <div className="metric" key={label}>
+            <span>{label}</span>
+            <strong>{formatNumber(value)}</strong>
+          </div>
+        ))}
+      </div>
+
+      <div className="walletStatus wide">
+        <span>Updated {formatDate(summary.updated_at) || "--"}</span>
+        <span>
+          PnL snapshots over $10K {formatNumber(summary.over_10k_with_pnl)} / {formatNumber(summary.wallets_over_10k)}
+          {" "}({formatPercent(coveragePercent)})
+        </span>
+      </div>
+
+      <div className="walletListGrid wide">
+        <WalletListPanel title="Smart Wallets" kind="smart" wallets={smartWallets} />
+        <WalletListPanel title="Whale Wallets" kind="whale" wallets={whaleWallets} />
+      </div>
+    </section>
+  );
+}
+
+function WalletListPanel({
+  title,
+  kind,
+  wallets,
+}: {
+  title: string;
+  kind: "smart" | "whale";
+  wallets: WalletRow[];
+}) {
+  return (
+    <div className="panel walletListPanel">
+      <PanelTitle icon={kind === "smart" ? <LineChart size={18} /> : <WalletCards size={18} />} title={`${title} (${formatNumber(wallets.length)})`} />
+      <div className="tableScroller">
+        <table className="walletTable">
+          <thead>
+            {kind === "smart" ? (
+              <tr>
+                <th>Wallet</th>
+                <th>ROI</th>
+                <th>PnL</th>
+                <th>Total Volume</th>
+                <th>Portfolio</th>
+                <th>Trades</th>
+                <th>Last Trade</th>
+              </tr>
+            ) : (
+              <tr>
+                <th>Wallet</th>
+                <th>Reason</th>
+                <th>Total Volume</th>
+                <th>Max Trade</th>
+                <th>24h Volume</th>
+                <th>Trades</th>
+                <th>Last Trade</th>
+              </tr>
+            )}
+          </thead>
+          <tbody>
+            {wallets.length === 0 ? (
+              <tr>
+                <td colSpan={7}><div className="empty compact">No wallets loaded</div></td>
+              </tr>
+            ) : wallets.map((wallet) => (
+              kind === "smart" ? (
+                <tr key={wallet.user_address}>
+                  <td><WalletIdentity wallet={wallet.user_address} /></td>
+                  <td className="num valuePositive">{formatRatioPercent(wallet.pnl_roi)}</td>
+                  <td className={`num ${signedValueClass(wallet.total_pnl)}`}>{formatSignedCurrency(wallet.total_pnl)}</td>
+                  <td className="num">{formatCurrency(wallet.traded_notional)}</td>
+                  <td className="num">{formatCurrencyPrecise(wallet.portfolio_value)}</td>
+                  <td className="num">{formatNumber(wallet.trade_count)}</td>
+                  <td>{formatDate(wallet.last_trade_at) || "--"}</td>
+                </tr>
+              ) : (
+                <tr key={wallet.user_address}>
+                  <td><WalletIdentity wallet={wallet.user_address} /></td>
+                  <td><span className="statusTag">{formatWalletReason(wallet)}</span></td>
+                  <td className="num">{formatCurrency(wallet.traded_notional)}</td>
+                  <td className="num">{formatCurrency(wallet.max_single_trade_notional)}</td>
+                  <td className="num">{formatCurrency(wallet.traded_notional_24h)}</td>
+                  <td className="num">{formatNumber(wallet.trade_count)}</td>
+                  <td>{formatDate(wallet.last_trade_at) || "--"}</td>
+                </tr>
+              )
+            ))}
+          </tbody>
+        </table>
+      </div>
+    </div>
   );
 }
 
@@ -721,6 +953,7 @@ function PanelTitle({ icon, title }: { icon: React.ReactNode; title: string }) {
 function viewTitle(view: View) {
   return {
     dashboard: "Internal Overview",
+    wallets: "Wallets",
     hardware: "Hardware Status",
     markets: "Market Explorer",
     traders: "Trader Profiles",
@@ -744,10 +977,48 @@ function formatCurrency(value: unknown) {
   return new Intl.NumberFormat("en-US", { style: "currency", currency: "USD", maximumFractionDigits: 0 }).format(number);
 }
 
+function formatCurrencyPrecise(value: unknown) {
+  const number = Number(value || 0);
+  return new Intl.NumberFormat("en-US", {
+    style: "currency",
+    currency: "USD",
+    maximumFractionDigits: 2,
+  }).format(number);
+}
+
+function formatSignedCurrency(value: unknown) {
+  const number = Number(value || 0);
+  const formatted = formatCurrencyPrecise(Math.abs(number));
+  if (number > 0) return `+${formatted}`;
+  if (number < 0) return `-${formatted}`;
+  return formatted;
+}
+
 function formatPercent(value: unknown) {
   const number = Number(value);
   if (!Number.isFinite(number)) return "--";
   return `${formatNumber(number)}%`;
+}
+
+function formatRatioPercent(value: unknown) {
+  const number = Number(value);
+  if (!Number.isFinite(number)) return "--";
+  return formatPercent(number * 100);
+}
+
+function ratioPercent(value: unknown, total: unknown) {
+  const numerator = Number(value || 0);
+  const denominator = Number(total || 0);
+  if (!Number.isFinite(numerator) || !Number.isFinite(denominator) || denominator <= 0) {
+    return 0;
+  }
+  return (numerator / denominator) * 100;
+}
+
+function boundedPercent(value: unknown) {
+  const number = Number(value);
+  if (!Number.isFinite(number)) return 0;
+  return Math.max(0, Math.min(number, 100));
 }
 
 function formatBytes(value: unknown) {
@@ -777,7 +1048,8 @@ function formatCores(value: unknown) {
 
 function formatDate(value: string | null | undefined) {
   if (!value) return "";
-  return new Date(value).toLocaleString();
+  const normalized = /[zZ]|[+-]\d\d:?\d\d$/.test(value) ? value : `${value.replace(" ", "T")}Z`;
+  return new Date(normalized).toLocaleString();
 }
 
 function formatDuration(value: unknown) {
@@ -789,12 +1061,6 @@ function formatDuration(value: unknown) {
   if (days > 0) return `${days}d ${hours}h`;
   if (hours > 0) return `${hours}h ${minutes}m`;
   return `${minutes}m`;
-}
-
-function boundedPercent(value: unknown) {
-  const number = Number(value);
-  if (!Number.isFinite(number)) return 0;
-  return Math.max(0, Math.min(number, 100));
 }
 
 function pressureTone(value: number) {
@@ -810,6 +1076,71 @@ function errorMessage(exc: unknown) {
 function shortId(value: string) {
   if (!value || value.length < 14) return value;
   return `${value.slice(0, 6)}...${value.slice(-6)}`;
+}
+
+function shortAddress(value: string) {
+  if (!value || value.length < 12) return value;
+  return `${value.slice(0, 6)}...${value.slice(-4)}`;
+}
+
+function signedValueClass(value: unknown) {
+  const number = Number(value || 0);
+  if (number > 0) return "valuePositive";
+  if (number < 0) return "valueNegative";
+  return "";
+}
+
+function formatWalletReason(wallet: WalletRow) {
+  if (wallet.whale_reason === "total_volume_and_single_trade") return "Volume + single trade";
+  if (wallet.whale_reason === "single_trade") return "Single trade";
+  if (wallet.whale_reason === "total_volume") return "Total volume";
+  return wallet.whale_tier || "Whale";
+}
+
+function WalletIdentity({ wallet }: { wallet: string }) {
+  return (
+    <div className="walletCell">
+      <a className="walletLink" href={polymarketProfileUrl(wallet)} target="_blank" rel="noreferrer">
+        <code>{shortAddress(wallet)}</code>
+      </a>
+      <a
+        className="iconMini"
+        href={polymarketProfileUrl(wallet)}
+        target="_blank"
+        rel="noreferrer"
+        title="Open Polymarket profile"
+      >
+        <ExternalLink size={14} />
+      </a>
+      <button
+        className="iconMini"
+        type="button"
+        title="Copy wallet address"
+        onClick={() => copyWallet(wallet)}
+      >
+        <Copy size={14} />
+      </button>
+    </div>
+  );
+}
+
+function polymarketProfileUrl(wallet: string) {
+  return `https://polymarket.com/profile/${encodeURIComponent(wallet)}`;
+}
+
+async function copyWallet(wallet: string) {
+  try {
+    await navigator.clipboard.writeText(wallet);
+  } catch {
+    const textarea = document.createElement("textarea");
+    textarea.value = wallet;
+    textarea.style.position = "fixed";
+    textarea.style.opacity = "0";
+    document.body.appendChild(textarea);
+    textarea.select();
+    document.execCommand("copy");
+    document.body.removeChild(textarea);
+  }
 }
 
 createRoot(document.getElementById("root")!).render(<App />);

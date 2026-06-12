@@ -67,3 +67,29 @@ create table if not exists collector_dead_letters (
 
 create index if not exists idx_collector_dead_letters_created
   on collector_dead_letters (created_at desc);
+
+create table if not exists event_sync_runs (
+  id bigserial primary key,
+  event_id text not null,
+  refresh_run text not null,
+  task_id bigint references collector_tasks(id),
+  node_id text not null,
+  status text not null,
+  started_at timestamptz not null,
+  finished_at timestamptz,
+  markets integer not null default 0,
+  condition_ids integer not null default 0,
+  token_ids integer not null default 0,
+  raw_paths text[] not null default '{}',
+  error text,
+  details jsonb not null default '{}'::jsonb,
+  created_at timestamptz not null default now(),
+  updated_at timestamptz not null default now(),
+  unique (event_id, refresh_run)
+);
+
+create index if not exists idx_event_sync_runs_latest
+  on event_sync_runs (event_id, finished_at desc);
+
+create index if not exists idx_event_sync_runs_status
+  on event_sync_runs (status, finished_at desc);

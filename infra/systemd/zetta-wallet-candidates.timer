@@ -1,0 +1,11 @@
+[Unit]
+Description=Seed Zetta whale and smart wallet candidates every 5 minutes
+
+[Timer]
+OnBootSec=6min
+OnUnitInactiveSec=5min
+AccuracySec=30s
+Unit=zetta-wallet-candidates.service
+
+[Install]
+WantedBy=timers.target

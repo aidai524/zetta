@@ -18,6 +18,7 @@ class CollectionResult:
     pages: int
     items: int
     last_cursor: str | None
+    raw_paths: list[str]
 
 
 class GammaCollector:
@@ -48,6 +49,7 @@ class GammaCollector:
         cursor = self.state_store.get(state_key, {}).get("next_cursor") if resume else None
         pages = 0
         total_items = 0
+        raw_paths: list[str] = []
 
         while max_pages == 0 or pages < max_pages:
             previous_cursor = cursor
@@ -68,11 +70,15 @@ class GammaCollector:
                     active=active,
                 )
 
-            self.raw_writer.write(
-                source="gamma",
-                entity=entity,
-                request_url=page.response.url,
-                payload=page.response.body,
+            raw_paths.append(
+                str(
+                    self.raw_writer.write(
+                        source="gamma",
+                        entity=entity,
+                        request_url=page.response.url,
+                        payload=page.response.body,
+                    )
+                )
             )
             pages += 1
             total_items += len(page.items)
@@ -97,4 +103,5 @@ class GammaCollector:
             pages=pages,
             items=total_items,
             last_cursor=cursor,
+            raw_paths=raw_paths,
         )

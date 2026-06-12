@@ -62,6 +62,8 @@ def default_rate_limiter() -> RateLimiter:
             "data:market_positions": TokenBucket(rate_per_second=3, burst=6),
             "data:open_interest": TokenBucket(rate_per_second=4, burst=8),
             "data:trades": TokenBucket(rate_per_second=4, burst=8),
+            "user_pnl": TokenBucket(rate_per_second=8, burst=16),
+            "user_pnl:user_pnl": TokenBucket(rate_per_second=8, burst=16),
             "clob": TokenBucket(rate_per_second=4, burst=8),
             "clob:book": TokenBucket(rate_per_second=2, burst=4),
             "clob:prices_history": TokenBucket(rate_per_second=3, burst=6),

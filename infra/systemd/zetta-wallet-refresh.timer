@@ -1,0 +1,11 @@
+[Unit]
+Description=Seed Zetta wallet refresh tasks every minute
+
+[Timer]
+OnBootSec=4min
+OnUnitInactiveSec=1min
+AccuracySec=10s
+Unit=zetta-wallet-refresh.service
+
+[Install]
+WantedBy=timers.target

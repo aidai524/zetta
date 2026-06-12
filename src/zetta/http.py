@@ -134,6 +134,8 @@ def api_family(url: str) -> str:
         return "gamma"
     if "data-api.polymarket.com" in host:
         return "data"
+    if "user-pnl-api.polymarket.com" in host:
+        return "user_pnl"
     if "clob.polymarket.com" in host:
         return "clob"
     if "polygon" in host:
@@ -161,6 +163,9 @@ def api_endpoint(url: str, family: str | None = None) -> str | None:
             return "market_positions"
         if path == "oi":
             return "open_interest"
+    if family == "user_pnl":
+        if path == "user-pnl":
+            return "user_pnl"
     if family == "clob":
         if path == "book":
             return "book"

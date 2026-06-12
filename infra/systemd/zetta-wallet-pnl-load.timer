@@ -1,0 +1,11 @@
+[Unit]
+Description=Load Zetta wallet PnL snapshots every minute
+
+[Timer]
+OnBootSec=3min
+OnUnitInactiveSec=1min
+AccuracySec=15s
+Unit=zetta-wallet-pnl-load.service
+
+[Install]
+WantedBy=timers.target

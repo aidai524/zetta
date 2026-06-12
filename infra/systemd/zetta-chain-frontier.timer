@@ -1,0 +1,11 @@
+[Unit]
+Description=Collect latest Polymarket chain logs every minute
+
+[Timer]
+OnBootSec=3min
+OnUnitInactiveSec=1min
+AccuracySec=10s
+Unit=zetta-chain-frontier.service
+
+[Install]
+WantedBy=timers.target

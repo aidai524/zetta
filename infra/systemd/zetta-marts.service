@@ -7,3 +7,7 @@ Wants=network-online.target
 Type=oneshot
 EnvironmentFile=/etc/zetta/zetta.env
 ExecStart=/usr/local/bin/zetta-runner marts
+MemoryAccounting=true
+MemoryMax=24G
+TasksMax=128
+TimeoutStartSec=30min

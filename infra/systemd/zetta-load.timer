@@ -1,9 +1,9 @@
 [Unit]
-Description=Run Zetta raw loaders every 5 minutes
+Description=Run capped Zetta raw loaders every 15 minutes
 
 [Timer]
 OnBootSec=2min
-OnUnitActiveSec=5min
+OnUnitInactiveSec=15min
 AccuracySec=30s
 Unit=zetta-load.service
 
