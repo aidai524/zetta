@@ -1,0 +1,23 @@
+zetta@prod-clickhouse:~$ SELECT dataset, rows, latest_record FROM zetta.coverage_overview ORDER BY rows DESC;
+
+┏━━━━━━━━━━━━━━━━━━━━━━┳━━━━━━━━━━━━━━┳━━━━━━━━━━━━━━━━━━━━━━━┳━━━━━━━━━━━━━━━━━━━━┓
+┃ dataset              ┃ rows indexed ┃ latest record         ┃ table              ┃
+┡━━━━━━━━━━━━━━━━━━━━━━╇━━━━━━━━━━━━━━╇━━━━━━━━━━━━━━━━━━━━━━━╇━━━━━━━━━━━━━━━━━━━━┩
+│ Polymarket trades    │  516,841,525 │ 2026-06-12 13:39 UTC │ fact_trade         │
+│ Polygon chain logs   │   18,676,134 │ 2026-06-12 13:43 UTC │ fact_chain_log     │
+│ CLOB price points    │    3,686,820 │ 2026-06-12 09:49 UTC │ fact_price_history │
+│ Outcome tokens       │    2,754,281 │ 2026-06-12 13:42 UTC │ dim_outcome_token  │
+│ Markets + events     │    1,942,333 │ 2026-06-12 13:42 UTC │ dim_market/event   │
+└──────────────────────┴──────────────┴───────────────────────┴────────────────────┘
+
+zetta@prod-clickhouse:~$ SELECT total_wallets, wallets_over_10k, smart_wallets, whale_wallets FROM mart_wallet_screener FINAL;
+
+┏━━━━━━━━━━━━━━━┳━━━━━━━━━━━━━━━━━━━━━━━┳━━━━━━━━━━━━━━━┳━━━━━━━━━━━━━━━┳━━━━━━━━━━━━━━┓
+┃ all wallets   ┃ wallets > $10K volume ┃ smart wallets ┃ whale wallets ┃ PnL coverage ┃
+┡━━━━━━━━━━━━━━━╇━━━━━━━━━━━━━━━━━━━━━━━╇━━━━━━━━━━━━━━━╇━━━━━━━━━━━━━━━╇━━━━━━━━━━━━━━┩
+│     2,191,937 │                94,792 │         3,221 │         2,242 │       99.97% │
+└───────────────┴───────────────────────┴───────────────┴───────────────┴──────────────┘
+
+Rules: whale = total volume > $1M or single trade > $100K.
+Rules: smart = ROI > 55% and total volume > $10K.
+Source: live ClickHouse warehouse, UTC timestamps.

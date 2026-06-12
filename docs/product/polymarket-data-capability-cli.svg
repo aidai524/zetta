@@ -1,0 +1,120 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1920" height="1080" viewBox="0 0 1920 1080" role="img" aria-labelledby="title desc">
+  <title id="title">Zetta Polymarket data capability CLI screenshot</title>
+  <desc id="desc">A terminal style promotional image showing Polymarket market, trade, chain log, wallet, smart wallet, and whale wallet coverage.</desc>
+  <style>
+    .bg { fill: #071013; }
+    .window { fill: #0d171c; stroke: #263b43; stroke-width: 2; }
+    .topbar { fill: #101f26; }
+    .title { font: 700 48px ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; fill: #f5fbff; }
+    .subtitle { font: 400 24px ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; fill: #9ab0b8; }
+    .mono { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; }
+    .prompt { font: 700 22px ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; fill: #49d1a6; }
+    .query { font: 400 22px ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; fill: #cde7ef; }
+    .comment { font: 400 18px ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; fill: #6f8790; }
+    .table-title { font: 700 23px ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; fill: #f4c95d; }
+    .th { font: 700 18px ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; fill: #8eb8c5; }
+    .td { font: 400 19px ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; fill: #e6f1f4; }
+    .num { font: 700 21px ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; fill: #7dd3fc; }
+    .good { fill: #49d1a6; }
+    .warn { fill: #f4c95d; }
+    .muted { fill: #76919b; }
+    .line { stroke: #1d333b; stroke-width: 1; }
+    .panel { fill: #0f1d23; stroke: #21414b; stroke-width: 1.5; }
+    .panel2 { fill: #0a1419; stroke: #21414b; stroke-width: 1.5; }
+    .pill { fill: #132a31; stroke: #285866; stroke-width: 1; }
+    .pill-text { font: 700 17px ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; fill: #b9f2e2; }
+    .metric-label { font: 700 18px ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; fill: #9ab0b8; }
+    .metric-value { font: 800 34px ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; fill: #f7fbff; }
+    .footer { font: 400 18px ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; fill: #718892; }
+  </style>
+
+  <rect class="bg" width="1920" height="1080"/>
+  <rect x="48" y="48" width="1824" height="984" rx="8" fill="#09161b" stroke="#15323b" stroke-width="2"/>
+
+  <text x="96" y="112" class="title">Zetta Polymarket Intelligence Warehouse</text>
+  <text x="98" y="154" class="subtitle">Full-site market data, wallet-level PnL, portfolio snapshots, whale and smart-money segmentation</text>
+
+  <rect x="96" y="190" width="1728" height="780" rx="8" class="window"/>
+  <rect x="96" y="190" width="1728" height="54" rx="8" class="topbar"/>
+  <circle cx="129" cy="217" r="8" fill="#ff5f57"/>
+  <circle cx="157" cy="217" r="8" fill="#ffbd2e"/>
+  <circle cx="185" cy="217" r="8" fill="#28c840"/>
+  <text x="226" y="225" class="comment">prod-clickhouse / zetta database / public capability snapshot</text>
+  <rect x="1565" y="205" width="218" height="25" rx="12" class="pill"/>
+  <text x="1582" y="224" class="pill-text">updated 2026-06-12</text>
+
+  <text x="130" y="286" class="prompt">zetta@prod-clickhouse:~$</text>
+  <text x="424" y="286" class="query">SELECT dataset, rows, latest_record FROM zetta.coverage_overview ORDER BY rows DESC;</text>
+
+  <rect x="130" y="318" width="1030" height="318" rx="8" class="panel2"/>
+  <text x="154" y="356" class="table-title">Coverage overview</text>
+  <line x1="154" y1="378" x2="1136" y2="378" class="line"/>
+  <text x="154" y="410" class="th">DATASET</text>
+  <text x="540" y="410" class="th">ROWS INDEXED</text>
+  <text x="764" y="410" class="th">LATEST RECORD</text>
+  <text x="1006" y="410" class="th">TABLE</text>
+  <line x1="154" y1="428" x2="1136" y2="428" class="line"/>
+
+  <text x="154" y="464" class="td">Polymarket trades</text>
+  <text x="540" y="464" class="num">516,841,525</text>
+  <text x="764" y="464" class="td">2026-06-12 13:39 UTC</text>
+  <text x="1006" y="464" class="td">fact_trade</text>
+
+  <text x="154" y="504" class="td">Polygon chain logs</text>
+  <text x="540" y="504" class="num">18,676,134</text>
+  <text x="764" y="504" class="td">2026-06-12 13:43 UTC</text>
+  <text x="1006" y="504" class="td">fact_chain_log</text>
+
+  <text x="154" y="544" class="td">CLOB price points</text>
+  <text x="540" y="544" class="num">3,686,820</text>
+  <text x="764" y="544" class="td">2026-06-12 09:49 UTC</text>
+  <text x="1006" y="544" class="td">fact_price_history</text>
+
+  <text x="154" y="584" class="td">Outcome tokens</text>
+  <text x="540" y="584" class="num">2,754,281</text>
+  <text x="764" y="584" class="td">2026-06-12 13:42 UTC</text>
+  <text x="1006" y="584" class="td">dim_outcome_token</text>
+
+  <text x="154" y="624" class="td">Markets / events</text>
+  <text x="540" y="624" class="num">1,942,333</text>
+  <text x="764" y="624" class="td">2026-06-12 13:42 UTC</text>
+  <text x="1006" y="624" class="td">dim_* </text>
+
+  <rect x="1190" y="318" width="594" height="318" rx="8" class="panel"/>
+  <text x="1216" y="356" class="table-title">Live processing</text>
+  <line x1="1216" y1="378" x2="1758" y2="378" class="line"/>
+  <text x="1216" y="415" class="metric-label">distributed jobs</text>
+  <text x="1502" y="415" class="metric-value">1,922,916</text>
+  <text x="1216" y="472" class="metric-label">queue closed</text>
+  <text x="1502" y="472" class="metric-value">98.8%</text>
+  <text x="1216" y="529" class="metric-label">running workers</text>
+  <text x="1502" y="529" class="metric-value">20</text>
+  <text x="1216" y="586" class="metric-label">ingestion streams</text>
+  <text x="1502" y="586" class="metric-value">5</text>
+  <text x="1216" y="624" class="comment">Gamma + CLOB + Data API + Polygon + WebSocket</text>
+
+  <text x="130" y="690" class="prompt">zetta@prod-clickhouse:~$</text>
+  <text x="424" y="690" class="query">SELECT total_wallets, wallets_over_10k, smart_wallets, whale_wallets FROM mart_wallet_screener FINAL;</text>
+
+  <rect x="130" y="724" width="1654" height="168" rx="8" class="panel2"/>
+  <text x="154" y="760" class="table-title">Wallet intelligence snapshot</text>
+  <line x1="154" y1="782" x2="1760" y2="782" class="line"/>
+
+  <text x="154" y="822" class="metric-label">all wallets</text>
+  <text x="154" y="868" class="metric-value">2,191,937</text>
+
+  <text x="482" y="822" class="metric-label">wallets &gt; $10K volume</text>
+  <text x="482" y="868" class="metric-value">94,792</text>
+
+  <text x="890" y="822" class="metric-label">smart wallets</text>
+  <text x="890" y="868" class="metric-value">3,221</text>
+
+  <text x="1194" y="822" class="metric-label">whale wallets</text>
+  <text x="1194" y="868" class="metric-value">2,242</text>
+
+  <text x="1492" y="822" class="metric-label">PnL coverage</text>
+  <text x="1492" y="868" class="metric-value">99.97%</text>
+
+  <text x="130" y="934" class="footer">Rules: whale = total volume &gt; $1M or single trade &gt; $100K; smart = ROI &gt; 55% and volume &gt; $10K.</text>
+  <text x="1292" y="934" class="footer">Source: live ClickHouse warehouse, UTC timestamps.</text>
+</svg>
