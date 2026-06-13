@@ -33,7 +33,12 @@ set_env() {
 install -d -m 0755 "$(dirname "$ENV_FILE")" "$WALLET_RAW_DIR" "$WALLET_STATE_DIR"
 
 if [[ -d "$ZETTA_HOME/src" ]]; then
-  rsync -a --delete "$REPO_ROOT/src/" "$ZETTA_HOME/src/"
+  if command -v rsync >/dev/null 2>&1; then
+    rsync -a --delete "$REPO_ROOT/src/" "$ZETTA_HOME/src/"
+  else
+    rm -rf "$ZETTA_HOME/src"
+    cp -a "$REPO_ROOT/src" "$ZETTA_HOME/src"
+  fi
 fi
 install -m 0755 "$REPO_ROOT/infra/scripts/zetta-runner" /usr/local/bin/zetta-runner
 
