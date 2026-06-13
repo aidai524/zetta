@@ -59,6 +59,10 @@ class ProductApi:
             return ApiResponse(HTTPStatus.OK, {"wallets": self.event_wallet_flow(query)})
         if path == "/events/pnl-leaderboard":
             return ApiResponse(HTTPStatus.OK, {"wallets": self.event_pnl_leaderboard(query)})
+        if path == "/events/smart-wallet-options":
+            return ApiResponse(HTTPStatus.OK, self.event_smart_wallet_options_response(query))
+        if path == "/events/smart-wallets":
+            return ApiResponse(HTTPStatus.OK, self.event_smart_wallets(query))
         if path == "/traders/profile":
             profile = self.trader_profile(query)
             if profile is None:
@@ -539,6 +543,457 @@ class ProductApi:
             format JSONEachRow
         """
         return rows_json(self.clickhouse.query_text(sql))
+
+    def event_smart_wallets(self, query: dict[str, list[str]]) -> dict[str, Any]:
+        event_ref = (
+            param(query, "event")
+            or param(query, "slug")
+            or param(query, "event_slug")
+            or param(query, "event_id")
+            or param(query, "name")
+            or param(query, "q")
+        ).strip()
+        if not event_ref:
+            return empty_event_smart_wallet_options_response("", status="missing_event")
+        limit = int_param(query, "limit", 100, maximum=500)
+        event = self.event_lookup(event_ref)
+        if event is None:
+            return empty_event_smart_wallet_options_response(event_ref, status="event_not_found")
+        event_id = str(event.get("event_id", ""))
+        if not event_id:
+            return event_smart_wallet_options_response_body(event, [])
+        include_details = param(query, "details").lower() in ("1", "true", "yes")
+        if not include_details:
+            return event_smart_wallet_options_response_body(
+                event,
+                self.event_smart_wallet_options(event_id),
+            )
+
+        base_cte = f"""
+            with
+            selected_event as
+            (
+              select
+                event_id,
+                slug,
+                title,
+                start_time,
+                end_time,
+                active,
+                closed,
+                updated_at
+              from dim_event final
+              where event_id = {ch_string(event_id)}
+            ),
+            selected_markets as
+            (
+              select
+                events.event_id as event_id,
+                events.slug as event_slug,
+                events.title as event_title,
+                markets.market_id as market_id,
+                markets.condition_id as condition_id,
+                markets.question as market_question
+              from dim_market as markets final
+              inner join selected_event as events on markets.event_id = events.event_id
+              where markets.condition_id != ''
+            ),
+            smart_wallets as
+            (
+              select
+                user_address,
+                trade_count as wallet_trade_count,
+                traded_notional as wallet_traded_notional,
+                total_pnl as wallet_total_pnl,
+                pnl_roi as wallet_pnl_roi,
+                portfolio_value as wallet_portfolio_value,
+                is_whale as wallet_is_whale,
+                pnl_captured_at as wallet_pnl_captured_at
+              from mart_wallet_screener final
+              where is_smart
+            ),
+            dedup_trades as
+            (
+              select
+                raw_trade_key,
+                argMax(raw_timestamp, raw_ingested_at) as timestamp,
+                argMax(raw_condition_id, raw_ingested_at) as condition_id,
+                argMax(raw_token_id, raw_ingested_at) as token_id,
+                argMax(raw_user_address, raw_ingested_at) as user_address,
+                argMax(raw_side, raw_ingested_at) as side,
+                argMax(raw_price, raw_ingested_at) as price,
+                argMax(raw_size, raw_ingested_at) as size,
+                argMax(raw_notional, raw_ingested_at) as notional
+              from
+              (
+                select
+                  if(
+                    transaction_hash != '',
+                    concat(
+                      transaction_hash, '|', token_id, '|', toString(timestamp), '|',
+                      side, '|', toString(price), '|', toString(size)
+                    ),
+                    trade_id
+                  ) as raw_trade_key,
+                  timestamp as raw_timestamp,
+                  condition_id as raw_condition_id,
+                  token_id as raw_token_id,
+                  lower(user_address) as raw_user_address,
+                  side as raw_side,
+                  price as raw_price,
+                  size as raw_size,
+                  notional as raw_notional,
+                  ingested_at as raw_ingested_at
+                from fact_trade_by_user
+                where user_address in (select user_address from smart_wallets)
+                  and condition_id in (select condition_id from selected_markets)
+                  and user_address != ''
+                  and condition_id != ''
+                  and token_id != ''
+                  and side in ('BUY', 'SELL')
+                  and timestamp <= now64(3) + interval 10 minute
+              )
+              group by raw_trade_key
+            )
+        """
+        summary = rows_json(
+            self.clickhouse.query_text(
+                base_cte
+                + """
+                    select
+                      selected_markets.event_slug,
+                      selected_markets.event_title,
+                      count() as smart_trade_count,
+                      uniqExact(dedup_trades.user_address) as smart_wallet_count,
+                      sum(dedup_trades.notional) as smart_traded_notional,
+                      sumIf(dedup_trades.notional, dedup_trades.side = 'BUY') as smart_buy_notional,
+                      sumIf(dedup_trades.notional, dedup_trades.side = 'SELL') as smart_sell_notional,
+                      sum(if(dedup_trades.side = 'BUY', dedup_trades.size, -dedup_trades.size))
+                        as smart_net_shares,
+                      max(dedup_trades.timestamp) as latest_smart_trade_at,
+                      uniqExactIf(
+                        dedup_trades.user_address,
+                        dedup_trades.timestamp >= now64(3) - interval 24 hour
+                      ) as smart_wallets_24h,
+                      countIf(dedup_trades.timestamp >= now64(3) - interval 24 hour)
+                        as smart_trade_count_24h,
+                      sumIf(dedup_trades.notional, dedup_trades.timestamp >= now64(3) - interval 24 hour)
+                        as smart_traded_notional_24h
+                    from dedup_trades
+                    inner join selected_markets on dedup_trades.condition_id = selected_markets.condition_id
+                    group by selected_markets.event_slug, selected_markets.event_title
+                    format JSONEachRow
+                """
+            )
+        )
+        outcomes = rows_json(
+            self.clickhouse.query_text(
+                base_cte
+                + """
+                    select
+                      selected_markets.event_slug,
+                      selected_markets.event_title,
+                      selected_markets.market_question,
+                      ifNull(tokens.outcome, '') as token_outcome,
+                      upper(ifNull(tokens.outcome, '')) as outcome_side,
+                      concat(
+                        selected_markets.market_question,
+                        ' / ',
+                        upper(ifNull(tokens.outcome, ''))
+                      ) as selection,
+                      count() as smart_trade_count,
+                      uniqExact(dedup_trades.user_address) as smart_wallet_count,
+                      sum(dedup_trades.notional) as smart_traded_notional,
+                      sumIf(dedup_trades.notional, dedup_trades.side = 'BUY') as smart_buy_notional,
+                      sumIf(dedup_trades.notional, dedup_trades.side = 'SELL') as smart_sell_notional,
+                      sum(if(dedup_trades.side = 'BUY', dedup_trades.size, -dedup_trades.size))
+                        as smart_net_shares,
+                      max(dedup_trades.timestamp) as latest_smart_trade_at,
+                      uniqExactIf(
+                        dedup_trades.user_address,
+                        dedup_trades.timestamp >= now64(3) - interval 24 hour
+                      ) as smart_wallets_24h,
+                      countIf(dedup_trades.timestamp >= now64(3) - interval 24 hour)
+                        as smart_trade_count_24h,
+                      sumIf(dedup_trades.notional, dedup_trades.timestamp >= now64(3) - interval 24 hour)
+                        as smart_traded_notional_24h
+                    from dedup_trades
+                    inner join selected_markets on dedup_trades.condition_id = selected_markets.condition_id
+                    left join dim_outcome_token as tokens final
+                      on selected_markets.market_id = tokens.market_id
+                     and dedup_trades.token_id = tokens.token_id
+                    group by
+                      selected_markets.event_slug,
+                      selected_markets.event_title,
+                      selected_markets.market_question,
+                      token_outcome,
+                      outcome_side,
+                      selection
+                    order by smart_traded_notional desc
+                    format JSONEachRow
+                """
+            )
+        )
+        wallets = rows_json(
+            self.clickhouse.query_text(
+                base_cte
+                + f"""
+                    select
+                      selected_markets.event_slug,
+                      selected_markets.event_title,
+                      selected_markets.market_question,
+                      ifNull(tokens.outcome, '') as token_outcome,
+                      upper(ifNull(tokens.outcome, '')) as outcome_side,
+                      concat(
+                        selected_markets.market_question,
+                        ' / ',
+                        upper(ifNull(tokens.outcome, ''))
+                      ) as selection,
+                      dedup_trades.user_address as user_address,
+                      count() as smart_trade_count,
+                      sum(dedup_trades.notional) as event_traded_notional,
+                      sumIf(dedup_trades.notional, dedup_trades.side = 'BUY') as event_buy_notional,
+                      sumIf(dedup_trades.notional, dedup_trades.side = 'SELL') as event_sell_notional,
+                      sum(if(dedup_trades.side = 'BUY', dedup_trades.size, -dedup_trades.size))
+                        as event_net_shares,
+                      argMax(dedup_trades.side, dedup_trades.timestamp) as latest_side,
+                      max(dedup_trades.timestamp) as latest_trade_at,
+                      any(smart_wallets.wallet_trade_count) as wallet_trade_count,
+                      any(smart_wallets.wallet_traded_notional) as wallet_traded_notional,
+                      any(smart_wallets.wallet_total_pnl) as wallet_total_pnl,
+                      any(smart_wallets.wallet_pnl_roi) as wallet_pnl_roi,
+                      any(smart_wallets.wallet_portfolio_value) as wallet_portfolio_value,
+                      any(smart_wallets.wallet_is_whale) as wallet_is_whale,
+                      any(smart_wallets.wallet_pnl_captured_at) as wallet_pnl_captured_at
+                    from dedup_trades
+                    inner join selected_markets on dedup_trades.condition_id = selected_markets.condition_id
+                    inner join smart_wallets on dedup_trades.user_address = smart_wallets.user_address
+                    left join dim_outcome_token as tokens final
+                      on selected_markets.market_id = tokens.market_id
+                     and dedup_trades.token_id = tokens.token_id
+                    group by
+                      selected_markets.event_slug,
+                      selected_markets.event_title,
+                      selected_markets.market_question,
+                      token_outcome,
+                      outcome_side,
+                      selection,
+                      dedup_trades.user_address
+                    order by event_traded_notional desc
+                    limit {limit}
+                    format JSONEachRow
+                """
+            )
+        )
+        positions = rows_json(
+            self.clickhouse.query_text(
+                f"""
+                    select
+                      events.slug as event_slug,
+                      events.title as event_title,
+                      markets.question as market_question,
+                      pos.outcome as token_outcome,
+                      upper(pos.outcome) as outcome_side,
+                      concat(markets.question, ' / ', upper(pos.outcome)) as selection,
+                      pos.user_address,
+                      pos.trade_count,
+                      pos.traded_notional,
+                      pos.position_size,
+                      pos.current_value,
+                      pos.unrealized_pnl_estimate,
+                      pos.latest_action,
+                      pos.last_trade_at,
+                      screener.traded_notional as wallet_traded_notional,
+                      screener.total_pnl as wallet_total_pnl,
+                      screener.pnl_roi as wallet_pnl_roi
+                    from mart_live_wallet_position as pos final
+                    inner join mart_wallet_screener as screener final
+                      on pos.user_address = screener.user_address
+                    inner join dim_event as events final on pos.event_id = events.event_id
+                    inner join dim_market as markets final on pos.market_id = markets.market_id
+                    where events.event_id = {ch_string(event_id)}
+                      and screener.is_smart
+                      and abs(pos.position_size) > 0.000001
+                    order by pos.traded_notional desc
+                    limit {limit}
+                    format JSONEachRow
+                """
+            )
+        )
+        return {
+            "event": event,
+            "summary": summary[0] if summary else empty_event_smart_wallet_summary(event),
+            "outcomes": outcomes,
+            "wallets": wallets,
+            "positions": positions,
+        }
+
+    def event_smart_wallet_options_response(self, query: dict[str, list[str]]) -> dict[str, Any]:
+        event_ref = (
+            param(query, "event")
+            or param(query, "slug")
+            or param(query, "event_slug")
+            or param(query, "event_id")
+            or param(query, "name")
+            or param(query, "q")
+        ).strip()
+        if not event_ref:
+            return empty_event_smart_wallet_options_response("", status="missing_event")
+        event = self.event_lookup(event_ref)
+        if event is None:
+            return empty_event_smart_wallet_options_response(event_ref, status="event_not_found")
+        event_id = str(event.get("event_id", ""))
+        if not event_id:
+            return event_smart_wallet_options_response_body(event, [])
+        return event_smart_wallet_options_response_body(
+            event,
+            self.event_smart_wallet_options(event_id),
+        )
+
+    def event_lookup(self, event_ref: str) -> dict[str, Any] | None:
+        value = event_ref.strip()
+        if not value:
+            return None
+        if value.isdigit():
+            where = f"event_id = {ch_string(value)}"
+        elif value.startswith("fifwc-") or "-" in value:
+            where = f"slug = {ch_string(value)}"
+        else:
+            escaped = ch_string(value)
+            where = f"positionCaseInsensitive(title, {escaped}) > 0"
+        sql = f"""
+            select
+              event_id,
+              slug,
+              title,
+              category,
+              active,
+              closed,
+              start_time,
+              end_time,
+              updated_at
+            from dim_event final
+            where {where}
+            order by
+              lower(title) = lower({ch_string(value)}) desc,
+              positionCaseInsensitive(title, 'Exact Score') = 0 desc,
+              length(title) asc,
+              updated_at desc
+            limit 1
+            format JSONEachRow
+        """
+        rows = rows_json(self.clickhouse.query_text(sql))
+        return rows[0] if rows else None
+
+    def event_smart_wallet_options(self, event_id: str) -> list[dict[str, Any]]:
+        sql = f"""
+            with
+            selected_event as
+            (
+              select event_id, slug, title
+              from dim_event final
+              where event_id = {ch_string(event_id)}
+            ),
+            selected_markets as
+            (
+              select
+                events.slug as event_slug,
+                events.title as event_title,
+                markets.market_id as market_id,
+                markets.condition_id as condition_id,
+                markets.question as market_question
+              from dim_market as markets final
+              inner join selected_event as events on markets.event_id = events.event_id
+              where markets.condition_id != ''
+            ),
+            wallet_segments as
+            (
+              select
+                lower(user_address) as user_address,
+                is_smart,
+                is_whale
+              from mart_wallet_screener final
+              where is_smart or is_whale
+            ),
+            dedup_trades as
+            (
+              select
+                raw_trade_key,
+                argMax(raw_timestamp, raw_ingested_at) as timestamp,
+                argMax(raw_condition_id, raw_ingested_at) as condition_id,
+                argMax(raw_token_id, raw_ingested_at) as token_id,
+                argMax(raw_user_address, raw_ingested_at) as user_address,
+                argMax(raw_notional, raw_ingested_at) as notional
+              from
+              (
+                select
+                  if(
+                    transaction_hash != '',
+                    concat(
+                      transaction_hash, '|', token_id, '|', toString(timestamp), '|',
+                      side, '|', toString(price), '|', toString(size)
+                    ),
+                    trade_id
+                  ) as raw_trade_key,
+                  timestamp as raw_timestamp,
+                  condition_id as raw_condition_id,
+                  token_id as raw_token_id,
+                  lower(user_address) as raw_user_address,
+                  notional as raw_notional,
+                  ingested_at as raw_ingested_at
+                from fact_trade_by_user
+                where user_address in (select user_address from wallet_segments)
+                  and condition_id in (select condition_id from selected_markets)
+                  and user_address != ''
+                  and condition_id != ''
+                  and token_id != ''
+                  and side in ('BUY', 'SELL')
+                  and timestamp <= now64(3) + interval 10 minute
+              )
+              group by raw_trade_key
+            ),
+            option_stats as
+            (
+              select
+                dedup_trades.condition_id as condition_id,
+                dedup_trades.token_id as token_id,
+                uniqExactIf(dedup_trades.user_address, wallet_segments.is_smart) as smart_wallet_count,
+                sumIf(dedup_trades.notional, wallet_segments.is_smart) as smart_amount,
+                countIf(wallet_segments.is_smart) as smart_trade_count,
+                uniqExactIf(dedup_trades.user_address, wallet_segments.is_whale) as whale_wallet_count,
+                sumIf(dedup_trades.notional, wallet_segments.is_whale) as whale_amount
+              from dedup_trades
+              inner join wallet_segments on dedup_trades.user_address = wallet_segments.user_address
+              group by dedup_trades.condition_id, dedup_trades.token_id
+            )
+            select
+              selected_markets.event_slug as event_slug,
+              selected_markets.event_title as event_title,
+              selected_markets.market_question as market_question,
+              ifNull(tokens.outcome, '') as token_outcome,
+              upper(ifNull(tokens.outcome, '')) as outcome_side,
+              concat(
+                selected_markets.market_question,
+                ' / ',
+                upper(ifNull(tokens.outcome, ''))
+              ) as selection,
+              ifNull(option_stats.smart_wallet_count, 0) as smart_wallet_count,
+              ifNull(option_stats.smart_amount, 0.0) as smart_amount,
+              ifNull(option_stats.smart_trade_count, 0) as smart_trade_count,
+              ifNull(option_stats.whale_wallet_count, 0) as whale_wallet_count,
+              ifNull(option_stats.whale_amount, 0.0) as whale_amount
+            from selected_markets
+            left join dim_outcome_token as tokens final
+              on selected_markets.market_id = tokens.market_id
+            left join option_stats
+              on selected_markets.condition_id = option_stats.condition_id
+             and tokens.token_id = option_stats.token_id
+            order by
+              selected_markets.market_question asc,
+              outcome_side desc
+            format JSONEachRow
+        """
+        return compact_event_smart_wallet_options(rows_json(self.clickhouse.query_text(sql)))
 
     def trader_profile(self, query: dict[str, list[str]]) -> dict[str, Any] | None:
         user = param(query, "user").lower()
@@ -1547,6 +2002,97 @@ def rows_json(text: str) -> list[dict[str, Any]]:
     return [json.loads(line) for line in text.splitlines() if line.strip()]
 
 
+def compact_event_smart_wallet_options(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    empty_side = {
+        "smart_wallet_count": 0,
+        "smart_amount": 0.0,
+        "whale_wallet_count": 0,
+        "whale_amount": 0.0,
+    }
+    options_by_question: dict[str, dict[str, Any]] = {}
+    ordered_questions: list[str] = []
+
+    for row in rows:
+        question = str(row.get("market_question", ""))
+        if not question:
+            continue
+        if question not in options_by_question:
+            options_by_question[question] = {
+                "market_question": question,
+                "yes": dict(empty_side),
+                "no": dict(empty_side),
+            }
+            ordered_questions.append(question)
+
+        side = str(row.get("outcome_side") or row.get("token_outcome") or "").lower()
+        if side not in ("yes", "no"):
+            continue
+        options_by_question[question][side] = {
+            "smart_wallet_count": int_value(row.get("smart_wallet_count")),
+            "smart_amount": float_value(row.get("smart_amount")),
+            "whale_wallet_count": int_value(row.get("whale_wallet_count")),
+            "whale_amount": float_value(row.get("whale_amount")),
+        }
+
+    return [options_by_question[question] for question in ordered_questions]
+
+
+def event_smart_wallet_options_response_body(
+    event: dict[str, Any],
+    options: list[dict[str, Any]],
+) -> dict[str, Any]:
+    return {
+        "event": event,
+        "options": options,
+        "data_status": "ok" if options else "no_options",
+        "message": "" if options else "No option data is available for this event yet.",
+    }
+
+
+def empty_event_smart_wallet_options_response(
+    event_ref: str,
+    *,
+    status: str,
+) -> dict[str, Any]:
+    if status == "missing_event":
+        message = "Missing event query parameter."
+    else:
+        message = "No data is available for this event yet."
+    return {
+        "event": {
+            "event_id": "",
+            "slug": event_ref,
+            "title": event_ref,
+            "category": "",
+            "active": False,
+            "closed": False,
+            "start_time": None,
+            "end_time": None,
+            "updated_at": None,
+        },
+        "options": [],
+        "data_status": status,
+        "message": message,
+    }
+
+
+def empty_event_smart_wallet_summary(event: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "event_slug": event.get("slug", ""),
+        "event_title": event.get("title", ""),
+        "smart_trade_count": 0,
+        "smart_wallet_count": 0,
+        "smart_traded_notional": 0.0,
+        "smart_buy_notional": 0.0,
+        "smart_sell_notional": 0.0,
+        "smart_net_shares": 0.0,
+        "latest_smart_trade_at": None,
+        "smart_wallets_24h": 0,
+        "smart_trade_count_24h": 0,
+        "smart_traded_notional_24h": 0.0,
+    }
+
+
 def merge_trader_profile(
     profile: dict[str, Any] | None,
     activity: dict[str, Any] | None,
@@ -1640,6 +2186,13 @@ def float_value(value: Any) -> float:
         return float(value or 0)
     except (TypeError, ValueError):
         return 0.0
+
+
+def int_value(value: Any) -> int:
+    try:
+        return int(float(value or 0))
+    except (TypeError, ValueError):
+        return 0
 
 
 def collect_system_stats() -> dict[str, Any]:

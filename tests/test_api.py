@@ -1,3 +1,5 @@
+import re
+
 from zetta.api import ProductApi, ch_string, collect_system_stats, int_param, rows_json
 
 
@@ -237,6 +239,164 @@ def test_product_api_wallet_summary_counts_screened_wallets() -> None:
     assert "max_single_trade_notional >= 100000.0" in query
 
 
+def test_product_api_event_smart_wallets_returns_compact_options() -> None:
+    fake = FakeClickHouse(
+        outputs=[
+            '{"event_id":"351717","slug":"fifwc-can-bih-2026-06-12",'
+            '"title":"Canada vs. Bosnia and Herzegovina"}\n',
+            '{"market_question":"Will Canada win?","token_outcome":"Yes",'
+            '"outcome_side":"YES","selection":"Will Canada win? / YES",'
+            '"smart_wallet_count":"1","smart_amount":1000,'
+            '"whale_wallet_count":"2","whale_amount":2500}\n'
+            '{"market_question":"Will Canada win?","token_outcome":"No",'
+            '"outcome_side":"NO","selection":"Will Canada win? / NO",'
+            '"smart_wallet_count":"0","smart_amount":0,'
+            '"whale_wallet_count":"0","whale_amount":0}\n',
+        ]
+    )
+    api = ProductApi(clickhouse=fake)
+
+    response = api.handle(
+        "/events/smart-wallets",
+        {"event": ["fifwc-can-bih-2026-06-12"], "limit": ["5"]},
+    )
+
+    assert response.status == 200
+    assert response.body["event"]["event_id"] == "351717"
+    assert response.body["data_status"] == "ok"
+    assert response.body["options"] == [
+        {
+            "market_question": "Will Canada win?",
+            "yes": {
+                "smart_wallet_count": 1,
+                "smart_amount": 1000.0,
+                "whale_wallet_count": 2,
+                "whale_amount": 2500.0,
+            },
+            "no": {
+                "smart_wallet_count": 0,
+                "smart_amount": 0.0,
+                "whale_wallet_count": 0,
+                "whale_amount": 0.0,
+            },
+        }
+    ]
+    assert "left join option_stats" in fake.queries[1]
+
+
+def test_product_api_event_smart_wallet_options_is_always_compact() -> None:
+    fake = FakeClickHouse(
+        outputs=[
+            '{"event_id":"351717","slug":"fifwc-can-bih-2026-06-12",'
+            '"title":"Canada vs. Bosnia and Herzegovina"}\n',
+            '{"market_question":"Will Canada win?","token_outcome":"No",'
+            '"outcome_side":"NO","selection":"Will Canada win? / NO",'
+            '"smart_wallet_count":0,"smart_amount":0,'
+            '"whale_wallet_count":0,"whale_amount":0}\n',
+        ]
+    )
+    api = ProductApi(clickhouse=fake)
+
+    response = api.handle(
+        "/events/smart-wallet-options",
+        {"event": ["fifwc-can-bih-2026-06-12"], "details": ["1"]},
+    )
+
+    assert response.status == 200
+    assert sorted(response.body.keys()) == ["data_status", "event", "message", "options"]
+    assert response.body["data_status"] == "ok"
+    assert response.body["options"] == [
+        {
+            "market_question": "Will Canada win?",
+            "yes": {
+                "smart_wallet_count": 0,
+                "smart_amount": 0.0,
+                "whale_wallet_count": 0,
+                "whale_amount": 0.0,
+            },
+            "no": {
+                "smart_wallet_count": 0,
+                "smart_amount": 0.0,
+                "whale_wallet_count": 0,
+                "whale_amount": 0.0,
+            },
+        }
+    ]
+
+
+def test_product_api_event_smart_wallet_options_not_found_is_empty_response() -> None:
+    fake = FakeClickHouse(outputs=[""])
+    api = ProductApi(clickhouse=fake)
+
+    response = api.handle(
+        "/events/smart-wallet-options",
+        {"event": ["fifwc-missing-2026-06-12"]},
+    )
+
+    assert response.status == 200
+    assert response.body["event"]["slug"] == "fifwc-missing-2026-06-12"
+    assert response.body["options"] == []
+    assert response.body["data_status"] == "event_not_found"
+    assert response.body["message"] == "No data is available for this event yet."
+
+
+def test_product_api_event_smart_wallet_options_no_markets_is_empty_response() -> None:
+    fake = FakeClickHouse(
+        outputs=[
+            '{"event_id":"351717","slug":"fifwc-can-bih-2026-06-12",'
+            '"title":"Canada vs. Bosnia and Herzegovina"}\n',
+            "",
+        ]
+    )
+    api = ProductApi(clickhouse=fake)
+
+    response = api.handle(
+        "/events/smart-wallet-options",
+        {"event": ["fifwc-can-bih-2026-06-12"]},
+    )
+
+    assert response.status == 200
+    assert response.body["event"]["event_id"] == "351717"
+    assert response.body["options"] == []
+    assert response.body["data_status"] == "no_options"
+    assert response.body["message"] == "No option data is available for this event yet."
+
+
+def test_product_api_event_smart_wallets_details_returns_wallet_rows() -> None:
+    fake = FakeClickHouse(
+        outputs=[
+            '{"event_id":"351717","slug":"fifwc-can-bih-2026-06-12",'
+            '"title":"Canada vs. Bosnia and Herzegovina"}\n',
+            '{"event_slug":"fifwc-can-bih-2026-06-12","event_title":"Canada vs. Bosnia and Herzegovina",'
+            '"smart_trade_count":2,"smart_wallet_count":2,"smart_traded_notional":1100.24}\n',
+            '{"event_slug":"fifwc-can-bih-2026-06-12","market_question":"Will Canada win?",'
+            '"token_outcome":"Yes","outcome_side":"YES","selection":"Will Canada win? / YES",'
+            '"smart_trade_count":1,"smart_wallet_count":1}\n',
+            '{"event_slug":"fifwc-can-bih-2026-06-12","market_question":"Will Canada win?",'
+            '"token_outcome":"Yes","outcome_side":"YES","selection":"Will Canada win? / YES",'
+            '"user_address":"0xabc","event_traded_notional":1000}\n',
+            "",
+        ]
+    )
+    api = ProductApi(clickhouse=fake)
+
+    response = api.handle(
+        "/events/smart-wallets",
+        {"event": ["fifwc-can-bih-2026-06-12"], "limit": ["5"], "details": ["1"]},
+    )
+
+    assert response.status == 200
+    assert response.body["event"]["event_id"] == "351717"
+    assert response.body["summary"]["smart_wallet_count"] == 2
+    assert response.body["outcomes"][0]["outcome_side"] == "YES"
+    assert response.body["outcomes"][0]["selection"] == "Will Canada win? / YES"
+    assert response.body["wallets"][0]["user_address"] == "0xabc"
+    assert response.body["positions"] == []
+    assert "slug = 'fifwc-can-bih-2026-06-12'" in fake.queries[0]
+    assert "upper(ifNull(tokens.outcome, '')) as outcome_side" in fake.queries[2]
+    assert "selection" in fake.queries[3]
+
+
 def test_product_api_alerts_and_liquidity_routes() -> None:
     fake = FakeClickHouse('{"token_id":"t1"}\n')
     api = ProductApi(clickhouse=fake)
@@ -330,10 +490,7 @@ def test_product_api_analytics_routes_are_read_only() -> None:
         assert response.status == 200
 
     joined = "\n".join(fake.queries).lower()
-    assert "delete" not in joined
-    assert "drop" not in joined
-    assert "insert" not in joined
-    assert "update" not in joined
+    assert not re.search(r"\b(delete|drop|insert|update)\b", joined)
 
 
 def test_event_and_wallet_analytics_require_scope() -> None:

@@ -170,3 +170,19 @@ Scale out:
 
 For dedicated WebSocket hosts, keep `zetta-ws-market.service` enabled only on those
 hosts to avoid duplicate raw streams.
+
+## Dedicated Wallet Helpers
+
+For wallet-heavy processing, use the dedicated helper-node runbook instead of starting
+generic workers on cloned machines. Generic workers can claim full-site trade, Gamma,
+price, or chain tasks; helper workers should claim only `wallet-portfolio` and
+`wallet-pnl`.
+
+Current production wallet-helper plan:
+
+- Master: [101.47.178.69](nodes/master-101.47.178.69.md)
+- Wallet helper 1: [101.47.179.91](nodes/wallet-helper-101.47.179.91.md)
+- Wallet helper 2: [101.47.176.154](nodes/wallet-helper-101.47.176.154.md)
+- Wallet helper 3: [101.47.176.175](nodes/wallet-helper-101.47.176.175.md)
+
+See [Distributed Wallet Workers](distributed-wallet-workers.md) for the full plan.
