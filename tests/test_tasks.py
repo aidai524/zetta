@@ -14,6 +14,7 @@ from zetta.cli import (
     cmd_tasks_seed_frontier,
     cmd_tasks_seed_history,
     cmd_tasks_seed_wallets,
+    parse_task_kinds,
 )
 from zetta.scheduler.runner import TaskRunner, task_execution_params
 from zetta.scheduler.tasks import (
@@ -63,6 +64,42 @@ def test_local_task_store_claims_lowest_priority_first(tmp_path) -> None:
 
     assert task is not None
     assert task.kind == "gamma-events"
+
+
+def test_local_task_store_filters_allowed_kinds(tmp_path) -> None:
+    seed_store = LocalTaskStore(tmp_path / "tasks.json")
+    seed_store.add_many(
+        [
+            Task(kind="trades", params={"market": "condition-1"}, priority=0),
+            Task(kind="wallet-pnl", params={"user": "0x1"}, priority=10),
+            Task(kind="wallet-portfolio", params={"user": "0x2"}, priority=20),
+        ]
+    )
+    wallet_store = LocalTaskStore(
+        tmp_path / "tasks.json",
+        allowed_kinds={"wallet-portfolio", "wallet-pnl"},
+    )
+
+    first = wallet_store.claim_next()
+    second = wallet_store.claim_next()
+    third = wallet_store.claim_next()
+
+    assert first is not None
+    assert first.kind == "wallet-pnl"
+    assert second is not None
+    assert second.kind == "wallet-portfolio"
+    assert third is None
+    tasks = seed_store.load()
+    assert [task.kind for task in tasks if task.status == "pending"] == ["trades"]
+
+
+def test_parse_task_kinds_accepts_repeated_and_comma_values() -> None:
+    assert parse_task_kinds(["wallet-portfolio,wallet-pnl", "activity"]) == {
+        "activity",
+        "wallet-pnl",
+        "wallet-portfolio",
+    }
+    assert parse_task_kinds([]) is None
 
 
 def test_task_source_entity_maps_known_task_kinds() -> None:

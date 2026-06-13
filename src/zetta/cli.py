@@ -401,12 +401,26 @@ def build_parser() -> argparse.ArgumentParser:
     progress.set_defaults(func=cmd_tasks_progress)
 
     run_once = task_subparsers.add_parser("run-once", help="Claim and run one pending task.")
+    run_once.add_argument(
+        "--task-kind",
+        action="append",
+        dest="task_kinds",
+        default=[],
+        help="Only claim tasks of this kind. Repeat or pass comma-separated values.",
+    )
     run_once.set_defaults(func=cmd_tasks_run_once)
 
     run_loop = task_subparsers.add_parser("run-loop", help="Continuously claim and run tasks.")
     run_loop.add_argument("--max-tasks", type=int, default=0, help="Use 0 to run forever.")
     run_loop.add_argument("--idle-sleep-seconds", type=float, default=5.0)
     run_loop.add_argument("--stop-on-idle", action="store_true")
+    run_loop.add_argument(
+        "--task-kind",
+        action="append",
+        dest="task_kinds",
+        default=[],
+        help="Only claim tasks of this kind. Repeat or pass comma-separated values.",
+    )
     run_loop.set_defaults(func=cmd_tasks_run_loop)
 
     load = subparsers.add_parser("load", help="Load raw data into analytical stores.")
@@ -1760,19 +1774,31 @@ def cmd_tasks_run_loop(args: argparse.Namespace, app_settings: Settings) -> Any:
 
 
 def task_store_for_args(args: argparse.Namespace, app_settings: Settings):
+    allowed_kinds = parse_task_kinds(getattr(args, "task_kinds", []))
     if args.task_store == "postgres":
         return PostgresTaskStore(
             dsn=app_settings.postgres_dsn,
             node_id=args.node_id,
             lease_seconds=args.lease_seconds,
+            allowed_kinds=allowed_kinds,
         )
-    return LocalTaskStore(Path(args.task_file))
+    return LocalTaskStore(Path(args.task_file), allowed_kinds=allowed_kinds)
 
 
 def run_store_for_args(args: argparse.Namespace, task_store):
     if args.task_store == "postgres":
         return task_store
     return LocalRunStore(Path(args.task_file).with_suffix(".runs.jsonl"))
+
+
+def parse_task_kinds(values: list[str]) -> set[str] | None:
+    kinds = {
+        item.strip()
+        for value in values
+        for item in value.split(",")
+        if item.strip()
+    }
+    return kinds or None
 
 
 def cmd_load_gamma_raw(args: argparse.Namespace, app_settings: Settings) -> Any:

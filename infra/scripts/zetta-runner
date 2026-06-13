@@ -28,12 +28,24 @@ fi
 case "$MODE" in
   worker)
     WORKER_PROCESSES="${ZETTA_WORKER_PROCESSES:-1}"
+    WORKER_TASK_KIND_ARGS=()
+    if [[ -n "${ZETTA_WORKER_TASK_KINDS:-}" ]]; then
+      IFS=',' read -r -a WORKER_TASK_KINDS <<< "$ZETTA_WORKER_TASK_KINDS"
+      for task_kind in "${WORKER_TASK_KINDS[@]}"; do
+        task_kind="${task_kind//[[:space:]]/}"
+        if [[ -n "$task_kind" ]]; then
+          WORKER_TASK_KIND_ARGS+=(--task-kind "$task_kind")
+        fi
+      done
+    fi
     if [[ "$WORKER_PROCESSES" -le 1 ]]; then
       exec "$ZETTA_PYTHON" -m zetta.cli \
         "${COMMON_ARGS[@]}" \
         --task-store postgres \
         --node-id "$ZETTA_NODE_ID" \
-        tasks run-loop --idle-sleep-seconds "$ZETTA_WORKER_IDLE_SECONDS"
+        tasks run-loop \
+          "${WORKER_TASK_KIND_ARGS[@]}" \
+          --idle-sleep-seconds "$ZETTA_WORKER_IDLE_SECONDS"
     fi
     pids=()
     stop_workers() {
@@ -48,7 +60,9 @@ case "$MODE" in
         "${COMMON_ARGS[@]}" \
         --task-store postgres \
         --node-id "${ZETTA_NODE_ID}-${index}" \
-        tasks run-loop --idle-sleep-seconds "$ZETTA_WORKER_IDLE_SECONDS" &
+        tasks run-loop \
+          "${WORKER_TASK_KIND_ARGS[@]}" \
+          --idle-sleep-seconds "$ZETTA_WORKER_IDLE_SECONDS" &
       pids+=("$!")
     done
     wait -n

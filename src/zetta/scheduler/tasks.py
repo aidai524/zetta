@@ -33,8 +33,9 @@ class Task:
 
 
 class LocalTaskStore:
-    def __init__(self, path: Path) -> None:
+    def __init__(self, path: Path, *, allowed_kinds: set[str] | None = None) -> None:
         self.path = path
+        self.allowed_kinds = allowed_kinds
         self.path.parent.mkdir(parents=True, exist_ok=True)
         if not self.path.exists():
             self.save([])
@@ -87,7 +88,7 @@ class LocalTaskStore:
         pending = [
             (index, task)
             for index, task in enumerate(tasks)
-            if task.status == "pending"
+            if task.status == "pending" and self._kind_allowed(task.kind)
         ]
         if not pending:
             return None
@@ -139,6 +140,9 @@ class LocalTaskStore:
                 return
         raise KeyError(f"Task not found: {task_id}")
 
+    def _kind_allowed(self, kind: str) -> bool:
+        return self.allowed_kinds is None or kind in self.allowed_kinds
+
     def _record_dead_letter(self, task_id: str, error: str) -> None:
         task = next((item for item in self.load() if item.id == task_id), None)
         payload = {
@@ -155,10 +159,18 @@ class LocalTaskStore:
 
 
 class PostgresTaskStore:
-    def __init__(self, *, dsn: str, node_id: str, lease_seconds: int = 300) -> None:
+    def __init__(
+        self,
+        *,
+        dsn: str,
+        node_id: str,
+        lease_seconds: int = 300,
+        allowed_kinds: set[str] | None = None,
+    ) -> None:
         self.dsn = dsn
         self.node_id = node_id
         self.lease_seconds = lease_seconds
+        self.allowed_kinds = allowed_kinds
 
     def add_many(self, new_tasks: list[Task]) -> int:
         psycopg, Jsonb = import_psycopg()
@@ -243,6 +255,11 @@ class PostgresTaskStore:
         return row_to_task(row) if row else None
 
     def _claim_with_status(self, cursor, *, where_sql: str, lease_expires_at: datetime):
+        params: list[Any] = [self.node_id, lease_expires_at]
+        kind_filter = ""
+        if self.allowed_kinds is not None:
+            kind_filter = "and task_type = any(%s)"
+            params.append(sorted(self.allowed_kinds))
         cursor.execute(
             f"""
             with candidate as
@@ -250,6 +267,7 @@ class PostgresTaskStore:
               select id
               from collector_tasks
               where {where_sql}
+                {kind_filter}
               order by priority asc, id asc
               limit 1
               for update skip locked
@@ -266,7 +284,7 @@ class PostgresTaskStore:
             returning task.id, task.task_type, task.params, task.status, task.attempts,
               task.created_at, task.updated_at, task.last_error, task.max_attempts, task.priority
             """,
-            (self.node_id, lease_expires_at),
+            params,
         )
         return cursor.fetchone()
 
