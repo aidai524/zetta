@@ -3,7 +3,7 @@ set -euo pipefail
 
 NODE_ID="${1:?usage: configure_wallet_helper.sh <node-id> <master-host> [worker-processes]}"
 MASTER_HOST="${2:?usage: configure_wallet_helper.sh <node-id> <master-host> [worker-processes]}"
-WORKER_PROCESSES="${3:-6}"
+WORKER_PROCESSES="${3:-4}"
 
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 ZETTA_HOME="${ZETTA_HOME:-/opt/zetta}"

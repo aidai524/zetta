@@ -33,6 +33,42 @@ This runbook describes the current wallet-processing split:
 The helper nodes use a wallet-only raw directory so cloned historical raw files from the
 master image are not replayed into ClickHouse.
 
+## Helper Resource Policy
+
+The three helper nodes are 16 CPU cores and 32 GB RAM. They should run a conservative
+wallet-only profile:
+
+- `ZETTA_WORKER_PROCESSES=4`
+- `ZETTA_WORKER_TASK_KINDS=wallet-portfolio,wallet-pnl`
+- `ZETTA_RAW_DIR=/var/lib/zetta/wallet-raw`
+- `ZETTA_STATE_DIR=/var/lib/zetta/wallet-state`
+
+Do not run local Postgres, ClickHouse, Redpanda, MinIO, API, WebSocket, chain, marts, or
+full-site frontier jobs on helper nodes.
+
+Keep on helper nodes:
+
+- `/opt/zetta/.venv`
+- `/opt/zetta/src`
+- `/etc/zetta/zetta.env`
+- `/usr/local/bin/zetta-runner`
+- `/var/lib/zetta/wallet-raw`
+- `/var/lib/zetta/wallet-state`
+- systemd units needed by `zetta-worker.service` and `zetta-load-trades-realtime.timer`
+
+Safe to remove on helper nodes after the wallet helper is configured:
+
+- `/var/lib/zetta/raw`
+- `/var/lib/zetta/state`
+- `/var/lib/zetta/quarantine`
+- cloned Docker volumes for local Postgres, ClickHouse, Redpanda, and MinIO
+- `apps/web/node_modules`
+- repo-local generated data under `/root/zetta/data` or `/opt/zetta/data`, except any
+  files you intentionally want to keep for debugging
+
+The helper loader timer is still named `zetta-load-trades-realtime.timer`, but with the
+wallet-only raw directory it only sees wallet helper raw files collected on that helper.
+
 ## Master Configuration
 
 Run on `101.47.178.69`:
