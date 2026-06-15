@@ -176,7 +176,7 @@ def build_parser() -> argparse.ArgumentParser:
     positions.set_defaults(func=cmd_positions)
 
     wallet_portfolio = collect_subparsers.add_parser(
-        "wallet-portfolio", help="Collect wallet portfolio value, PnL, and available balance."
+        "wallet-portfolio", help="Collect wallet positions, value, and available balance."
     )
     wallet_portfolio.add_argument("--user", required=True)
     wallet_portfolio.set_defaults(func=cmd_wallet_portfolio)

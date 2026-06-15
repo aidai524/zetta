@@ -249,8 +249,10 @@ def test_seed_wallets_adds_wallet_trade_and_activity_tasks(monkeypatch, tmp_path
             "include_trades": True,
             "include_activity": True,
             "include_wallet_portfolio": False,
+            "include_wallet_pnl": False,
             "refresh_run": "realtime-wallets",
             "requeue_done": True,
+            "wallets": [],
         },
     )()
 
@@ -272,7 +274,7 @@ def test_seed_wallets_can_use_smart_candidate_wallets(monkeypatch, tmp_path) -> 
             pass
 
         def query_text(self, query):
-            assert "mart_trader_profile final" in query
+            assert "mart_wallet_screener final" in query
             assert "traded_notional >= 10000.0" in query
             return '{"user_address":"0xabc"}\n{"user_address":"0xdef"}\n'
 
@@ -294,8 +296,10 @@ def test_seed_wallets_can_use_smart_candidate_wallets(monkeypatch, tmp_path) -> 
             "include_trades": False,
             "include_activity": False,
             "include_wallet_portfolio": True,
+            "include_wallet_pnl": False,
             "refresh_run": "smart-candidates",
             "requeue_done": True,
+            "wallets": [],
         },
     )()
 

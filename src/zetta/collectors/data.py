@@ -208,7 +208,6 @@ class DataCollector:
         raw_paths: list[str] = []
         positions = self.client.data_positions(user=wallet)
         value = self.client.data_value(user=wallet)
-        pnl = self.client.user_pnl(user=wallet)
         raw_paths.append(
             str(
                 self.raw_writer.write(
@@ -219,12 +218,11 @@ class DataCollector:
                 )
             )
         )
-        items = len(positions.items) + len(value.items) + len(pnl.items)
+        items = len(positions.items) + len(value.items)
         aggregate: dict[str, object] = {
             "user": wallet,
             "positions": positions.response.body,
             "value": value.response.body,
-            "pnl": pnl.response.body,
         }
         if self.rpc_client is not None:
             balance = self.pusd_balance(user)

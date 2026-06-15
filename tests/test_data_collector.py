@@ -54,6 +54,47 @@ class OffsetLimitedTradesClient:
         )
 
 
+class WalletPortfolioClient:
+    def __init__(self) -> None:
+        self.user_pnl_calls = 0
+
+    def data_positions(self, *, user: str):
+        items = [{"proxyWallet": user, "currentValue": 24.2423}]
+        return Page(
+            response=HttpResponse(
+                url=f"https://example.test/positions?user={user}",
+                status=200,
+                headers={},
+                body=items,
+            ),
+            items=items,
+        )
+
+    def data_value(self, *, user: str):
+        items = [{"user": user, "value": 24.2423}]
+        return Page(
+            response=HttpResponse(
+                url=f"https://example.test/value?user={user}",
+                status=200,
+                headers={},
+                body=items,
+            ),
+            items=items,
+        )
+
+    def user_pnl(self, **_kwargs):
+        self.user_pnl_calls += 1
+        raise AssertionError("wallet portfolio collection should not call user_pnl")
+
+
+class WalletPortfolioRpcClient:
+    def eth_call(self, *, to: str, data: str, block: str = "latest") -> str:
+        assert to
+        assert data.startswith("0x70a08231")
+        assert block == "latest"
+        return "0x1"
+
+
 def test_trades_collector_max_pages_zero_runs_until_short_page(tmp_path) -> None:
     raw_writer = FakeRawWriter()
     client = PagedTradesClient()
@@ -87,3 +128,28 @@ def test_trades_collector_stops_at_data_api_offset_limit(tmp_path) -> None:
     assert result.next_offset == 2
     assert client.calls == 2
     assert len(raw_writer.records) == 1
+
+
+def test_wallet_portfolio_collector_does_not_fetch_user_pnl(tmp_path) -> None:
+    raw_writer = FakeRawWriter()
+    client = WalletPortfolioClient()
+    collector = DataCollector(
+        client=client,
+        raw_writer=raw_writer,
+        state_store=LocalStateStore(tmp_path),
+        rpc_client=WalletPortfolioRpcClient(),
+    )
+
+    result = collector.collect_wallet_portfolio(user="0x00000000000000000000000000000000000000AB")
+
+    assert result.entity == "wallet_portfolio"
+    assert result.pages == 2
+    assert result.items == 3
+    assert client.user_pnl_calls == 0
+    assert [record["entity"] for record in raw_writer.records] == ["positions", "wallet_portfolio"]
+    aggregate = raw_writer.records[1]["payload"]
+    assert aggregate["user"] == "0x00000000000000000000000000000000000000ab"
+    assert "positions" in aggregate
+    assert "value" in aggregate
+    assert "availableBalance" in aggregate
+    assert "pnl" not in aggregate

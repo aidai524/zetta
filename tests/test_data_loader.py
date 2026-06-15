@@ -203,6 +203,27 @@ def test_wallet_portfolio_rows_from_aggregate() -> None:
     assert rows[0]["total_pnl"] == 154.27983
 
 
+def test_wallet_portfolio_rows_from_aggregate_without_pnl() -> None:
+    rows = wallet_portfolio_rows(
+        {
+            "user": "0xABC",
+            "positions": [
+                {"proxyWallet": "0xABC", "currentValue": 24.2423},
+                {"proxyWallet": "0xABC", "currentValue": 0, "redeemable": True},
+            ],
+            "value": [{"user": "0xABC", "value": 24.2423}],
+            "availableBalance": 1.202269,
+        },
+        __import__("datetime").datetime(2026, 1, 1),
+    )
+
+    assert rows[0]["position_count"] == 1
+    assert rows[0]["positions_value"] == 24.2423
+    assert rows[0]["available_balance"] == 1.202269
+    assert rows[0]["portfolio_value"] == 25.444569
+    assert rows[0]["total_pnl"] == 0.0
+
+
 def test_open_interest_rows_normalize_values() -> None:
     rows = open_interest_rows(
         [{"market": "condition-1", "value": 123.45}],
@@ -235,7 +256,14 @@ def test_data_trades_loader_uses_raw_path_high_watermark(tmp_path) -> None:
 
     assert result.raw_records == 1
     assert any("max(raw_path)" in query for query in fake.queries)
-    assert not any("SELECT payload_hash" in query for query in fake.queries)
+    assert not any(
+        "SELECT payload_hash" in query and "startsWith(raw_path" not in query
+        for query in fake.queries
+    )
+    assert any(
+        "SELECT payload_hash" in query and "startsWith(raw_path" in query
+        for query in fake.queries
+    )
 
 
 def test_data_trades_loader_can_load_latest_files_first_with_limit(tmp_path) -> None:
