@@ -14,7 +14,7 @@ Polymarket API error rates and memory are stable.
 ```bash
 cd /root/zetta
 git pull --ff-only origin main
-sudo bash scripts/configure_wallet_helper.sh wallet-helper-2 101.47.178.69 4
+sudo bash scripts/configure_wallet_helper.sh wallet-helper-2 10.17.12.97 4
 ```
 
 ## Cleanup Cloned Master Data
@@ -43,7 +43,7 @@ sudo rm -rf /root/zetta/apps/web/node_modules /opt/zetta/apps/web/node_modules 2
 sudo find /root/zetta/data /opt/zetta/data -mindepth 1 -maxdepth 1 ! -name exports -exec rm -rf {} + 2>/dev/null || true
 
 sudo systemctl daemon-reload
-sudo bash scripts/configure_wallet_helper.sh wallet-helper-2 101.47.178.69 4
+sudo bash scripts/configure_wallet_helper.sh wallet-helper-2 10.17.12.97 4
 ```
 
 ## Expected Environment
@@ -55,8 +55,8 @@ grep -E 'ZETTA_NODE_ID|ZETTA_POSTGRES_DSN|ZETTA_CLICKHOUSE_HOST|ZETTA_RAW_DIR|ZE
 Expected values:
 
 - `ZETTA_NODE_ID=wallet-helper-2`
-- `ZETTA_POSTGRES_DSN=postgresql://zetta:zetta@101.47.178.69:55432/zetta`
-- `ZETTA_CLICKHOUSE_HOST=101.47.178.69`
+- `ZETTA_POSTGRES_DSN=postgresql://zetta:zetta@10.17.12.97:55432/zetta`
+- `ZETTA_CLICKHOUSE_HOST=10.17.12.97`
 - `ZETTA_RAW_DIR=/var/lib/zetta/wallet-raw`
 - `ZETTA_STATE_DIR=/var/lib/zetta/wallet-state`
 - `ZETTA_WORKER_TASK_KINDS=wallet-portfolio,wallet-pnl`
@@ -68,5 +68,5 @@ Expected values:
 systemctl status zetta-worker.service --no-pager
 systemctl list-timers 'zetta-*' --all --no-pager
 journalctl -u zetta-worker.service -n 80 --no-pager
-curl -sS 'http://101.47.178.69:8123/?user=zetta&password=zetta&query=select%201'
+curl -sS 'http://10.17.12.97:8123/?user=zetta&password=zetta&query=select%201'
 ```

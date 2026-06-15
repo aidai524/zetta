@@ -20,6 +20,7 @@ from zetta.scheduler.runner import TaskRunner, task_execution_params
 from zetta.scheduler.tasks import (
     LocalRunStore,
     LocalTaskStore,
+    PostgresTaskStore,
     Task,
     requeue_done_task,
     row_to_task,
@@ -91,6 +92,37 @@ def test_local_task_store_filters_allowed_kinds(tmp_path) -> None:
     assert third is None
     tasks = seed_store.load()
     assert [task.kind for task in tasks if task.status == "pending"] == ["trades"]
+
+
+def test_postgres_task_store_claim_orders_kind_filter_before_lease_params() -> None:
+    class FakeCursor:
+        def __init__(self) -> None:
+            self.sql = ""
+            self.params = None
+
+        def execute(self, sql, params) -> None:
+            self.sql = sql
+            self.params = params
+
+        def fetchone(self):
+            return None
+
+    now = datetime(2026, 1, 1, tzinfo=UTC)
+    cursor = FakeCursor()
+    store = PostgresTaskStore(
+        dsn="postgresql://example",
+        node_id="wallet-helper-2-1",
+        allowed_kinds={"wallet-pnl", "wallet-portfolio"},
+    )
+
+    store._claim_with_status(cursor, where_sql="status = 'pending'", lease_expires_at=now)
+
+    assert "task_type = any(%s::text[])" in cursor.sql
+    assert cursor.params == [
+        ["wallet-pnl", "wallet-portfolio"],
+        "wallet-helper-2-1",
+        now,
+    ]
 
 
 def test_parse_task_kinds_accepts_repeated_and_comma_values() -> None:

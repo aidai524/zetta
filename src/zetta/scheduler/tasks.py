@@ -255,11 +255,12 @@ class PostgresTaskStore:
         return row_to_task(row) if row else None
 
     def _claim_with_status(self, cursor, *, where_sql: str, lease_expires_at: datetime):
-        params: list[Any] = [self.node_id, lease_expires_at]
+        params: list[Any] = []
         kind_filter = ""
         if self.allowed_kinds is not None:
-            kind_filter = "and task_type = any(%s)"
+            kind_filter = "and task_type = any(%s::text[])"
             params.append(sorted(self.allowed_kinds))
+        params.extend([self.node_id, lease_expires_at])
         cursor.execute(
             f"""
             with candidate as
