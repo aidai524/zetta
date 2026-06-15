@@ -1,0 +1,12 @@
+[Unit]
+Description=Prune old Zetta raw collector files daily
+
+[Timer]
+OnBootSec=15min
+OnCalendar=*-*-* 03:30:00
+Persistent=true
+RandomizedDelaySec=30min
+Unit=zetta-prune-raw.service
+
+[Install]
+WantedBy=timers.target

@@ -121,13 +121,13 @@ class TaskRunner:
                 raw_writer=self.raw_writer,
                 state_store=self.state_store,
             ).collect_keyset("markets", **params)
-        elif task.kind == "trades":
+        elif task.kind in {"trades", "wallet-trades"}:
             result = DataCollector(
                 client=self.client,
                 raw_writer=self.raw_writer,
                 state_store=self.state_store,
             ).collect_trades(**params)
-        elif task.kind == "activity":
+        elif task.kind in {"activity", "wallet-activity"}:
             result = DataCollector(
                 client=self.client,
                 raw_writer=self.raw_writer,

@@ -1,6 +1,8 @@
+import json
 import re
 
 from zetta.api import ProductApi, ch_string, collect_system_stats, int_param, rows_json
+from zetta.config import Settings
 
 
 class FakeClickHouse:
@@ -218,6 +220,306 @@ def test_product_api_wallet_screener_smart_mode_uses_roi_definition() -> None:
     assert "screener.traded_notional >= 10000.0" in query
     assert "screener.pnl_roi >= 0.55" in query
     assert "screener.pnl_roi desc" in query
+
+
+def test_product_api_wallet_detail_returns_portfolio_pnl_and_activity() -> None:
+    portfolio_raw = {
+        "positions": [
+            {
+                "asset": "asset-1",
+                "conditionId": "c1",
+                "title": "Spread: Germany (-3.5)",
+                "slug": "fifwc-ger-kor-2026-06-14-spread-home-3pt5",
+                "eventSlug": "fifwc-ger-kor-2026-06-14-more-markets",
+                "outcome": "Germany",
+                "size": 100,
+                "avgPrice": 0.5,
+                "curPrice": 0.8,
+                "initialValue": 50,
+                "currentValue": 80,
+                "cashPnl": 30,
+                "percentPnl": 60,
+                "redeemable": False,
+            },
+            {
+                "asset": "asset-2",
+                "conditionId": "c2",
+                "title": "Old market",
+                "slug": "mlb-old",
+                "eventSlug": "mlb-old",
+                "outcome": "Team",
+                "size": 10,
+                "avgPrice": 0.4,
+                "curPrice": 0,
+                "initialValue": 4,
+                "currentValue": 0,
+                "cashPnl": -4,
+                "percentPnl": -100,
+                "redeemable": True,
+            },
+        ]
+    }
+    pnl_raw = {"points": [{"t": 1781481600, "p": 1000.5}, {"t": 1781568000, "p": 1200.25}]}
+    fake = FakeClickHouse(
+        outputs=[
+            (
+                '{"user_address":"0xabc","captured_at":"2026-06-14 18:51:07.344",'
+                '"position_count":2,"positions_value":80,"portfolio_value":85,'
+                '"available_balance":5,"total_pnl":900,'
+                f'"raw_json":{json.dumps(json.dumps(portfolio_raw))}}}\n'
+            ),
+            (
+                '{"user_address":"0xabc","captured_at":"2026-06-15 07:36:07.032",'
+                '"total_pnl":1200.25,'
+                f'"raw_json":{json.dumps(json.dumps(pnl_raw))}}}\n'
+            ),
+            (
+                '{"user_address":"0xabc","activity_count":10,"trade_activity_count":8,'
+                '"buy_count":6,"sell_count":2,"traded_size":1000,'
+                '"traded_notional":500,"buy_notional":350,"sell_notional":150,'
+                '"activity_count_24h":3,"trade_activity_count_24h":2,'
+                '"traded_notional_24h":100,"trade_activity_count_7d":7,'
+                '"traded_notional_7d":420,"avg_bet":62.5,'
+                '"latest_activity_type":"TRADE",'
+                '"latest_side":"BUY","first_activity_at":"2026-06-11 00:00:00.000",'
+                '"last_activity_at":"2026-06-15 03:03:13.000"}\n'
+            ),
+            '{"activity_type":"TRADE","count":8,"notional":500}\n',
+            (
+                '{"timestamp":"2026-06-15 03:03:13.000","activity_type":"TRADE",'
+                '"side":"BUY","price":0.52,"size":10,"notional":5.2,'
+                '"condition_id":"c1","token_id":"asset-1","transaction_hash":"0xhash",'
+                '"title":"Spread: Germany (-3.5)","slug":"fifwc-ger-kor-2026-06-14-spread-home-3pt5",'
+                '"event_slug":"fifwc-ger-kor-2026-06-14-more-markets","outcome":"Germany"}\n'
+            ),
+            (
+                '{"user_address":"0xabc","completed_event_count":10,'
+                '"profitable_event_count":6,"losing_event_count":4,"win_rate":0.6,'
+                '"realized_pnl":150,"avg_event_roi":0.12,"best_event_pnl":50,'
+                '"worst_event_pnl":-30,"active_position_count":2,"active_event_count":1,'
+                '"active_unrealized_pnl_estimate":80,"favorite_category":"sports",'
+                '"favorite_category_notional":400,"first_trade_at":"2026-06-11 00:00:00.000",'
+                '"last_trade_at":"2026-06-15 03:03:13.000"}\n'
+            ),
+        ]
+    )
+    api = ProductApi(clickhouse=fake)
+
+    response = api.handle(
+        "/wallets/detail",
+        {
+            "user": ["0xABC"],
+            "position_scope": ["worldcup"],
+            "position_limit": ["5"],
+            "pnl_points_limit": ["1"],
+        },
+    )
+
+    assert response.status == 200
+    body = response.body
+    assert body["wallet"]["user_address"] == "0xabc"
+    assert body["wallet"]["latest_total_pnl"] == 1200.25
+    assert body["wallet"]["portfolio_value"] == 85.0
+    assert body["wallet"]["cash"] == 5.0
+    assert body["wallet"]["pnl_7d"] == 0.0
+    assert body["wallet"]["trade_volume_7d"] == 420.0
+    assert body["wallet"]["trade_count_7d"] == 7
+    assert body["wallet"]["avg_bet"] == 62.5
+    assert body["wallet"]["win_rate"] == 0.6
+    assert body["position_summary"]["position_count"] == 2
+    assert body["position_summary"]["worldcup_position_count"] == 1
+    assert body["positions_available"] == 1
+    assert body["positions"][0]["slug"] == "fifwc-ger-kor-2026-06-14-spread-home-3pt5"
+    assert body["positions"][0]["is_worldcup"] is True
+    assert body["pnl_point_count"] == 1
+    assert body["pnl_points"][0]["pnl"] == 1200.25
+    assert body["activity_summary"]["trade_activity_count"] == 8
+    assert body["activity_by_type"][0]["activity_type"] == "TRADE"
+    assert body["reputation"]["completed_event_count"] == 10
+    assert body["recent_activity"][0]["title"] == "Spread: Germany (-3.5)"
+    assert "from fact_wallet_portfolio_snapshot" in fake.queries[0]
+    assert "from fact_wallet_pnl_snapshot" in fake.queries[1]
+    assert "from fact_user_activity" in fake.queries[2]
+
+
+def test_product_api_wallet_detail_not_found() -> None:
+    fake = FakeClickHouse(outputs=["", "", "", "", "", ""])
+    api = ProductApi(clickhouse=fake)
+
+    response = api.handle("/wallets/detail", {"user": ["0xmissing"]})
+
+    assert response.status == 404
+    assert response.body == {"error": "wallet_not_found"}
+
+
+def test_product_api_wallet_detail_refresh_enqueues_high_priority_tasks(monkeypatch) -> None:
+    captured = {}
+
+    class FakeTaskStore:
+        def __init__(self, **kwargs) -> None:
+            captured["kwargs"] = kwargs
+
+        def add_many(self, tasks):
+            captured["tasks"] = tasks
+            return len(tasks)
+
+    fake = FakeClickHouse(outputs=["", "", "", "", "", ""])
+    monkeypatch.setattr("zetta.api.PostgresTaskStore", FakeTaskStore)
+    api = ProductApi(clickhouse=fake, settings=Settings(postgres_dsn="postgresql://example"))
+
+    response = api.handle("/wallets/detail", {"user": ["0xABC"], "refresh": ["1"]})
+
+    assert response.status == 404
+    assert response.body == {"error": "wallet_not_found"}
+    assert captured["kwargs"]["dsn"] == "postgresql://example"
+    tasks = captured["tasks"]
+    assert {task.kind for task in tasks} == {
+        "wallet-activity",
+        "wallet-pnl",
+        "wallet-portfolio",
+        "wallet-trades",
+    }
+    assert {task.priority for task in tasks} == {-2}
+    assert {task.params["user"] for task in tasks} == {"0xabc"}
+    assert all(task.params["_requeue_done"] is True for task in tasks)
+
+
+def test_product_api_tasks_nodes_returns_node_progress(monkeypatch) -> None:
+    calls = {"count": 0}
+
+    class FakeTaskStore:
+        def __init__(self, **kwargs) -> None:
+            self.kwargs = kwargs
+
+        def node_progress(self, *, lookback_minutes):
+            calls["count"] += 1
+            return {
+                "lookback_minutes": lookback_minutes,
+                "nodes": [{"node_id": "wallet-helper-1-1", "role": "wallet-helper"}],
+                "totals": {"nodes": 1},
+            }
+
+    monkeypatch.setattr("zetta.api.PostgresTaskStore", FakeTaskStore)
+    api = ProductApi(clickhouse=FakeClickHouse(), settings=Settings(postgres_dsn="postgresql://example"))
+
+    response = api.handle("/tasks/nodes", {"lookback_minutes": ["15"]})
+    cached_response = api.handle("/tasks/nodes", {"lookback_minutes": ["15"]})
+
+    assert response.status == 200
+    assert response.body["lookback_minutes"] == 15
+    assert response.body["nodes"][0]["node_id"] == "wallet-helper-1-1"
+    assert cached_response.body == response.body
+    assert calls["count"] == 1
+
+
+def test_product_api_tasks_progress_uses_short_cache(monkeypatch) -> None:
+    calls = {"count": 0}
+
+    class FakeTaskStore:
+        def __init__(self, **kwargs) -> None:
+            self.kwargs = kwargs
+
+        def progress(self, *, recent_limit):
+            calls["count"] += 1
+            return {"recent_limit": recent_limit, "summary": {"done": calls["count"]}}
+
+    monkeypatch.setattr("zetta.api.PostgresTaskStore", FakeTaskStore)
+    api = ProductApi(clickhouse=FakeClickHouse(), settings=Settings(postgres_dsn="postgresql://example"))
+
+    response = api.handle("/tasks/progress", {"recent_limit": ["8"]})
+    cached_response = api.handle("/tasks/progress", {"recent_limit": ["8"]})
+
+    assert response.status == 200
+    assert response.body["recent_limit"] == 8
+    assert cached_response.body == response.body
+    assert calls["count"] == 1
+
+
+def test_product_api_worldcup_wallet_rankings_defaults_to_compact_response() -> None:
+    fake = FakeClickHouse(outputs=worldcup_positive_wallet_outputs())
+    api = ProductApi(clickhouse=fake)
+
+    response = api.handle("/worldcup/wallet-rankings", {"slug": ["fifwc-can-bih-2026-06-12"]})
+
+    assert response.status == 200
+    body = response.body
+    assert body["data_status"] == "ok"
+    assert body["scope"]["input_slug_count"] == 4
+    assert body["cumulative_profit_wallets"][0]["user_address"] == "0xabc"
+    assert body["cumulative_profit_wallets"][0]["rank_metric"]["pnl"] == 50.0
+    assert "matches" not in body["cumulative_profit_wallets"][0]
+
+
+def test_product_api_worldcup_wallet_rankings_can_include_details() -> None:
+    fake = FakeClickHouse(outputs=worldcup_positive_wallet_outputs())
+    api = ProductApi(clickhouse=fake)
+
+    response = api.handle(
+        "/worldcup/wallet-rankings",
+        {"slug": ["fifwc-can-bih-2026-06-12"], "details": ["true"]},
+    )
+
+    assert response.status == 200
+    first = response.body["cumulative_profit_wallets"][0]
+    assert first["matches"][0]["match_slug"] == "fifwc-can-bih-2026-06-12"
+    assert first["matches"][0]["tokens"][0]["mark_price_source"] == "price_history"
+
+
+def test_product_api_worldcup_wallet_rankings_supports_exact_slug_mode() -> None:
+    fake = FakeClickHouse(outputs=worldcup_positive_wallet_outputs())
+    api = ProductApi(clickhouse=fake)
+
+    response = api.handle(
+        "/worldcup/wallet-rankings",
+        {
+            "slug": ["fifwc-can-bih-2026-06-12"],
+            "expand_variants": ["false"],
+        },
+    )
+
+    assert response.status == 200
+    assert response.body["scope"]["input_slugs"] == ["fifwc-can-bih-2026-06-12"]
+
+
+def test_product_api_worldcup_wallet_rankings_uses_short_cache() -> None:
+    fake = FakeClickHouse(outputs=worldcup_positive_wallet_outputs())
+    api = ProductApi(clickhouse=fake)
+
+    first = api.handle("/worldcup/wallet-rankings", {"slug": ["fifwc-can-bih-2026-06-12"]})
+    second = api.handle("/worldcup/wallet-rankings", {"slug": ["fifwc-can-bih-2026-06-12"]})
+
+    assert first.status == 200
+    assert second.status == 200
+    assert len(fake.queries) == 4
+    assert second.body["cumulative_profit_wallets"][0]["user_address"] == "0xabc"
+
+
+def worldcup_positive_wallet_outputs() -> list[str]:
+    return [
+        (
+            '{"event_id":"e1","event_slug":"fifwc-can-bih-2026-06-12",'
+            '"event_title":"Canada vs Bosnia and Herzegovina","market_id":"m1",'
+            '"condition_id":"c1","market_question":"Canada vs Bosnia and Herzegovina",'
+            '"token_id":"t1","outcome":"Canada"}\n'
+        ),
+        (
+            '{"condition_id":"c1","token_id":"t1","user_address":"0xabc",'
+            '"trade_count":1,"buy_count":1,"sell_count":0,"buy_size":200,'
+            '"sell_size":0,"buy_notional":100,"sell_notional":0,'
+            '"traded_notional":100,"last_trade_price":0.5,'
+            '"first_trade_at":"2026-06-12 12:00:00.000",'
+            '"last_trade_at":"2026-06-12 12:00:00.000"}\n'
+        ),
+        (
+            '{"token_id":"t1","last_trade_at":"2026-06-12 12:00:00.000",'
+            '"last_trade_price":0.5}\n'
+        ),
+        (
+            '{"token_id":"t1","book_best_bid":null,"book_best_ask":null,'
+            '"book_mark_at":null,"price_history_price":0.75,'
+            '"price_history_at":"2026-06-12 12:01:00.000"}\n'
+        ),
+    ]
 
 
 def test_product_api_wallet_summary_counts_screened_wallets() -> None:

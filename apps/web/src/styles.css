@@ -182,6 +182,24 @@ nav {
   padding: 0;
 }
 
+.iconButton.small {
+  width: 30px;
+  height: 30px;
+  min-height: 30px;
+}
+
+.iconButton.danger:hover {
+  border-color: rgba(251, 113, 133, 0.55);
+  color: #fecdd3;
+}
+
+.commandButton {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: 8px;
+}
+
 .notice {
   display: flex;
   align-items: center;
@@ -203,7 +221,8 @@ nav {
 }
 
 .workspaceMain,
-.leaderboardPage {
+.leaderboardPage,
+.trackedWalletPage {
   min-width: 0;
 }
 
@@ -362,13 +381,15 @@ nav {
 }
 
 .marketRows,
-.leaderRows {
+.leaderRows,
+.trackedTable {
   width: 100%;
   overflow-x: auto;
 }
 
 .marketRow,
-.leaderRow {
+.leaderRow,
+.trackedRow {
   display: grid;
   grid-template-columns: minmax(240px, 1fr) 68px 74px 92px 92px 70px;
   align-items: center;
@@ -387,12 +408,15 @@ nav {
 
 .marketRow:hover,
 .marketRow.active,
-.leaderRow:hover {
+.leaderRow:hover,
+.trackedRow:hover,
+.trackedRow.active {
   background: #121b29;
 }
 
 .marketHeader,
-.leaderHeader {
+.leaderHeader,
+.trackedHeader {
   min-height: 38px;
   color: var(--muted);
   font-size: 12px;
@@ -628,6 +652,135 @@ nav {
   min-width: 660px;
 }
 
+.trackedToolbar {
+  display: grid;
+  grid-template-columns: minmax(260px, 1.2fr) minmax(180px, 0.8fr) auto;
+  gap: 10px;
+  margin-bottom: 12px;
+}
+
+.trackedInput {
+  display: grid;
+  grid-template-columns: auto minmax(0, 1fr);
+  align-items: center;
+  gap: 10px;
+}
+
+.trackedInput svg {
+  color: var(--muted);
+}
+
+.trackedLayout {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) 380px;
+  gap: 16px;
+  align-items: start;
+}
+
+.trackedRow {
+  grid-template-columns:
+    minmax(180px, 1.1fr)
+    110px
+    150px
+    100px
+    145px
+    105px
+    112px;
+  min-width: 940px;
+}
+
+.trackedRow:not(.trackedHeader) {
+  cursor: pointer;
+}
+
+.walletNameCell,
+.stackedMetric {
+  display: grid;
+  gap: 4px;
+  min-width: 0;
+}
+
+.walletNameCell strong,
+.walletPosition strong {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.walletNameCell small,
+.stackedMetric small,
+.walletPosition small,
+.mutedText {
+  color: var(--muted);
+  font-size: 12px;
+}
+
+.stackedMetric.right {
+  text-align: right;
+}
+
+.rowActions {
+  display: flex;
+  justify-content: flex-end;
+  gap: 6px;
+}
+
+.trackedEmpty {
+  padding: 24px 14px;
+}
+
+.walletDetailPanel {
+  position: sticky;
+  top: 22px;
+}
+
+.walletDetailPanel code {
+  color: var(--muted);
+  font-size: 12px;
+}
+
+.walletDetailHero {
+  display: grid;
+  gap: 5px;
+  border: 1px solid var(--line-soft);
+  border-radius: 7px;
+  background: #0b111c;
+  padding: 12px;
+}
+
+.walletDetailHero span,
+.walletDetailHero small {
+  color: var(--muted);
+  font-size: 12px;
+}
+
+.walletDetailHero strong {
+  font-size: 30px;
+}
+
+.walletPositionList {
+  display: grid;
+  gap: 8px;
+}
+
+.walletPosition {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+  align-items: center;
+  gap: 10px;
+  border-top: 1px solid var(--line-soft);
+  padding-top: 9px;
+}
+
+.walletPosition:first-child {
+  border-top: 0;
+  padding-top: 0;
+}
+
+.activityList.compact {
+  max-height: 360px;
+}
+
 .winsRows .leaderRow {
   grid-template-columns: 78px minmax(230px, 0.9fr) minmax(260px, 1.2fr) 140px;
   min-width: 760px;
@@ -830,12 +983,17 @@ th {
 
 @media (max-width: 1180px) {
   .marketWorkspace,
-  .leaderboardGrid {
+  .leaderboardGrid,
+  .trackedLayout {
     grid-template-columns: 1fr;
   }
 
   .workspaceSide {
     grid-template-columns: repeat(2, minmax(0, 1fr));
+  }
+
+  .walletDetailPanel {
+    position: static;
   }
 
   .livePanel,
@@ -886,6 +1044,10 @@ th {
   .boardToolbar {
     align-items: stretch;
     flex-direction: column;
+  }
+
+  .trackedToolbar {
+    grid-template-columns: 1fr;
   }
 
   .segmentedControl {

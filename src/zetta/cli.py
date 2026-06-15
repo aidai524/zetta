@@ -48,6 +48,7 @@ FRONTIER_TRADES_PRIORITY = 3
 FRONTIER_PRICE_HISTORY_PRIORITY = 4
 FRONTIER_BOOK_PRIORITY = 5
 WALLET_REFRESH_PRIORITY = 2
+WALLET_EXPLICIT_REFRESH_PRIORITY = -2
 WALLET_PORTFOLIO_PRIORITY = 0
 WALLET_PNL_PRIORITY = -1
 DISCOVERY_PRIORITY = 50
@@ -1378,6 +1379,10 @@ def merge_wallet_lists(primary: list[str], extra: list[str]) -> list[str]:
     return wallets
 
 
+def normalize_wallet_list(wallets: list[str]) -> list[str]:
+    return merge_wallet_lists([], wallets)
+
+
 def cmd_tasks_seed_basic(args: argparse.Namespace, app_settings: Settings) -> Any:
     store = task_store_for_args(args, app_settings)
     trade_max_pages = args.max_pages if args.max_pages > 0 else 1
@@ -1423,16 +1428,30 @@ def cmd_tasks_seed_wallets(args: argparse.Namespace, app_settings: Settings) -> 
         )
     store = task_store_for_args(args, app_settings)
     refresh_run = args.refresh_run or datetime.now(UTC).replace(microsecond=0).isoformat()
-    wallets = discover_wallet_candidates(
-        ClickHouseWriter(app_settings),
-        wallet_limit=args.wallet_limit,
-        mode=args.candidate_mode,
-        since_hours=args.since_hours,
-        min_notional=args.min_notional,
-    )
-    wallets = merge_wallet_lists(wallets, args.wallets)
+    explicit_wallets = normalize_wallet_list(args.wallets)
+    candidate_wallets = []
+    if args.wallet_limit > 0:
+        candidate_wallets = discover_wallet_candidates(
+            ClickHouseWriter(app_settings),
+            wallet_limit=args.wallet_limit,
+            mode=args.candidate_mode,
+            since_hours=args.since_hours,
+            min_notional=args.min_notional,
+        )
+    elif not explicit_wallets:
+        raise ValueError("wallet_limit must be positive unless at least one --wallet is provided")
+    wallets = merge_wallet_lists(candidate_wallets, explicit_wallets)
+    explicit_wallet_set = set(explicit_wallets)
     tasks: list[Task] = []
     for wallet in wallets:
+        is_explicit_wallet = wallet in explicit_wallet_set
+        wallet_refresh_priority = (
+            WALLET_EXPLICIT_REFRESH_PRIORITY if is_explicit_wallet else WALLET_REFRESH_PRIORITY
+        )
+        wallet_portfolio_priority = (
+            WALLET_EXPLICIT_REFRESH_PRIORITY if is_explicit_wallet else WALLET_PORTFOLIO_PRIORITY
+        )
+        wallet_pnl_priority = WALLET_EXPLICIT_REFRESH_PRIORITY if is_explicit_wallet else WALLET_PNL_PRIORITY
         base_params = {
             "user": wallet,
             "page_limit": min(args.page_limit, 500),
@@ -1445,17 +1464,17 @@ def cmd_tasks_seed_wallets(args: argparse.Namespace, app_settings: Settings) -> 
         if args.include_trades:
             tasks.append(
                 Task(
-                    kind="trades",
+                    kind="wallet-trades",
                     params={**base_params, "market": None, "event_id": None},
-                    priority=WALLET_REFRESH_PRIORITY,
+                    priority=wallet_refresh_priority,
                 )
             )
         if args.include_activity:
             tasks.append(
                 Task(
-                    kind="activity",
+                    kind="wallet-activity",
                     params=dict(base_params),
-                    priority=WALLET_REFRESH_PRIORITY,
+                    priority=wallet_refresh_priority,
                 )
             )
         if args.include_wallet_portfolio:
@@ -1466,7 +1485,7 @@ def cmd_tasks_seed_wallets(args: argparse.Namespace, app_settings: Settings) -> 
                 Task(
                     kind="wallet-portfolio",
                     params=portfolio_params,
-                    priority=WALLET_PORTFOLIO_PRIORITY,
+                    priority=wallet_portfolio_priority,
                 )
             )
         if args.include_wallet_pnl:
@@ -1482,7 +1501,7 @@ def cmd_tasks_seed_wallets(args: argparse.Namespace, app_settings: Settings) -> 
                 Task(
                     kind="wallet-pnl",
                     params=pnl_params,
-                    priority=WALLET_PNL_PRIORITY,
+                    priority=wallet_pnl_priority,
                 )
             )
 
@@ -1497,6 +1516,7 @@ def cmd_tasks_seed_wallets(args: argparse.Namespace, app_settings: Settings) -> 
         "include_wallet_portfolio": args.include_wallet_portfolio,
         "include_wallet_pnl": args.include_wallet_pnl,
         "candidate_mode": args.candidate_mode,
+        "explicit_wallets": len(explicit_wallets),
         "summary": store.summary(),
         "task_store": args.task_store,
     }

@@ -4,16 +4,24 @@ import json
 import os
 import shutil
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import UTC, datetime
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from pathlib import Path
 from typing import Any
 from urllib.parse import parse_qs, urlparse
 
 from zetta.config import Settings
-from zetta.scheduler.tasks import PostgresTaskStore
+from zetta.scheduler.tasks import PostgresTaskStore, Task
 from zetta.storage.clickhouse import ClickHouseWriter
+from zetta.worldcup_wallets import (
+    RANKING_LIST_NAMES,
+    compact_worldcup_wallet_rankings,
+    parse_slug_values,
+    worldcup_event_slugs_for_scope,
+    worldcup_wallet_rankings,
+)
 
 
 @dataclass(frozen=True)
@@ -26,6 +34,11 @@ class ProductApi:
     def __init__(self, *, clickhouse: ClickHouseWriter, settings: Settings | None = None) -> None:
         self.clickhouse = clickhouse
         self.settings = settings
+        self._worldcup_wallet_rankings_cache: dict[
+            tuple[tuple[str, ...], int], tuple[float, dict[str, Any]]
+        ] = {}
+        self._tasks_progress_cache: dict[tuple[int], tuple[float, dict[str, Any]]] = {}
+        self._tasks_nodes_cache: dict[tuple[int], tuple[float, dict[str, Any]]] = {}
 
     def handle(self, path: str, query: dict[str, list[str]]) -> ApiResponse:
         if path == "/health":
@@ -38,6 +51,8 @@ class ProductApi:
             return ApiResponse(HTTPStatus.OK, {"system": collect_system_stats()})
         if path == "/tasks/progress":
             return ApiResponse(HTTPStatus.OK, self.tasks_progress(query))
+        if path == "/tasks/nodes":
+            return ApiResponse(HTTPStatus.OK, self.tasks_nodes(query))
         if path == "/markets/overview":
             return ApiResponse(HTTPStatus.OK, {"overview": self.market_overview()})
         if path == "/markets/trending":
@@ -77,10 +92,17 @@ class ProductApi:
             return ApiResponse(HTTPStatus.OK, {"summary": self.wallet_summary(query)})
         if path == "/wallets/screener":
             return ApiResponse(HTTPStatus.OK, {"wallets": self.wallet_screener(query)})
+        if path == "/wallets/detail":
+            detail = self.wallet_detail(query)
+            if detail is None:
+                return ApiResponse(HTTPStatus.NOT_FOUND, {"error": "wallet_not_found"})
+            return ApiResponse(HTTPStatus.OK, detail)
         if path == "/wallets/live-positions":
             return ApiResponse(HTTPStatus.OK, {"positions": self.wallet_live_positions(query)})
         if path == "/wallets/smart-money/activity":
             return ApiResponse(HTTPStatus.OK, {"activity": self.smart_money_activity(query)})
+        if path == "/worldcup/wallet-rankings":
+            return ApiResponse(HTTPStatus.OK, self.worldcup_wallet_rankings(query))
         if path == "/markets/liquidity":
             return ApiResponse(HTTPStatus.OK, {"liquidity": self.market_liquidity(query)})
         if path == "/signals/anomalies":
@@ -142,10 +164,61 @@ class ProductApi:
         if self.settings is None:
             return {"error": "task_store_unavailable"}
         recent_limit = int_param(query, "recent_limit", 10, maximum=100)
-        return PostgresTaskStore(
+        cache_ttl_seconds = bounded_int_param(
+            query,
+            "cache_ttl_seconds",
+            10,
+            minimum=0,
+            maximum=60,
+        )
+        cache_key = (recent_limit,)
+        cached = self._tasks_progress_cache.get(cache_key)
+        if (
+            cache_ttl_seconds > 0
+            and cached is not None
+            and time.time() - cached[0] <= cache_ttl_seconds
+        ):
+            return cached[1]
+        output = PostgresTaskStore(
             dsn=self.settings.postgres_dsn,
             node_id="api",
         ).progress(recent_limit=recent_limit)
+        if cache_ttl_seconds > 0:
+            self._tasks_progress_cache[cache_key] = (time.time(), output)
+        return output
+
+    def tasks_nodes(self, query: dict[str, list[str]]) -> dict[str, Any]:
+        if self.settings is None:
+            return {"error": "task_store_unavailable"}
+        lookback_minutes = bounded_int_param(
+            query,
+            "lookback_minutes",
+            30,
+            minimum=1,
+            maximum=1440,
+        )
+        cache_ttl_seconds = bounded_int_param(
+            query,
+            "cache_ttl_seconds",
+            10,
+            minimum=0,
+            maximum=60,
+        )
+        cache_key = (lookback_minutes,)
+        cached = self._tasks_nodes_cache.get(cache_key)
+        if (
+            cache_ttl_seconds > 0
+            and cached is not None
+            and time.time() - cached[0] <= cache_ttl_seconds
+        ):
+            return cached[1]
+        output = PostgresTaskStore(
+            dsn=self.settings.postgres_dsn,
+            node_id="api",
+        ).node_progress(lookback_minutes=lookback_minutes)
+        if cache_ttl_seconds > 0:
+            self._tasks_nodes_cache[cache_key] = (time.time(), output)
+        return output
 
     def market_overview(self) -> dict[str, Any]:
         sql = """
@@ -1768,6 +1841,271 @@ class ProductApi:
         """
         return rows_json(self.clickhouse.query_text(sql))
 
+    def wallet_detail(self, query: dict[str, list[str]]) -> dict[str, Any] | None:
+        user = param(query, "user").lower()
+        if not user:
+            return None
+        if param(query, "refresh").lower() in ("1", "true", "yes"):
+            self.enqueue_wallet_refresh(user)
+        position_limit = int_param(query, "position_limit", 50, maximum=500)
+        activity_limit = int_param(query, "activity_limit", 50, maximum=200)
+        pnl_points_limit = int_param(query, "pnl_points_limit", 180, maximum=2000)
+        position_scope = param(query, "position_scope", "all").lower()
+        position_sort = param(query, "position_sort", "current_value").lower()
+
+        portfolio = self.wallet_latest_portfolio_snapshot(user)
+        pnl = self.wallet_latest_pnl_snapshot(user)
+        activity_summary = self.wallet_activity_summary(user)
+        activity_by_type = self.wallet_activity_by_type(user)
+        recent_activity = self.wallet_recent_activity(user, activity_limit)
+        reputation = self.wallet_detail_reputation(user)
+        if not any((portfolio, pnl, activity_summary, activity_by_type, recent_activity)):
+            return None
+
+        positions = wallet_positions_from_snapshot(portfolio)
+        filtered_positions = filter_wallet_positions(positions, position_scope)
+        sorted_positions = sort_wallet_positions(filtered_positions, position_sort)
+        all_pnl_points = wallet_pnl_points_from_snapshot(pnl, 10_000)
+        pnl_points = all_pnl_points[-pnl_points_limit:]
+        pnl_7d = wallet_pnl_delta(all_pnl_points, days=7)
+        latest_total_pnl = (
+            float_value(pnl.get("total_pnl"))
+            if pnl
+            else float_value((portfolio or {}).get("total_pnl"))
+        )
+
+        return {
+            "wallet": {
+                "user_address": user,
+                "data_status": "ok",
+                "latest_total_pnl": latest_total_pnl,
+                "pnl_captured_at": (pnl or {}).get("captured_at"),
+                "portfolio_captured_at": (portfolio or {}).get("captured_at"),
+                "position_count": int_value((portfolio or {}).get("position_count")),
+                "positions_value": float_value((portfolio or {}).get("positions_value")),
+                "portfolio_value": float_value((portfolio or {}).get("portfolio_value")),
+                "available_balance": float_value((portfolio or {}).get("available_balance")),
+                "cash": float_value((portfolio or {}).get("available_balance")),
+                "portfolio_total_pnl": float_value((portfolio or {}).get("total_pnl")),
+                "pnl_7d": pnl_7d,
+                "win_rate": (reputation or {}).get("win_rate"),
+                "completed_event_count": int_value(
+                    (reputation or {}).get("completed_event_count")
+                ),
+                "avg_event_roi": (reputation or {}).get("avg_event_roi"),
+                "avg_bet": float_value((activity_summary or {}).get("avg_bet")),
+                "trade_volume_7d": float_value(
+                    (activity_summary or {}).get("traded_notional_7d")
+                ),
+                "trade_count_7d": int_value(
+                    (activity_summary or {}).get("trade_activity_count_7d")
+                ),
+                "activity_count": int_value((activity_summary or {}).get("activity_count")),
+                "trade_activity_count": int_value(
+                    (activity_summary or {}).get("trade_activity_count")
+                ),
+                "first_activity_at": (activity_summary or {}).get("first_activity_at"),
+                "last_activity_at": (activity_summary or {}).get("last_activity_at"),
+            },
+            "position_summary": summarize_wallet_positions(positions),
+            "positions": sorted_positions[:position_limit],
+            "positions_returned": min(len(sorted_positions), position_limit),
+            "positions_available": len(sorted_positions),
+            "position_scope": position_scope,
+            "position_sort": position_sort,
+            "pnl_points": pnl_points,
+            "pnl_point_count": len(pnl_points),
+            "activity_summary": activity_summary or empty_wallet_activity_summary(user),
+            "activity_by_type": activity_by_type,
+            "reputation": reputation or empty_wallet_reputation(user),
+            "recent_activity": recent_activity,
+        }
+
+    def enqueue_wallet_refresh(self, user: str) -> dict[str, Any]:
+        if self.settings is None:
+            return {"added": 0, "status": "task_store_unavailable"}
+        refresh_run = datetime.now(UTC).replace(microsecond=0).isoformat()
+        params = {
+            "user": user,
+            "page_limit": 500,
+            "max_pages": 2,
+            "resume": False,
+            "_refresh_run": refresh_run,
+            "_requeue_done": True,
+        }
+        tasks = [
+            Task(
+                kind="wallet-trades",
+                params={**params, "market": None, "event_id": None},
+                priority=-2,
+            ),
+            Task(kind="wallet-activity", params=dict(params), priority=-2),
+            Task(
+                kind="wallet-portfolio",
+                params={"user": user, "_refresh_run": refresh_run, "_requeue_done": True},
+                priority=-2,
+            ),
+            Task(
+                kind="wallet-pnl",
+                params={
+                    "user": user,
+                    "interval": "all",
+                    "fidelity": "1d",
+                    "_refresh_run": refresh_run,
+                    "_requeue_done": True,
+                },
+                priority=-2,
+            ),
+        ]
+        added = PostgresTaskStore(
+            dsn=self.settings.postgres_dsn,
+            node_id="api",
+        ).add_many(tasks)
+        return {"added": added, "refresh_run": refresh_run}
+
+    def wallet_latest_portfolio_snapshot(self, user: str) -> dict[str, Any] | None:
+        sql = f"""
+            select
+              user_address,
+              captured_at,
+              position_count,
+              positions_value,
+              portfolio_value,
+              available_balance,
+              total_pnl,
+              raw_json
+            from fact_wallet_portfolio_snapshot
+            where user_address = {ch_string(user)}
+            order by captured_at desc
+            limit 1
+            format JSONEachRow
+        """
+        rows = rows_json(self.clickhouse.query_text(sql))
+        return rows[0] if rows else None
+
+    def wallet_latest_pnl_snapshot(self, user: str) -> dict[str, Any] | None:
+        sql = f"""
+            select
+              user_address,
+              captured_at,
+              total_pnl,
+              raw_json
+            from fact_wallet_pnl_snapshot
+            where user_address = {ch_string(user)}
+            order by captured_at desc
+            limit 1
+            format JSONEachRow
+        """
+        rows = rows_json(self.clickhouse.query_text(sql))
+        return rows[0] if rows else None
+
+    def wallet_activity_summary(self, user: str) -> dict[str, Any] | None:
+        sql = f"""
+            select
+              user_address,
+              count() as activity_count,
+              countIf(activity_type = 'TRADE') as trade_activity_count,
+              countIf(activity_type = 'TRADE' and side = 'BUY') as buy_count,
+              countIf(activity_type = 'TRADE' and side = 'SELL') as sell_count,
+              sumIf(size, activity_type = 'TRADE') as traded_size,
+              sumIf(notional, activity_type = 'TRADE') as traded_notional,
+              sumIf(notional, activity_type = 'TRADE' and side = 'BUY') as buy_notional,
+              sumIf(notional, activity_type = 'TRADE' and side = 'SELL') as sell_notional,
+              countIf(timestamp >= now64(3) - interval 24 hour) as activity_count_24h,
+              countIf(activity_type = 'TRADE' and timestamp >= now64(3) - interval 24 hour)
+                as trade_activity_count_24h,
+              sumIf(
+                notional,
+                activity_type = 'TRADE' and timestamp >= now64(3) - interval 24 hour
+              ) as traded_notional_24h,
+              countIf(activity_type = 'TRADE' and timestamp >= now64(3) - interval 7 day)
+                as trade_activity_count_7d,
+              sumIf(
+                notional,
+                activity_type = 'TRADE' and timestamp >= now64(3) - interval 7 day
+              ) as traded_notional_7d,
+              avgIf(notional, activity_type = 'TRADE' and notional > 0) as avg_bet,
+              argMax(activity_type, timestamp) as latest_activity_type,
+              argMax(side, timestamp) as latest_side,
+              min(timestamp) as first_activity_at,
+              max(timestamp) as last_activity_at
+            from fact_user_activity
+            where user_address = {ch_string(user)}
+            group by user_address
+            limit 1
+            format JSONEachRow
+        """
+        rows = rows_json(self.clickhouse.query_text(sql))
+        return normalize_wallet_activity_summary(rows[0]) if rows else None
+
+    def wallet_detail_reputation(self, user: str) -> dict[str, Any] | None:
+        sql = f"""
+            select
+              user_address,
+              completed_event_count,
+              profitable_event_count,
+              losing_event_count,
+              win_rate,
+              realized_pnl,
+              avg_event_roi,
+              best_event_pnl,
+              worst_event_pnl,
+              active_position_count,
+              active_event_count,
+              active_unrealized_pnl_estimate,
+              favorite_category,
+              favorite_category_notional,
+              first_trade_at,
+              last_trade_at
+            from mart_wallet_reputation final
+            where user_address = {ch_string(user)}
+            limit 1
+            format JSONEachRow
+        """
+        rows = rows_json(self.clickhouse.query_text(sql))
+        return rows[0] if rows else None
+
+    def wallet_activity_by_type(self, user: str) -> list[dict[str, Any]]:
+        sql = f"""
+            select
+              activity_type,
+              count() as count,
+              sum(size) as size,
+              sum(notional) as notional,
+              min(timestamp) as first_activity_at,
+              max(timestamp) as last_activity_at
+            from fact_user_activity
+            where user_address = {ch_string(user)}
+            group by activity_type
+            order by count desc, notional desc
+            format JSONEachRow
+        """
+        return [normalize_wallet_activity_type(row) for row in rows_json(self.clickhouse.query_text(sql))]
+
+    def wallet_recent_activity(self, user: str, limit: int) -> list[dict[str, Any]]:
+        sql = f"""
+            select
+              timestamp,
+              activity_type,
+              side,
+              price,
+              size,
+              notional,
+              condition_id,
+              token_id,
+              transaction_hash,
+              JSONExtractString(raw_json, 'title') as title,
+              JSONExtractString(raw_json, 'slug') as slug,
+              JSONExtractString(raw_json, 'eventSlug') as event_slug,
+              JSONExtractString(raw_json, 'outcome') as outcome
+            from fact_user_activity
+            where user_address = {ch_string(user)}
+            order by timestamp desc
+            limit {limit}
+            format JSONEachRow
+        """
+        return rows_json(self.clickhouse.query_text(sql))
+
     def wallet_live_positions(self, query: dict[str, list[str]]) -> list[dict[str, Any]]:
         user = param(query, "user").lower()
         event_id = param(query, "event_id")
@@ -1870,6 +2208,88 @@ class ProductApi:
             format JSONEachRow
         """
         return rows_json(self.clickhouse.query_text(fallback_sql))
+
+    def worldcup_wallet_rankings(self, query: dict[str, list[str]]) -> dict[str, Any]:
+        limit = int_param(query, "limit", 100, maximum=500)
+        include_details = param(query, "details").lower() in ("1", "true", "yes")
+        refresh = param(query, "refresh").lower() in ("1", "true", "yes")
+        cache_ttl_seconds = bounded_int_param(
+            query,
+            "cache_ttl_seconds",
+            60,
+            minimum=0,
+            maximum=3600,
+        )
+        expand_variants = param(query, "expand_variants", "true").lower() not in (
+            "0",
+            "false",
+            "no",
+        )
+        supplied_slugs = parse_slug_values(query, "slug", "slugs", "event_slug", "event_slugs")
+        input_slugs = worldcup_event_slugs_for_scope(
+            supplied_slugs or None,
+            date_from=param(query, "date_from"),
+            date_to=param(query, "date_to"),
+            expand_variants=expand_variants,
+        )
+        cache_key = (tuple(input_slugs), limit)
+        cached = self._worldcup_wallet_rankings_cache.get(cache_key)
+        if (
+            not refresh
+            and cache_ttl_seconds > 0
+            and cached is not None
+            and time.time() - cached[0] <= cache_ttl_seconds
+        ):
+            output = cached[1]
+        else:
+            output = self.cached_worldcup_wallet_rankings(query, input_slugs, limit)
+            if output is None:
+                output = worldcup_wallet_rankings(
+                    self.worldcup_clickhouse(),
+                    input_slugs,
+                    rank_limit=limit,
+                )
+            if cache_ttl_seconds > 0:
+                self._worldcup_wallet_rankings_cache[cache_key] = (time.time(), output)
+        return output if include_details else compact_worldcup_wallet_rankings(output)
+
+    def cached_worldcup_wallet_rankings(
+        self,
+        query: dict[str, list[str]],
+        input_slugs: list[str],
+        limit: int,
+    ) -> dict[str, Any] | None:
+        if param(query, "refresh").lower() in ("1", "true", "yes"):
+            return None
+        if parse_slug_values(query, "slug", "slugs", "event_slug", "event_slugs"):
+            return None
+        if param(query, "date_from") or param(query, "date_to"):
+            return None
+        cache_path = Path("data/worldcup_wallet_per_wallet_rankings_latest.json")
+        if not cache_path.exists():
+            return None
+        try:
+            output = json.loads(cache_path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            return None
+        if output.get("data_status") != "ok":
+            return None
+        cached_slugs = output.get("scope", {}).get("input_slugs")
+        if cached_slugs != input_slugs:
+            return None
+        return limit_worldcup_rankings(output, limit)
+
+    def worldcup_clickhouse(self) -> ClickHouseWriter:
+        if not hasattr(self.clickhouse, "settings"):
+            return self.clickhouse
+        if self.clickhouse.settings.request_timeout_seconds >= 300:
+            return self.clickhouse
+        return ClickHouseWriter(
+            replace(
+                self.clickhouse.settings,
+                request_timeout_seconds=300,
+            )
+        )
 
     def market_liquidity(self, query: dict[str, list[str]]) -> list[dict[str, Any]]:
         token_id = param(query, "token_id")
@@ -2000,6 +2420,266 @@ def serve_api(*, settings: Settings, host: str, port: int) -> None:
 
 def rows_json(text: str) -> list[dict[str, Any]]:
     return [json.loads(line) for line in text.splitlines() if line.strip()]
+
+
+def wallet_positions_from_snapshot(snapshot: dict[str, Any] | None) -> list[dict[str, Any]]:
+    if not snapshot:
+        return []
+    raw_json = snapshot.get("raw_json")
+    if not raw_json:
+        return []
+    try:
+        payload = json.loads(str(raw_json))
+    except json.JSONDecodeError:
+        return []
+    raw_positions = payload.get("positions") if isinstance(payload, dict) else None
+    if not isinstance(raw_positions, list):
+        return []
+
+    positions = []
+    for item in raw_positions:
+        if not isinstance(item, dict):
+            continue
+        size = float_value(item.get("size"))
+        current_value = float_value(item.get("currentValue"))
+        cash_pnl = float_value(item.get("cashPnl"))
+        avg_price = float_value(item.get("avgPrice"))
+        cur_price = float_value(item.get("curPrice"))
+        initial_value = float_value(item.get("initialValue"))
+        position = {
+            "asset": str(item.get("asset") or ""),
+            "condition_id": str(item.get("conditionId") or item.get("condition_id") or ""),
+            "title": str(item.get("title") or ""),
+            "slug": str(item.get("slug") or ""),
+            "event_id": str(item.get("eventId") or item.get("event_id") or ""),
+            "event_slug": str(item.get("eventSlug") or item.get("event_slug") or ""),
+            "outcome": str(item.get("outcome") or ""),
+            "opposite_outcome": str(item.get("oppositeOutcome") or ""),
+            "size": size,
+            "avg_price": avg_price,
+            "cur_price": cur_price,
+            "initial_value": initial_value,
+            "current_value": current_value,
+            "cash_pnl": cash_pnl,
+            "percent_pnl": float_value(item.get("percentPnl")),
+            "realized_pnl": float_value(item.get("realizedPnl")),
+            "percent_realized_pnl": float_value(item.get("percentRealizedPnl")),
+            "total_bought": float_value(item.get("totalBought")),
+            "redeemable": bool(item.get("redeemable")),
+            "mergeable": bool(item.get("mergeable")),
+            "negative_risk": bool(item.get("negativeRisk")),
+            "end_date": item.get("endDate"),
+            "icon": str(item.get("icon") or ""),
+        }
+        position["is_worldcup"] = (
+            position["slug"].startswith("fifwc-")
+            or position["event_slug"].startswith("fifwc-")
+        )
+        position["is_open"] = current_value > 0 or (size > 0 and cur_price > 0)
+        position["is_settled_or_redeemable"] = bool(position["redeemable"]) or (
+            current_value <= 0 and cur_price <= 0
+        )
+        position["cost_basis_estimate"] = size * avg_price if avg_price else initial_value
+        positions.append(position)
+    return positions
+
+
+def filter_wallet_positions(positions: list[dict[str, Any]], scope: str) -> list[dict[str, Any]]:
+    if scope == "open":
+        return [position for position in positions if position.get("is_open")]
+    if scope in ("history", "historical", "settled"):
+        return [position for position in positions if position.get("is_settled_or_redeemable")]
+    if scope == "worldcup":
+        return [position for position in positions if position.get("is_worldcup")]
+    return positions
+
+
+def sort_wallet_positions(positions: list[dict[str, Any]], sort: str) -> list[dict[str, Any]]:
+    key_name = {
+        "pnl": "cash_pnl",
+        "cash_pnl": "cash_pnl",
+        "loss": "cash_pnl",
+        "current_value": "current_value",
+        "value": "current_value",
+        "size": "size",
+        "percent_pnl": "percent_pnl",
+        "abs_pnl": "cash_pnl",
+    }.get(sort, "current_value")
+    reverse = sort != "loss"
+    return sorted(
+        positions,
+        key=lambda position: abs(float_value(position.get(key_name)))
+        if sort == "abs_pnl"
+        else float_value(position.get(key_name)),
+        reverse=reverse,
+    )
+
+
+def summarize_wallet_positions(positions: list[dict[str, Any]]) -> dict[str, Any]:
+    open_positions = [position for position in positions if position.get("is_open")]
+    worldcup_positions = [position for position in positions if position.get("is_worldcup")]
+    return {
+        "position_count": len(positions),
+        "open_position_count": len(open_positions),
+        "historical_or_redeemable_position_count": len(positions) - len(open_positions),
+        "positive_pnl_position_count": sum(
+            1 for position in positions if float_value(position.get("cash_pnl")) > 0
+        ),
+        "negative_pnl_position_count": sum(
+            1 for position in positions if float_value(position.get("cash_pnl")) < 0
+        ),
+        "worldcup_position_count": len(worldcup_positions),
+        "current_value": sum(float_value(position.get("current_value")) for position in positions),
+        "open_current_value": sum(
+            float_value(position.get("current_value")) for position in open_positions
+        ),
+        "cash_pnl": sum(float_value(position.get("cash_pnl")) for position in positions),
+        "open_cash_pnl": sum(float_value(position.get("cash_pnl")) for position in open_positions),
+        "worldcup_cash_pnl": sum(
+            float_value(position.get("cash_pnl")) for position in worldcup_positions
+        ),
+        "worldcup_current_value": sum(
+            float_value(position.get("current_value")) for position in worldcup_positions
+        ),
+    }
+
+
+def wallet_pnl_points_from_snapshot(
+    snapshot: dict[str, Any] | None,
+    limit: int,
+) -> list[dict[str, Any]]:
+    if not snapshot:
+        return []
+    raw_json = snapshot.get("raw_json")
+    if not raw_json:
+        return []
+    try:
+        payload = json.loads(str(raw_json))
+    except json.JSONDecodeError:
+        return []
+    points = payload.get("points") if isinstance(payload, dict) else None
+    if not isinstance(points, list):
+        return []
+    normalized = []
+    for point in points:
+        if not isinstance(point, dict):
+            continue
+        timestamp = int_value(point.get("t"))
+        normalized.append(
+            {
+                "timestamp": timestamp,
+                "datetime": datetime.fromtimestamp(timestamp, UTC).isoformat()
+                if timestamp
+                else None,
+                "pnl": float_value(point.get("p")),
+            }
+        )
+    return normalized[-limit:]
+
+
+def wallet_pnl_delta(points: list[dict[str, Any]], *, days: int) -> float | None:
+    dated_points = [
+        point
+        for point in points
+        if int_value(point.get("timestamp")) > 0 and point.get("pnl") is not None
+    ]
+    if len(dated_points) < 2:
+        return None
+    latest = dated_points[-1]
+    cutoff = int_value(latest.get("timestamp")) - days * 86400
+    baseline = dated_points[0]
+    for point in dated_points:
+        if int_value(point.get("timestamp")) <= cutoff:
+            baseline = point
+        else:
+            break
+    return float_value(latest.get("pnl")) - float_value(baseline.get("pnl"))
+
+
+def empty_wallet_activity_summary(user: str) -> dict[str, Any]:
+    return {
+        "user_address": user,
+        "activity_count": 0,
+        "trade_activity_count": 0,
+        "buy_count": 0,
+        "sell_count": 0,
+        "traded_size": 0.0,
+        "traded_notional": 0.0,
+        "buy_notional": 0.0,
+        "sell_notional": 0.0,
+        "activity_count_24h": 0,
+        "trade_activity_count_24h": 0,
+        "traded_notional_24h": 0.0,
+        "trade_activity_count_7d": 0,
+        "traded_notional_7d": 0.0,
+        "avg_bet": 0.0,
+        "latest_activity_type": "",
+        "latest_side": "",
+        "first_activity_at": None,
+        "last_activity_at": None,
+    }
+
+
+def empty_wallet_reputation(user: str) -> dict[str, Any]:
+    return {
+        "user_address": user,
+        "completed_event_count": 0,
+        "profitable_event_count": 0,
+        "losing_event_count": 0,
+        "win_rate": None,
+        "realized_pnl": 0.0,
+        "avg_event_roi": None,
+        "best_event_pnl": 0.0,
+        "worst_event_pnl": 0.0,
+        "active_position_count": 0,
+        "active_event_count": 0,
+        "active_unrealized_pnl_estimate": 0.0,
+        "favorite_category": "",
+        "favorite_category_notional": 0.0,
+        "first_trade_at": None,
+        "last_trade_at": None,
+    }
+
+
+def normalize_wallet_activity_summary(row: dict[str, Any]) -> dict[str, Any]:
+    normalized = dict(row)
+    for key in (
+        "activity_count",
+        "trade_activity_count",
+        "buy_count",
+        "sell_count",
+        "activity_count_24h",
+        "trade_activity_count_24h",
+        "trade_activity_count_7d",
+    ):
+        normalized[key] = int_value(row.get(key))
+    for key in (
+        "traded_size",
+        "traded_notional",
+        "buy_notional",
+        "sell_notional",
+        "traded_notional_24h",
+        "traded_notional_7d",
+        "avg_bet",
+    ):
+        normalized[key] = float_value(row.get(key))
+    return normalized
+
+
+def normalize_wallet_activity_type(row: dict[str, Any]) -> dict[str, Any]:
+    normalized = dict(row)
+    normalized["count"] = int_value(row.get("count"))
+    normalized["size"] = float_value(row.get("size"))
+    normalized["notional"] = float_value(row.get("notional"))
+    return normalized
+
+
+def limit_worldcup_rankings(output: dict[str, Any], limit: int) -> dict[str, Any]:
+    limited = dict(output)
+    for list_name in RANKING_LIST_NAMES:
+        rows = output.get(list_name, [])
+        limited[list_name] = rows[:limit] if isinstance(rows, list) else []
+    return limited
 
 
 def compact_event_smart_wallet_options(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
@@ -2329,6 +3009,21 @@ def int_param(query: dict[str, list[str]], key: str, default: int, *, maximum: i
     except ValueError:
         value = default
     return max(1, min(value, maximum))
+
+
+def bounded_int_param(
+    query: dict[str, list[str]],
+    key: str,
+    default: int,
+    *,
+    minimum: int,
+    maximum: int,
+) -> int:
+    try:
+        value = int(param(query, key, str(default)))
+    except ValueError:
+        value = default
+    return max(minimum, min(value, maximum))
 
 
 def float_param(

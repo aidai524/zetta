@@ -1,9 +1,9 @@
 [Unit]
-Description=Load latest Zetta trades every minute
+Description=Load latest Zetta trades every two minutes
 
 [Timer]
 OnBootSec=2min
-OnUnitInactiveSec=1min
+OnUnitInactiveSec=2min
 AccuracySec=10s
 Unit=zetta-load-trades-realtime.service
 

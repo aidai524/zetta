@@ -33,6 +33,13 @@ create index if not exists idx_collector_tasks_lease
   on collector_tasks (lease_expires_at)
   where lease_owner is not null;
 
+create index if not exists idx_collector_tasks_active_updated
+  on collector_tasks (updated_at desc)
+  where status in ('pending', 'running', 'failed', 'dead_lettered');
+
+create index if not exists idx_collector_tasks_kind_status
+  on collector_tasks (task_type, status);
+
 create unique index if not exists idx_collector_tasks_unique_work
   on collector_tasks (task_type, source, entity, md5(params::text));
 
@@ -51,6 +58,12 @@ create table if not exists collector_runs (
 
 create index if not exists idx_collector_runs_finished
   on collector_runs (finished_at desc, status);
+
+create index if not exists idx_collector_runs_started
+  on collector_runs (started_at desc);
+
+create index if not exists idx_collector_runs_node_started
+  on collector_runs (node_id, started_at desc);
 
 create table if not exists collector_dead_letters (
   id bigserial primary key,

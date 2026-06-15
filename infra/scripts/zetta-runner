@@ -198,19 +198,29 @@ case "$MODE" in
       --batch-size "${ZETTA_WALLET_PNL_LOAD_BATCH_SIZE:-20000}"
     ;;
   load-trades-realtime)
-    "$ZETTA_PYTHON" -m zetta.cli "${COMMON_ARGS[@]}" load data-trades \
-      --batch-size "${ZETTA_REALTIME_TRADE_BATCH_SIZE:-1000}" \
-      --workers 1 \
-      --max-paths "${ZETTA_REALTIME_TRADE_MAX_PATHS:-1000}" \
-      --newest-first
+    TRADE_LOAD_ARGS=(
+      "${COMMON_ARGS[@]}"
+      load data-trades
+      --batch-size "${ZETTA_REALTIME_TRADE_BATCH_SIZE:-1000}"
+      --workers 1
+      --max-paths "${ZETTA_REALTIME_TRADE_MAX_PATHS:-1000}"
+    )
+    if [[ "${ZETTA_REALTIME_TRADE_NEWEST_FIRST:-1}" == "1" ]]; then
+      TRADE_LOAD_ARGS+=(--newest-first)
+    fi
+    "$ZETTA_PYTHON" -m zetta.cli "${TRADE_LOAD_ARGS[@]}"
     "$ZETTA_PYTHON" -m zetta.cli "${COMMON_ARGS[@]}" load data-activity \
       --batch-size "${ZETTA_REALTIME_TRADE_BATCH_SIZE:-1000}"
     "$ZETTA_PYTHON" -m zetta.cli "${COMMON_ARGS[@]}" load data-positions \
       --batch-size "${ZETTA_REALTIME_TRADE_BATCH_SIZE:-1000}"
-    "$ZETTA_PYTHON" -m zetta.cli "${COMMON_ARGS[@]}" load data-wallet-portfolio \
-      --batch-size "${ZETTA_REALTIME_TRADE_BATCH_SIZE:-1000}"
-    "$ZETTA_PYTHON" -m zetta.cli "${COMMON_ARGS[@]}" load data-user-pnl \
-      --batch-size "${ZETTA_REALTIME_TRADE_BATCH_SIZE:-1000}"
+    if [[ "${ZETTA_LOAD_WALLET_SNAPSHOTS:-1}" == "1" ]]; then
+      "$ZETTA_PYTHON" -m zetta.cli "${COMMON_ARGS[@]}" load data-wallet-portfolio \
+        --batch-size "${ZETTA_REALTIME_TRADE_BATCH_SIZE:-1000}"
+      "$ZETTA_PYTHON" -m zetta.cli "${COMMON_ARGS[@]}" load data-user-pnl \
+        --batch-size "${ZETTA_REALTIME_TRADE_BATCH_SIZE:-1000}"
+    else
+      printf '{"loader":"wallet_snapshots","skipped":true,"reason":"disabled"}\n'
+    fi
     ;;
   wallet-rollup)
     "$ZETTA_PYTHON" -m zetta.cli "${COMMON_ARGS[@]}" build wallet-trade-rollup \
@@ -243,7 +253,11 @@ case "$MODE" in
       "${EXCHANGE_ARGS[@]}"
     ;;
   chain-pnl)
-    "$ZETTA_PYTHON" -m zetta.cli "${COMMON_ARGS[@]}" build trader-chain-pnl
+    if [[ "${ZETTA_BUILD_CHAIN_PNL:-1}" == "1" ]]; then
+      "$ZETTA_PYTHON" -m zetta.cli "${COMMON_ARGS[@]}" build trader-chain-pnl
+    else
+      printf '{"mart":"trader_chain_pnl","skipped":true,"reason":"disabled"}\n'
+    fi
     ;;
   load)
     "$ZETTA_PYTHON" -m zetta.cli "${COMMON_ARGS[@]}" load gamma-raw --batch-size "$ZETTA_LOADER_BATCH_SIZE"
@@ -255,8 +269,12 @@ case "$MODE" in
     "$ZETTA_PYTHON" -m zetta.cli "${COMMON_ARGS[@]}" load data-holders --batch-size "$ZETTA_LOADER_BATCH_SIZE"
     "$ZETTA_PYTHON" -m zetta.cli "${COMMON_ARGS[@]}" load data-market-positions --batch-size "$ZETTA_LOADER_BATCH_SIZE"
     "$ZETTA_PYTHON" -m zetta.cli "${COMMON_ARGS[@]}" load data-positions --batch-size "$ZETTA_LOADER_BATCH_SIZE"
-    "$ZETTA_PYTHON" -m zetta.cli "${COMMON_ARGS[@]}" load data-wallet-portfolio --batch-size "$ZETTA_LOADER_BATCH_SIZE"
-    "$ZETTA_PYTHON" -m zetta.cli "${COMMON_ARGS[@]}" load data-user-pnl --batch-size "$ZETTA_LOADER_BATCH_SIZE"
+    if [[ "${ZETTA_LOAD_WALLET_SNAPSHOTS:-1}" == "1" ]]; then
+      "$ZETTA_PYTHON" -m zetta.cli "${COMMON_ARGS[@]}" load data-wallet-portfolio --batch-size "$ZETTA_LOADER_BATCH_SIZE"
+      "$ZETTA_PYTHON" -m zetta.cli "${COMMON_ARGS[@]}" load data-user-pnl --batch-size "$ZETTA_LOADER_BATCH_SIZE"
+    else
+      printf '{"loader":"wallet_snapshots","skipped":true,"reason":"disabled"}\n'
+    fi
     "$ZETTA_PYTHON" -m zetta.cli "${COMMON_ARGS[@]}" load data-open-interest --batch-size "$ZETTA_LOADER_BATCH_SIZE"
     "$ZETTA_PYTHON" -m zetta.cli "${COMMON_ARGS[@]}" load clob-price-history --batch-size "$ZETTA_LOADER_BATCH_SIZE"
     "$ZETTA_PYTHON" -m zetta.cli "${COMMON_ARGS[@]}" load clob-books --batch-size "$ZETTA_LOADER_BATCH_SIZE"
@@ -276,7 +294,11 @@ case "$MODE" in
     else
       printf '{"mart":"trader_profile","skipped":true,"reason":"disabled_for_regular_marts"}\n'
     fi
-    "$ZETTA_PYTHON" -m zetta.cli "${MART_ARGS[@]}" build trader-chain-pnl
+    if [[ "${ZETTA_BUILD_CHAIN_PNL:-1}" == "1" ]]; then
+      "$ZETTA_PYTHON" -m zetta.cli "${MART_ARGS[@]}" build trader-chain-pnl
+    else
+      printf '{"mart":"trader_chain_pnl","skipped":true,"reason":"disabled"}\n'
+    fi
     if [[ "${ZETTA_MART_BUILD_WALLET_SCREENER:-0}" == "1" ]]; then
       "$ZETTA_PYTHON" -m zetta.cli "${MART_ARGS[@]}" build wallet-screener
     else

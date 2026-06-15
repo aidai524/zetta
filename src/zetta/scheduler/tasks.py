@@ -243,13 +243,13 @@ class PostgresTaskStore:
             with conn.cursor() as cursor:
                 row = self._claim_with_status(
                     cursor,
-                    where_sql="status = 'pending'",
+                    where_sql="status = 'running' and lease_expires_at < now()",
                     lease_expires_at=lease_expires_at,
                 )
                 if row is None:
                     row = self._claim_with_status(
                         cursor,
-                        where_sql="status = 'running' and lease_expires_at < now()",
+                        where_sql="status = 'pending'",
                         lease_expires_at=lease_expires_at,
                     )
         return row_to_task(row) if row else None
@@ -316,15 +316,50 @@ class PostgresTaskStore:
     def progress(self, *, recent_limit: int = 10) -> dict[str, Any]:
         psycopg, _Jsonb = import_psycopg()
 
+        summary = {"pending": 0, "running": 0, "done": 0, "failed": 0, "dead_lettered": 0}
+        by_kind: dict[str, dict[str, Any]] = {}
+
         with psycopg.connect(self.dsn) as conn:
             with conn.cursor() as cursor:
                 cursor.execute(
                     """
-                    select task_type, status, attempts, updated_at
+                    select task_type, status, count(*)
                     from collector_tasks
+                    group by task_type, status
+                    order by task_type, status
                     """
                 )
-                task_rows = [
+                for kind, status, count in cursor.fetchall():
+                    status_key = str(status)
+                    kind_counts = by_kind.setdefault(
+                        str(kind),
+                        {
+                            "pending": 0,
+                            "running": 0,
+                            "done": 0,
+                            "failed": 0,
+                            "dead_lettered": 0,
+                            "total": 0,
+                            "done_percent": 0.0,
+                        },
+                    )
+                    count_int = int(count or 0)
+                    if status_key in summary:
+                        summary[status_key] += count_int
+                        kind_counts[status_key] += count_int
+                    kind_counts["total"] += count_int
+
+                cursor.execute(
+                    """
+                    select task_type, status, attempts, updated_at
+                    from collector_tasks
+                    where status in ('pending', 'running', 'failed', 'dead_lettered')
+                    order by updated_at desc
+                    limit %s
+                    """,
+                    (recent_limit,),
+                )
+                active_rows = [
                     {
                         "kind": str(kind),
                         "status": str(status),
@@ -387,9 +422,172 @@ class PostgresTaskStore:
                     ) in cursor.fetchall()
                 ]
 
-        progress = task_progress_from_rows(task_rows, recent_limit=recent_limit)
-        progress["recent_runs"] = recent_runs
-        return progress
+        total = sum(summary.values())
+        completed = summary["done"] + summary["dead_lettered"]
+        for counts in by_kind.values():
+            kind_total = int(counts["total"])
+            if kind_total:
+                counts["done_percent"] = round((int(counts["done"]) / kind_total) * 100, 2)
+
+        return {
+            "summary": summary,
+            "total_tasks": total,
+            "completed_tasks": completed,
+            "done_percent": round((summary["done"] / total) * 100, 2) if total else 0.0,
+            "closed_percent": round((completed / total) * 100, 2) if total else 0.0,
+            "by_kind": dict(sorted(by_kind.items())),
+            "active": active_rows,
+            "recent_runs": recent_runs,
+        }
+
+    def node_progress(self, *, lookback_minutes: int = 30) -> dict[str, Any]:
+        psycopg, _Jsonb = import_psycopg()
+
+        with psycopg.connect(self.dsn) as conn:
+            with conn.cursor() as cursor:
+                cursor.execute(
+                    """
+                    with node_runs as
+                    (
+                      select
+                        r.node_id,
+                        coalesce(t.task_type, '') as task_type,
+                        count(*) as runs,
+                        count(*) filter (where r.status = 'done') as done,
+                        count(*) filter (where r.status != 'done') as not_done,
+                        coalesce(sum(r.items), 0) as items,
+                        coalesce(sum(r.pages), 0) as pages,
+                        coalesce(avg(extract(epoch from (r.finished_at - r.started_at))), 0)
+                          as avg_seconds,
+                        max(r.finished_at) as latest_finished
+                      from collector_runs as r
+                      left join collector_tasks as t on t.id = r.task_id
+                      where r.started_at >= now() - (%s::text || ' minutes')::interval
+                      group by r.node_id, t.task_type
+                    ),
+                    running_tasks as
+                    (
+                      select
+                        coalesce(lease_owner, '') as node_id,
+                        task_type,
+                        count(*) as running_tasks,
+                        min(updated_at) as oldest_claim,
+                        max(updated_at) as newest_claim
+                      from collector_tasks
+                      where status = 'running'
+                        and lease_owner is not null
+                        and lease_owner != ''
+                      group by lease_owner, task_type
+                    ),
+                    nodes as
+                    (
+                      select node_id from node_runs
+                      union
+                      select node_id from running_tasks
+                    )
+                    select
+                      nodes.node_id,
+                      coalesce(
+                        (
+                          select jsonb_object_agg(
+                            node_runs.task_type,
+                            jsonb_build_object(
+                              'runs', node_runs.runs,
+                              'done', node_runs.done,
+                              'not_done', node_runs.not_done,
+                              'items', node_runs.items,
+                              'pages', node_runs.pages,
+                              'avg_seconds', round(node_runs.avg_seconds::numeric, 3),
+                              'latest_finished', node_runs.latest_finished
+                            )
+                          )
+                          from node_runs
+                          where node_runs.node_id = nodes.node_id
+                        ),
+                        '{}'::jsonb
+                      ) as recent_by_kind,
+                      coalesce(
+                        (
+                          select jsonb_object_agg(
+                            running_tasks.task_type,
+                            jsonb_build_object(
+                              'running_tasks', running_tasks.running_tasks,
+                              'oldest_claim', running_tasks.oldest_claim,
+                              'newest_claim', running_tasks.newest_claim
+                            )
+                          )
+                          from running_tasks
+                          where running_tasks.node_id = nodes.node_id
+                        ),
+                        '{}'::jsonb
+                      ) as running_by_kind,
+                      coalesce((select sum(runs) from node_runs where node_runs.node_id = nodes.node_id), 0)
+                        as runs,
+                      coalesce((select sum(done) from node_runs where node_runs.node_id = nodes.node_id), 0)
+                        as done,
+                      coalesce((select sum(not_done) from node_runs where node_runs.node_id = nodes.node_id), 0)
+                        as not_done,
+                      coalesce((select sum(items) from node_runs where node_runs.node_id = nodes.node_id), 0)
+                        as items,
+                      coalesce((select sum(pages) from node_runs where node_runs.node_id = nodes.node_id), 0)
+                        as pages,
+                      coalesce((select sum(running_tasks) from running_tasks where running_tasks.node_id = nodes.node_id), 0)
+                        as running_tasks,
+                      (
+                        select max(latest_finished)
+                        from node_runs
+                        where node_runs.node_id = nodes.node_id
+                      ) as latest_finished
+                    from nodes
+                    order by
+                      case when nodes.node_id like 'wallet-helper%%' then 0 else 1 end,
+                      nodes.node_id
+                    """,
+                    (lookback_minutes,),
+                )
+                nodes = [
+                    {
+                        "node_id": str(node_id),
+                        "role": node_role(str(node_id)),
+                        "recent_by_kind": dict(recent_by_kind or {}),
+                        "running_by_kind": dict(running_by_kind or {}),
+                        "runs": int(runs or 0),
+                        "done": int(done or 0),
+                        "not_done": int(not_done or 0),
+                        "items": int(items or 0),
+                        "pages": int(pages or 0),
+                        "running_tasks": int(running_tasks or 0),
+                        "latest_finished": latest_finished.isoformat()
+                        if hasattr(latest_finished, "isoformat")
+                        else None,
+                    }
+                    for (
+                        node_id,
+                        recent_by_kind,
+                        running_by_kind,
+                        runs,
+                        done,
+                        not_done,
+                        items,
+                        pages,
+                        running_tasks,
+                        latest_finished,
+                    ) in cursor.fetchall()
+                ]
+
+        return {
+            "lookback_minutes": lookback_minutes,
+            "nodes": nodes,
+            "totals": {
+                "nodes": len(nodes),
+                "runs": sum(node["runs"] for node in nodes),
+                "done": sum(node["done"] for node in nodes),
+                "not_done": sum(node["not_done"] for node in nodes),
+                "items": sum(node["items"] for node in nodes),
+                "pages": sum(node["pages"] for node in nodes),
+                "running_tasks": sum(node["running_tasks"] for node in nodes),
+            },
+        }
 
     def _mark(self, task_id: str, status: TaskStatus, error: str | None = None) -> None:
         psycopg, _Jsonb = import_psycopg()
@@ -606,6 +804,10 @@ def task_source_entity(kind: str) -> tuple[str, str]:
         return "event", "refresh"
     if kind.startswith("gamma-"):
         return "gamma", kind.removeprefix("gamma-").replace("-", "_")
+    if kind == "wallet-trades":
+        return "data", "trades"
+    if kind == "wallet-activity":
+        return "data", "activity"
     if kind in {
         "trades",
         "activity",
@@ -654,6 +856,14 @@ def row_to_task(row: Any) -> Task:
         last_error=last_error,
         max_attempts=int(max_attempts or 3),
     )
+
+
+def node_role(node_id: str) -> str:
+    if node_id.startswith("wallet-helper"):
+        return "wallet-helper"
+    if node_id.startswith("zetta-ubuntu-1"):
+        return "master"
+    return "unknown"
 
 
 def import_psycopg():

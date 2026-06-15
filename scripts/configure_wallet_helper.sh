@@ -52,7 +52,7 @@ set_env ZETTA_CLICKHOUSE_DATABASE "zetta"
 set_env ZETTA_RAW_DIR "$WALLET_RAW_DIR"
 set_env ZETTA_STATE_DIR "$WALLET_STATE_DIR"
 set_env ZETTA_WORKER_PROCESSES "$WORKER_PROCESSES"
-set_env ZETTA_WORKER_TASK_KINDS "wallet-portfolio,wallet-pnl"
+set_env ZETTA_WORKER_TASK_KINDS "wallet-trades,wallet-activity,wallet-portfolio,wallet-pnl"
 set_env ZETTA_REALTIME_TRADE_BATCH_SIZE "5000"
 set_env ZETTA_REALTIME_TRADE_MAX_PATHS "5000"
 

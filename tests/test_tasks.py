@@ -9,6 +9,7 @@ from zetta.cli import (
     FRONTIER_GAMMA_PRIORITY,
     FRONTIER_PRICE_HISTORY_PRIORITY,
     FRONTIER_TRADES_PRIORITY,
+    WALLET_EXPLICIT_REFRESH_PRIORITY,
     WALLET_REFRESH_PRIORITY,
     cmd_tasks_seed_basic,
     cmd_tasks_seed_frontier,
@@ -100,6 +101,12 @@ def test_postgres_task_store_claim_orders_kind_filter_before_lease_params() -> N
             self.sql = ""
             self.params = None
 
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *args):
+            return None
+
         def execute(self, sql, params) -> None:
             self.sql = sql
             self.params = params
@@ -125,6 +132,154 @@ def test_postgres_task_store_claim_orders_kind_filter_before_lease_params() -> N
     ]
 
 
+def test_postgres_task_store_node_progress_uses_lookback_parameter(monkeypatch) -> None:
+    class FakeCursor:
+        def __init__(self) -> None:
+            self.sql = ""
+            self.params = None
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *args):
+            return None
+
+        def execute(self, sql, params) -> None:
+            self.sql = sql
+            self.params = params
+
+        def fetchall(self):
+            return [
+                (
+                    "wallet-helper-1-1",
+                    {"wallet-pnl": {"runs": 2, "done": 2, "items": 10, "pages": 2, "avg_seconds": 0.5}},
+                    {"wallet-pnl": {"running_tasks": 1}},
+                    2,
+                    2,
+                    0,
+                    10,
+                    2,
+                    1,
+                    now,
+                )
+            ]
+
+    class FakeConnection:
+        def __init__(self, cursor) -> None:
+            self.cursor_instance = cursor
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *args):
+            return None
+
+        def cursor(self):
+            return self.cursor_instance
+
+    class FakePsycopg:
+        def __init__(self, cursor) -> None:
+            self.cursor_instance = cursor
+
+        def connect(self, _dsn):
+            return FakeConnection(self.cursor_instance)
+
+    now = datetime(2026, 1, 1, tzinfo=UTC)
+    cursor = FakeCursor()
+    monkeypatch.setattr("zetta.scheduler.tasks.import_psycopg", lambda: (FakePsycopg(cursor), object))
+    store = PostgresTaskStore(dsn="postgresql://example", node_id="api")
+
+    result = store.node_progress(lookback_minutes=15)
+
+    assert cursor.params == (15,)
+    assert "collector_runs" in cursor.sql
+    assert result["lookback_minutes"] == 15
+    assert result["totals"]["nodes"] == 1
+    assert result["totals"]["running_tasks"] == 1
+    assert result["nodes"][0]["role"] == "wallet-helper"
+
+
+def test_postgres_task_store_progress_uses_database_aggregates(monkeypatch) -> None:
+    class FakeCursor:
+        def __init__(self) -> None:
+            self.executed = []
+            self.index = 0
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *args):
+            return None
+
+        def execute(self, sql, params=None) -> None:
+            self.executed.append((sql, params))
+
+        def fetchall(self):
+            self.index += 1
+            if self.index == 1:
+                return [
+                    ("wallet-pnl", "done", 5),
+                    ("wallet-pnl", "running", 1),
+                    ("trades", "pending", 2),
+                ]
+            if self.index == 2:
+                return [("wallet-pnl", "running", 1, now)]
+            return [
+                (
+                    123,
+                    "wallet-pnl",
+                    "wallet-helper-1-1",
+                    now,
+                    now,
+                    "done",
+                    1,
+                    10,
+                    0.1,
+                    None,
+                )
+            ]
+
+    class FakeConnection:
+        def __init__(self, cursor) -> None:
+            self.cursor_instance = cursor
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *args):
+            return None
+
+        def cursor(self):
+            return self.cursor_instance
+
+    class FakePsycopg:
+        def __init__(self, cursor) -> None:
+            self.cursor_instance = cursor
+
+        def connect(self, _dsn):
+            return FakeConnection(self.cursor_instance)
+
+    now = datetime(2026, 1, 1, tzinfo=UTC)
+    cursor = FakeCursor()
+    monkeypatch.setattr("zetta.scheduler.tasks.import_psycopg", lambda: (FakePsycopg(cursor), object))
+    store = PostgresTaskStore(dsn="postgresql://example", node_id="api")
+
+    result = store.progress(recent_limit=8)
+
+    assert "group by task_type, status" in cursor.executed[0][0]
+    assert "from collector_tasks\n                    where status" in cursor.executed[1][0]
+    assert cursor.executed[1][1] == (8,)
+    assert result["summary"] == {
+        "pending": 2,
+        "running": 1,
+        "done": 5,
+        "failed": 0,
+        "dead_lettered": 0,
+    }
+    assert result["by_kind"]["wallet-pnl"]["done_percent"] == 83.33
+    assert result["active"][0]["kind"] == "wallet-pnl"
+
+
 def test_parse_task_kinds_accepts_repeated_and_comma_values() -> None:
     assert parse_task_kinds(["wallet-portfolio,wallet-pnl", "activity"]) == {
         "activity",
@@ -139,6 +294,8 @@ def test_task_source_entity_maps_known_task_kinds() -> None:
     assert task_source_entity("gamma-events") == ("gamma", "events")
     assert task_source_entity("prices-history") == ("clob", "prices_history")
     assert task_source_entity("activity") == ("data", "activity")
+    assert task_source_entity("wallet-activity") == ("data", "activity")
+    assert task_source_entity("wallet-trades") == ("data", "trades")
     assert task_source_entity("market-positions") == ("data", "market_positions")
     assert task_source_entity("positions") == ("data", "positions")
     assert task_source_entity("wallet-portfolio") == ("data", "wallet_portfolio")
@@ -261,8 +418,8 @@ def test_seed_wallets_adds_wallet_trade_and_activity_tasks(monkeypatch, tmp_path
 
     assert result["candidate_tasks"] == 4
     assert result["added"] == 4
-    assert [task.kind for task in tasks].count("trades") == 2
-    assert [task.kind for task in tasks].count("activity") == 2
+    assert [task.kind for task in tasks].count("wallet-trades") == 2
+    assert [task.kind for task in tasks].count("wallet-activity") == 2
     assert {task.priority for task in tasks} == {WALLET_REFRESH_PRIORITY}
     assert all(task.params["user"] in {"0xabc", "0xdef"} for task in tasks)
     assert all(requeue_done_task(task.params) for task in tasks)
@@ -311,6 +468,55 @@ def test_seed_wallets_can_use_smart_candidate_wallets(monkeypatch, tmp_path) -> 
     assert [task.kind for task in tasks] == ["wallet-portfolio", "wallet-portfolio"]
     assert all(task.priority == 0 for task in tasks)
     assert all(requeue_done_task(task.params) for task in tasks)
+
+
+def test_seed_wallets_allows_explicit_wallet_without_candidate_discovery(monkeypatch, tmp_path) -> None:
+    class FakeClickHouse:
+        def __init__(self, _settings):
+            pass
+
+        def query_text(self, _query):
+            raise AssertionError("explicit wallet seeding should not query candidates")
+
+    monkeypatch.setattr("zetta.cli.ClickHouseWriter", FakeClickHouse)
+    args = type(
+        "Args",
+        (),
+        {
+            "task_store": "local",
+            "task_file": str(tmp_path / "tasks.json"),
+            "node_id": "node-1",
+            "lease_seconds": 300,
+            "wallet_limit": 0,
+            "since_hours": 48,
+            "page_limit": 500,
+            "max_pages": 2,
+            "candidate_mode": "recent",
+            "min_notional": 10_000.0,
+            "include_trades": True,
+            "include_activity": True,
+            "include_wallet_portfolio": True,
+            "include_wallet_pnl": True,
+            "refresh_run": "manual-wallet",
+            "requeue_done": True,
+            "wallets": ["0xABC"],
+        },
+    )()
+
+    result = cmd_tasks_seed_wallets(args, Settings())
+    tasks = LocalTaskStore(tmp_path / "tasks.json").load()
+
+    assert result["wallets"] == 1
+    assert result["explicit_wallets"] == 1
+    assert result["candidate_tasks"] == 4
+    assert {task.kind for task in tasks} == {
+        "wallet-activity",
+        "wallet-trades",
+        "wallet-pnl",
+        "wallet-portfolio",
+    }
+    assert {task.params["user"] for task in tasks} == {"0xabc"}
+    assert {task.priority for task in tasks} == {WALLET_EXPLICIT_REFRESH_PRIORITY}
 
 
 def test_local_task_store_retries_then_dead_letters(tmp_path) -> None:

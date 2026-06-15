@@ -3,17 +3,19 @@ import { createRoot } from "react-dom/client";
 import {
   Activity,
   AlertTriangle,
-  BarChart3,
   ChevronRight,
   Cpu,
   Database,
+  Eye,
   HardDrive,
   Loader2,
+  Plus,
   MemoryStick,
   RefreshCw,
   Search,
   Server,
   Table2,
+  Trash2,
   Trophy,
   UserRound,
   UsersRound,
@@ -29,10 +31,11 @@ import {
 import "./styles.css";
 
 const API_BASE = import.meta.env.VITE_ZETTA_API_BASE || "/api";
-const DASHBOARD_REFRESH_MS = 30_000;
+const SYSTEM_REFRESH_MS = 30_000;
 const MARKET_REFRESH_MS = 30_000;
 const LEADERBOARD_REFRESH_MS = 30_000;
 const WORLD_CUP_DEFAULT_QUERY = "World Cup";
+const TRACKED_WALLETS_STORAGE_KEY = "zetta.trackedWallets.v1";
 
 type Overview = {
   events?: number;
@@ -122,8 +125,6 @@ type Trade = {
   outcome?: string;
 };
 
-type TraderProfile = Record<string, string | number | null>;
-
 type Progress = {
   summary: Record<string, number>;
   total_tasks: number;
@@ -154,6 +155,47 @@ type Progress = {
   }>;
 };
 
+type NodeProgressKind = {
+  runs?: number;
+  done?: number;
+  not_done?: number;
+  items?: number;
+  pages?: number;
+  avg_seconds?: number;
+  latest_finished?: string | null;
+  running_tasks?: number;
+  oldest_claim?: string | null;
+  newest_claim?: string | null;
+};
+
+type NodeProgressRow = {
+  node_id: string;
+  role: string;
+  recent_by_kind: Record<string, NodeProgressKind>;
+  running_by_kind: Record<string, NodeProgressKind>;
+  runs: number;
+  done: number;
+  not_done: number;
+  items: number;
+  pages: number;
+  running_tasks: number;
+  latest_finished: string | null;
+};
+
+type NodeProgress = {
+  lookback_minutes: number;
+  nodes: NodeProgressRow[];
+  totals: {
+    nodes: number;
+    runs: number;
+    done: number;
+    not_done: number;
+    items: number;
+    pages: number;
+    running_tasks: number;
+  };
+};
+
 type LeaderboardUser = {
   rank: string;
   proxyWallet: string;
@@ -180,7 +222,85 @@ type BiggestWinner = {
 type LeaderboardRange = "DAY" | "WEEK" | "MONTH" | "ALL";
 type LeaderboardMetric = "profit" | "volume" | "wins";
 type MarketFilter = "all" | "active" | "movement" | "liquidity" | "closing";
-type View = "markets" | "leaderboard" | "dashboard" | "traders" | "operations";
+type View = "markets" | "leaderboard" | "system" | "tracked-wallets";
+
+type TrackedWallet = {
+  address: string;
+  name: string;
+  addedAt: string;
+};
+
+type WalletPosition = {
+  asset: string;
+  condition_id: string;
+  title: string;
+  slug: string;
+  event_slug: string;
+  outcome: string;
+  size: number;
+  avg_price: number;
+  cur_price: number;
+  current_value: number;
+  cash_pnl: number;
+  percent_pnl: number;
+  is_worldcup: boolean;
+  is_open: boolean;
+  redeemable: boolean;
+};
+
+type WalletActivity = {
+  timestamp: string;
+  activity_type: string;
+  side: string;
+  price: number;
+  size: number;
+  notional: number;
+  title: string;
+  slug: string;
+  event_slug: string;
+  outcome: string;
+};
+
+type WalletDetail = {
+  wallet: {
+    user_address: string;
+    latest_total_pnl?: number | null;
+    pnl_7d?: number | null;
+    win_rate?: number | null;
+    avg_bet?: number | null;
+    cash?: number | null;
+    trade_volume_7d?: number | null;
+    trade_count_7d?: number | null;
+    last_activity_at?: string | null;
+    portfolio_value?: number | null;
+    positions_value?: number | null;
+    available_balance?: number | null;
+    position_count?: number | null;
+    pnl_captured_at?: string | null;
+    portfolio_captured_at?: string | null;
+  };
+  position_summary: {
+    position_count: number;
+    open_position_count: number;
+    worldcup_position_count: number;
+    current_value: number;
+    open_cash_pnl: number;
+    worldcup_cash_pnl: number;
+  };
+  positions: WalletPosition[];
+  positions_returned: number;
+  positions_available: number;
+  pnl_points: Array<{ timestamp: number; datetime: string | null; pnl: number }>;
+  activity_summary: Record<string, string | number | null>;
+  recent_activity: WalletActivity[];
+  reputation: Record<string, string | number | null>;
+};
+
+type WalletDetailState = {
+  loading: boolean;
+  detail?: WalletDetail;
+  error?: string;
+};
 
 const rangeOptions: Array<{ label: string; value: LeaderboardRange }> = [
   { label: "Today", value: "DAY" },
@@ -197,11 +317,27 @@ const marketFilters: Array<{ label: string; value: MarketFilter }> = [
   { label: "Closing", value: "closing" },
 ];
 
+const viewPaths: Record<View, string> = {
+  markets: "/",
+  leaderboard: "/leaderboard",
+  system: "/system",
+  "tracked-wallets": "/tracked-wallets",
+};
+
+function viewFromPath(pathname: string): View {
+  const normalized = pathname.replace(/\/+$/, "") || "/";
+  if (normalized === "/dashboard" || normalized === "/operations") return "system";
+  if (normalized === "/traders") return "tracked-wallets";
+  const match = Object.entries(viewPaths).find(([, path]) => path === normalized);
+  return match ? (match[0] as View) : "markets";
+}
+
 function App() {
-  const [view, setView] = useState<View>("markets");
+  const [view, setView] = useState<View>(() => viewFromPath(window.location.pathname));
   const [overview, setOverview] = useState<Overview>({});
   const [ingestion, setIngestion] = useState<IngestionRow[]>([]);
   const [progress, setProgress] = useState<Progress | null>(null);
+  const [nodeProgress, setNodeProgress] = useState<NodeProgress | null>(null);
   const [system, setSystem] = useState<SystemStats | null>(null);
   const [markets, setMarkets] = useState<Market[]>([]);
   const [selectedMarket, setSelectedMarket] = useState<Market | null>(null);
@@ -213,17 +349,33 @@ function App() {
   const [leaderboardRows, setLeaderboardRows] = useState<LeaderboardUser[]>([]);
   const [winnerRows, setWinnerRows] = useState<BiggestWinner[]>([]);
   const [leaderboardLoading, setLeaderboardLoading] = useState(false);
-  const [wallet, setWallet] = useState("");
-  const [profile, setProfile] = useState<TraderProfile | null>(null);
+  const [trackedWallets, setTrackedWallets] = useState<TrackedWallet[]>(() => loadTrackedWallets());
+  const [walletDetails, setWalletDetails] = useState<Record<string, WalletDetailState>>({});
+  const [selectedTrackedWallet, setSelectedTrackedWallet] = useState("");
+  const [trackedWalletAddress, setTrackedWalletAddress] = useState("");
+  const [trackedWalletName, setTrackedWalletName] = useState("");
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState("");
   const queryRef = useRef(query);
 
   useEffect(() => {
-    void refreshDashboard();
+    const onPopState = () => setView(viewFromPath(window.location.pathname));
+    window.addEventListener("popstate", onPopState);
+    return () => window.removeEventListener("popstate", onPopState);
+  }, []);
+
+  useEffect(() => {
+    const canonicalPath = viewPaths[view];
+    if (window.location.pathname !== canonicalPath) {
+      window.history.replaceState({}, "", canonicalPath);
+    }
+  }, []);
+
+  useEffect(() => {
+    void refreshSystem();
     const timer = window.setInterval(() => {
-      void refreshDashboard();
-    }, DASHBOARD_REFRESH_MS);
+      void refreshSystem();
+    }, SYSTEM_REFRESH_MS);
     return () => window.clearInterval(timer);
   }, []);
 
@@ -243,6 +395,15 @@ function App() {
     return () => window.clearInterval(timer);
   }, [leaderboardRange, leaderboardMetric]);
 
+  useEffect(() => {
+    saveTrackedWallets(trackedWallets);
+  }, [trackedWallets]);
+
+  useEffect(() => {
+    if (!trackedWallets.length) return;
+    void refreshTrackedWallets();
+  }, [trackedWallets.map((item) => item.address).join("|")]);
+
   async function getJson<T>(path: string): Promise<T> {
     const response = await fetch(`${API_BASE}${path}`);
     if (!response.ok) {
@@ -251,18 +412,20 @@ function App() {
     return (await response.json()) as T;
   }
 
-  async function refreshDashboard() {
+  async function refreshSystem() {
     setError("");
     try {
-      const [overviewData, ingestionData, progressData, systemData] = await Promise.all([
+      const [overviewData, ingestionData, progressData, nodeProgressData, systemData] = await Promise.all([
         getJson<{ overview: Overview }>("/stats/overview"),
         getJson<{ ingestion: IngestionRow[] }>("/stats/ingestion"),
         getJson<Progress>("/tasks/progress?recent_limit=8"),
+        getJson<NodeProgress>("/tasks/nodes?lookback_minutes=30"),
         getJson<{ system: SystemStats }>("/stats/system"),
       ]);
       setOverview(overviewData.overview || {});
       setIngestion(ingestionData.ingestion || []);
       setProgress(progressData);
+      setNodeProgress(nodeProgressData);
       setSystem(systemData.system || null);
     } catch (exc) {
       setError(errorMessage(exc));
@@ -272,6 +435,14 @@ function App() {
   function updateQuery(nextQuery: string) {
     queryRef.current = nextQuery;
     setQuery(nextQuery);
+  }
+
+  function navigateToView(nextView: View) {
+    setView(nextView);
+    const nextPath = viewPaths[nextView];
+    if (window.location.pathname !== nextPath) {
+      window.history.pushState({}, "", nextPath);
+    }
   }
 
   async function searchMarkets(nextQuery = query, options: { silent?: boolean } = {}) {
@@ -345,20 +516,68 @@ function App() {
     }
   }
 
-  async function loadTrader() {
-    if (!wallet.trim()) return;
-    setLoading(true);
-    setError("");
-    setProfile(null);
+  async function fetchWalletDetail(address: string, options: { refresh?: boolean } = {}) {
+    const refreshParam = options.refresh ? "&refresh=1" : "";
+    return getJson<WalletDetail>(
+      `/wallets/detail?user=${encodeURIComponent(address)}&position_limit=50&activity_limit=30&pnl_points_limit=240${refreshParam}`,
+    );
+  }
+
+  async function refreshTrackedWallet(address: string, options: { enqueueRefresh?: boolean } = {}) {
+    const normalized = normalizeWalletAddress(address);
+    if (!normalized) return;
+    setWalletDetails((current) => ({
+      ...current,
+      [normalized]: { ...current[normalized], loading: true, error: "" },
+    }));
     try {
-      const data = await getJson<{ profile: TraderProfile }>(
-        `/traders/profile?user=${encodeURIComponent(wallet.trim())}`,
-      );
-      setProfile(data.profile);
-    } catch {
-      setError("Trader profile not found yet.");
-    } finally {
-      setLoading(false);
+      const detail = await fetchWalletDetail(normalized, { refresh: options.enqueueRefresh });
+      setWalletDetails((current) => ({
+        ...current,
+        [normalized]: { loading: false, detail },
+      }));
+    } catch (exc) {
+      setWalletDetails((current) => ({
+        ...current,
+        [normalized]: { loading: false, error: errorMessage(exc) },
+      }));
+    }
+  }
+
+  async function refreshTrackedWallets() {
+    await Promise.all(trackedWallets.map((item) => refreshTrackedWallet(item.address)));
+  }
+
+  async function addTrackedWallet() {
+    const address = normalizeWalletAddress(trackedWalletAddress);
+    if (!address) {
+      setError("Enter a valid wallet address.");
+      return;
+    }
+    const name = trackedWalletName.trim() || shortId(address);
+    setTrackedWallets((current) => {
+      const existing = current.find((item) => item.address === address);
+      if (existing) {
+        return current.map((item) => item.address === address ? { ...item, name } : item);
+      }
+      return [{ address, name, addedAt: new Date().toISOString() }, ...current];
+    });
+    setSelectedTrackedWallet(address);
+    setTrackedWalletAddress("");
+    setTrackedWalletName("");
+    setError("");
+    await refreshTrackedWallet(address, { enqueueRefresh: true });
+  }
+
+  function removeTrackedWallet(address: string) {
+    setTrackedWallets((current) => current.filter((item) => item.address !== address));
+    setWalletDetails((current) => {
+      const next = { ...current };
+      delete next[address];
+      return next;
+    });
+    if (selectedTrackedWallet === address) {
+      setSelectedTrackedWallet("");
     }
   }
 
@@ -377,11 +596,10 @@ function App() {
           <span>Zetta</span>
         </div>
         <nav>
-          <NavButton active={view === "markets"} icon={<Table2 size={18} />} label="World Cup" onClick={() => setView("markets")} />
-          <NavButton active={view === "leaderboard"} icon={<Trophy size={18} />} label="Leaderboard" onClick={() => setView("leaderboard")} />
-          <NavButton active={view === "dashboard"} icon={<BarChart3 size={18} />} label="Overview" onClick={() => setView("dashboard")} />
-          <NavButton active={view === "traders"} icon={<UserRound size={18} />} label="Trader Lookup" onClick={() => setView("traders")} />
-          <NavButton active={view === "operations"} icon={<Server size={18} />} label="Operations" onClick={() => setView("operations")} />
+          <NavButton active={view === "markets"} icon={<Table2 size={18} />} label="World Cup" onClick={() => navigateToView("markets")} />
+          <NavButton active={view === "leaderboard"} icon={<Trophy size={18} />} label="Leaderboard" onClick={() => navigateToView("leaderboard")} />
+          <NavButton active={view === "system"} icon={<Server size={18} />} label="System" onClick={() => navigateToView("system")} />
+          <NavButton active={view === "tracked-wallets"} icon={<Wallet size={18} />} label="Tracked Wallets" onClick={() => navigateToView("tracked-wallets")} />
         </nav>
       </aside>
 
@@ -391,7 +609,11 @@ function App() {
             <h1>{viewTitle(view)}</h1>
             <p>{viewDescription(view)}</p>
           </div>
-          <button className="iconButton" onClick={() => view === "leaderboard" ? loadLeaderboard() : view === "markets" ? searchMarkets() : refreshDashboard()} title="Refresh">
+          <button
+            className="iconButton"
+            onClick={() => view === "leaderboard" ? loadLeaderboard() : view === "markets" ? searchMarkets() : view === "tracked-wallets" ? refreshTrackedWallets() : refreshSystem()}
+            title="Refresh"
+          >
             <RefreshCw size={18} />
           </button>
         </header>
@@ -426,15 +648,26 @@ function App() {
           />
         ) : null}
 
-        {view === "dashboard" ? (
-          <Dashboard overview={overview} ingestion={ingestion} progress={progress} system={system} />
+        {view === "system" ? (
+          <SystemPage overview={overview} ingestion={ingestion} progress={progress} progressRows={progressRows} nodeProgress={nodeProgress} system={system} />
         ) : null}
 
-        {view === "traders" ? (
-          <Traders wallet={wallet} setWallet={setWallet} profile={profile} loading={loading} onLoad={loadTrader} />
+        {view === "tracked-wallets" ? (
+          <TrackedWallets
+            wallets={trackedWallets}
+            details={walletDetails}
+            selectedAddress={selectedTrackedWallet}
+            addressInput={trackedWalletAddress}
+            nameInput={trackedWalletName}
+            setAddressInput={setTrackedWalletAddress}
+            setNameInput={setTrackedWalletName}
+            onAdd={addTrackedWallet}
+            onSelect={setSelectedTrackedWallet}
+            onRefresh={(address) => refreshTrackedWallet(address, { enqueueRefresh: true })}
+            onRemove={removeTrackedWallet}
+          />
         ) : null}
 
-        {view === "operations" ? <Operations progress={progress} progressRows={progressRows} ingestion={ingestion} system={system} /> : null}
       </main>
     </div>
   );
@@ -709,15 +942,19 @@ function TraderIdentity({ wallet, name, image }: { wallet: string; name?: string
   );
 }
 
-function Dashboard({
+function SystemPage({
   overview,
   ingestion,
   progress,
+  progressRows,
+  nodeProgress,
   system,
 }: {
   overview: Overview;
   ingestion: IngestionRow[];
   progress: Progress | null;
+  progressRows: Array<{ kind: string; total: number; pending: number; running: number; done: number; dead_lettered: number; done_percent: number }>;
+  nodeProgress: NodeProgress | null;
   system: SystemStats | null;
 }) {
   const statCards = [
@@ -730,7 +967,7 @@ function Dashboard({
   ];
   return (
     <section className="gridPage">
-      <div className="metrics">
+      <div className="metrics wide">
         {statCards.map(([label, value]) => (
           <div className="metric" key={label}>
             <span>{label}</span>
@@ -739,21 +976,7 @@ function Dashboard({
         ))}
       </div>
 
-      <SystemPressure system={system} />
-
-      <div className="panel">
-        <PanelTitle icon={<Database size={18} />} title="Ingestion Batches" />
-        <table>
-          <tbody>
-            {ingestion.slice(0, 8).map((row) => (
-              <tr key={`${row.source}-${row.entity}`}>
-                <td>{row.source}.{row.entity}</td>
-                <td className="num">{formatNumber(row.raw_batches)}</td>
-              </tr>
-            ))}
-          </tbody>
-        </table>
-      </div>
+      <SystemPressure system={system} wide />
 
       <div className="panel">
         <PanelTitle icon={<Activity size={18} />} title="Task State" />
@@ -775,70 +998,44 @@ function Dashboard({
           </PieChart>
         </ResponsiveContainer>
       </div>
-    </section>
-  );
-}
 
-function Traders({
-  wallet,
-  setWallet,
-  profile,
-  loading,
-  onLoad,
-}: {
-  wallet: string;
-  setWallet: (value: string) => void;
-  profile: TraderProfile | null;
-  loading: boolean;
-  onLoad: () => void;
-}) {
-  const fields = [
-    "trade_count",
-    "traded_notional",
-    "position_count",
-    "current_value",
-    "total_pnl",
-    "chain_fill_count",
-    "chain_traded_notional",
-    "chain_mark_to_market_pnl",
-  ];
-  return (
-    <section className="panel">
-      <div className="searchRow">
-        <UserRound size={18} />
-        <input value={wallet} onChange={(event) => setWallet(event.target.value)} placeholder="0x wallet address" onKeyDown={(event) => event.key === "Enter" && onLoad()} />
-        <button onClick={onLoad}>{loading ? <Loader2 className="spin" size={16} /> : "Load"}</button>
+      <div className="panel">
+        <PanelTitle icon={<Database size={18} />} title="Ingestion Batches" />
+        <table>
+          <tbody>
+            {ingestion.slice(0, 8).map((row) => (
+              <tr key={`${row.source}-${row.entity}`}>
+                <td>{row.source}.{row.entity}</td>
+                <td className="num">{formatNumber(row.raw_batches)}</td>
+              </tr>
+            ))}
+          </tbody>
+        </table>
       </div>
-      {profile ? (
-        <div className="metrics">
-          {fields.map((field) => (
-            <div className="metric" key={field}>
-              <span>{field.replaceAll("_", " ")}</span>
-              <strong>{formatNumber(profile[field] as number)}</strong>
-            </div>
-          ))}
-        </div>
-      ) : (
-        <div className="empty">Enter a wallet address to inspect trader profile data.</div>
-      )}
-    </section>
-  );
-}
 
-function Operations({
-  progress,
-  progressRows,
-  ingestion,
-  system,
-}: {
-  progress: Progress | null;
-  progressRows: Array<{ kind: string; total: number; pending: number; running: number; done: number; dead_lettered: number; done_percent: number }>;
-  ingestion: IngestionRow[];
-  system: SystemStats | null;
-}) {
-  return (
-    <section className="gridPage">
-      <SystemPressure system={system} wide />
+      <div className="panel wide">
+        <PanelTitle icon={<Server size={18} />} title="Node Progress" />
+        <table>
+          <thead>
+            <tr><th>Node</th><th>Role</th><th>Running</th><th>30m Runs</th><th>Items</th><th>Avg</th><th>Active Kinds</th><th>Last Done</th></tr>
+          </thead>
+          <tbody>
+            {(nodeProgress?.nodes || []).map((node) => (
+              <tr key={node.node_id}>
+                <td>{node.node_id}</td>
+                <td>{node.role}</td>
+                <td className="num">{formatNumber(node.running_tasks)}</td>
+                <td className="num">{formatNumber(node.runs)}</td>
+                <td className="num">{formatNumber(node.items)}</td>
+                <td className="num">{formatSeconds(nodeAverageSeconds(node))}</td>
+                <td>{nodeActiveKinds(node)}</td>
+                <td>{formatRelativeTime(node.latest_finished)}</td>
+              </tr>
+            ))}
+          </tbody>
+        </table>
+        {!nodeProgress?.nodes?.length ? <div className="empty">No node progress rows loaded yet.</div> : null}
+      </div>
 
       <div className="panel wide">
         <PanelTitle icon={<Server size={18} />} title="Task Queue" />
@@ -861,6 +1058,7 @@ function Operations({
           </tbody>
         </table>
       </div>
+
       <div className="panel wide">
         <PanelTitle icon={<Activity size={18} />} title="Recent Runs" />
         <table>
@@ -881,6 +1079,7 @@ function Operations({
           </tbody>
         </table>
       </div>
+
       <div className="panel wide">
         <PanelTitle icon={<Database size={18} />} title="Raw Ingestion" />
         <table>
@@ -901,6 +1100,199 @@ function Operations({
         </table>
       </div>
     </section>
+  );
+}
+
+function TrackedWallets({
+  wallets,
+  details,
+  selectedAddress,
+  addressInput,
+  nameInput,
+  setAddressInput,
+  setNameInput,
+  onAdd,
+  onSelect,
+  onRefresh,
+  onRemove,
+}: {
+  wallets: TrackedWallet[];
+  details: Record<string, WalletDetailState>;
+  selectedAddress: string;
+  addressInput: string;
+  nameInput: string;
+  setAddressInput: (value: string) => void;
+  setNameInput: (value: string) => void;
+  onAdd: () => void;
+  onSelect: (address: string) => void;
+  onRefresh: (address: string) => void;
+  onRemove: (address: string) => void;
+}) {
+  const selected = selectedAddress
+    ? wallets.find((wallet) => wallet.address === selectedAddress) || null
+    : wallets[0] || null;
+  const selectedState = selected ? details[selected.address] : undefined;
+
+  return (
+    <section className="trackedWalletPage">
+      <div className="trackedToolbar panel">
+        <div className="trackedInput">
+          <Wallet size={18} />
+          <input
+            value={addressInput}
+            onChange={(event) => setAddressInput(event.target.value)}
+            placeholder="0x wallet address"
+            onKeyDown={(event) => event.key === "Enter" && onAdd()}
+            aria-label="Wallet address"
+          />
+        </div>
+        <div className="trackedInput">
+          <UserRound size={18} />
+          <input
+            value={nameInput}
+            onChange={(event) => setNameInput(event.target.value)}
+            placeholder="Wallet name"
+            onKeyDown={(event) => event.key === "Enter" && onAdd()}
+            aria-label="Wallet name"
+          />
+        </div>
+        <button className="commandButton" onClick={onAdd}>
+          <Plus size={16} />
+          Add
+        </button>
+      </div>
+
+      <div className="trackedLayout">
+        <div className="panelFlush trackedTable">
+          <div className="trackedRow trackedHeader">
+            <span>Wallet</span>
+            <span>7d PnL</span>
+            <span>Win Rate / Avg Bet</span>
+            <span>Cash</span>
+            <span>7d Volume / Trades</span>
+            <span>Last Active</span>
+            <span>Actions</span>
+          </div>
+          {wallets.map((wallet) => {
+            const state = details[wallet.address];
+            const detail = state?.detail;
+            return (
+              <button
+                className={wallet.address === selected?.address ? "trackedRow active" : "trackedRow"}
+                key={wallet.address}
+                onClick={() => onSelect(wallet.address)}
+              >
+                <span className="walletNameCell">
+                  <strong>{wallet.name}</strong>
+                  <small>{shortId(wallet.address)}</small>
+                </span>
+                <ProfitCell value={detail?.wallet.pnl_7d} />
+                <span className="stackedMetric">
+                  <strong>{formatRatioPercent(detail?.wallet.win_rate)}</strong>
+                  <small>{formatCurrency(detail?.wallet.avg_bet)}</small>
+                </span>
+                <span className="num">{formatCurrency(detail?.wallet.cash)}</span>
+                <span className="stackedMetric right">
+                  <strong>{formatCurrency(detail?.wallet.trade_volume_7d)}</strong>
+                  <small>{formatCount(detail?.wallet.trade_count_7d)}</small>
+                </span>
+                <span className="mutedText">{formatRelativeTime(detail?.wallet.last_activity_at)}</span>
+                <span className="rowActions" onClick={(event) => event.stopPropagation()}>
+                  <button className="iconButton small" onClick={() => onRefresh(wallet.address)} title="Refresh wallet">
+                    {state?.loading ? <Loader2 className="spin" size={15} /> : <RefreshCw size={15} />}
+                  </button>
+                  <button className="iconButton small" onClick={() => onSelect(wallet.address)} title="Open wallet">
+                    <Eye size={15} />
+                  </button>
+                  <button className="iconButton small danger" onClick={() => onRemove(wallet.address)} title="Remove wallet">
+                    <Trash2 size={15} />
+                  </button>
+                </span>
+              </button>
+            );
+          })}
+          {!wallets.length ? (
+            <div className="empty trackedEmpty">Add a wallet address to build a tracked wallet list.</div>
+          ) : null}
+        </div>
+
+        <WalletDetailPanel wallet={selected} state={selectedState} />
+      </div>
+    </section>
+  );
+}
+
+function WalletDetailPanel({
+  wallet,
+  state,
+}: {
+  wallet: TrackedWallet | null;
+  state: WalletDetailState | undefined;
+}) {
+  const detail = state?.detail;
+  if (!wallet) {
+    return <aside className="sidePanel emptyPanel">Select a tracked wallet to inspect positions and activity.</aside>;
+  }
+  if (state?.loading && !detail) {
+    return <aside className="sidePanel emptyPanel"><Loader2 className="spin" size={18} /> Loading wallet detail</aside>;
+  }
+  if (state?.error && !detail) {
+    return <aside className="sidePanel emptyPanel">Wallet detail is not available yet.</aside>;
+  }
+  if (!detail) {
+    return <aside className="sidePanel emptyPanel">Wallet detail has not been loaded yet.</aside>;
+  }
+
+  return (
+    <aside className="walletDetailPanel sidePanel">
+      <div className="sideTitle">
+        <h2>{wallet.name}</h2>
+        <code>{shortId(wallet.address)}</code>
+      </div>
+      <div className="walletDetailHero">
+        <span>Total PnL</span>
+        <strong className={Number(detail.wallet.latest_total_pnl || 0) >= 0 ? "positive" : "negative"}>
+          {formatCurrency(detail.wallet.latest_total_pnl)}
+        </strong>
+        <small>Last active {formatRelativeTime(detail.wallet.last_activity_at)}</small>
+      </div>
+      <div className="miniGrid">
+        <MiniStat label="Portfolio" value={formatCurrency(detail.wallet.portfolio_value)} />
+        <MiniStat label="Open value" value={formatCurrency(detail.wallet.positions_value)} />
+        <MiniStat label="Cash" value={formatCurrency(detail.wallet.cash)} />
+        <MiniStat label="Win rate" value={formatRatioPercent(detail.wallet.win_rate)} />
+      </div>
+
+      <h3>Positions</h3>
+      <div className="walletPositionList">
+        {detail.positions.slice(0, 8).map((position) => (
+          <div className="walletPosition" key={`${position.asset}-${position.slug}`}>
+            <div>
+              <strong>{position.title || position.slug}</strong>
+              <small>{position.outcome} / {position.is_open ? "Open" : "Historical"}</small>
+            </div>
+            <span className={Number(position.cash_pnl) >= 0 ? "num positive" : "num negative"}>
+              {formatCurrency(position.cash_pnl)}
+            </span>
+          </div>
+        ))}
+        {!detail.positions.length ? <div className="empty">No positions in the selected scope.</div> : null}
+      </div>
+
+      <h3>Recent Activity</h3>
+      <div className="activityList compact">
+        {detail.recent_activity.slice(0, 8).map((activity) => (
+          <div className="activityItem" key={`${activity.timestamp}-${activity.slug}-${activity.notional}`}>
+            <div>
+              <strong>{activity.side || activity.activity_type}</strong>
+              <span>{formatCurrency(activity.notional)}</span>
+            </div>
+            <p>{activity.title || activity.slug || activity.outcome}</p>
+            <small>{activity.outcome} / {formatRelativeTime(activity.timestamp)}</small>
+          </div>
+        ))}
+      </div>
+    </aside>
   );
 }
 
@@ -1051,9 +1443,8 @@ function viewTitle(view: View) {
   return {
     markets: "World Cup Markets",
     leaderboard: "Leaderboard",
-    dashboard: "Internal Overview",
-    traders: "Trader Profiles",
-    operations: "Collection Operations",
+    system: "System",
+    "tracked-wallets": "Tracked Wallets",
   }[view];
 }
 
@@ -1061,10 +1452,38 @@ function viewDescription(view: View) {
   return {
     markets: "World Cup football markets, prices, liquidity, and live trade flow.",
     leaderboard: "Polymarket sports leaderboard data, used directly from data-api.",
-    dashboard: "Collector health and warehouse progress. Auto-refreshes every 30 seconds.",
-    traders: "Lookup a wallet in Zetta's internal mart data.",
-    operations: "Backfill queue and ingestion state.",
+    system: "Collector health, hardware pressure, task queue, and ingestion state.",
+    "tracked-wallets": "Save wallet addresses, monitor key wallet metrics, and drill into wallet detail.",
   }[view];
+}
+
+function loadTrackedWallets(): TrackedWallet[] {
+  if (typeof window === "undefined") return [];
+  try {
+    const raw = window.localStorage.getItem(TRACKED_WALLETS_STORAGE_KEY);
+    const parsed = raw ? JSON.parse(raw) : [];
+    if (!Array.isArray(parsed)) return [];
+    return parsed
+      .map((item) => ({
+        address: normalizeWalletAddress(String(item?.address || "")),
+        name: String(item?.name || ""),
+        addedAt: String(item?.addedAt || new Date().toISOString()),
+      }))
+      .filter((item) => item.address)
+      .map((item) => ({ ...item, name: item.name || shortId(item.address) }));
+  } catch {
+    return [];
+  }
+}
+
+function saveTrackedWallets(wallets: TrackedWallet[]) {
+  if (typeof window === "undefined") return;
+  window.localStorage.setItem(TRACKED_WALLETS_STORAGE_KEY, JSON.stringify(wallets));
+}
+
+function normalizeWalletAddress(value: string) {
+  const address = value.trim().toLowerCase();
+  return /^0x[a-f0-9]{40}$/.test(address) ? address : "";
 }
 
 function rangeLabel(value: LeaderboardRange) {
@@ -1080,27 +1499,72 @@ function formatNumber(value: unknown) {
   return new Intl.NumberFormat("en-US", { maximumFractionDigits: 2 }).format(number);
 }
 
+function formatCount(value: unknown) {
+  if (isMissing(value)) return "--";
+  return formatNumber(value);
+}
+
 function formatMetric(value: unknown) {
+  if (isMissing(value)) return "--";
   const number = Number(value);
   if (!Number.isFinite(number)) return "--";
   return formatNumber(number);
 }
 
+function formatSeconds(value: unknown) {
+  if (isMissing(value)) return "--";
+  const number = Number(value);
+  if (!Number.isFinite(number)) return "--";
+  return `${formatNumber(number)}s`;
+}
+
+function nodeAverageSeconds(node: NodeProgressRow) {
+  if (!node.runs) return null;
+  const weightedSeconds = Object.values(node.recent_by_kind || {}).reduce(
+    (total, kind) => total + Number(kind.avg_seconds || 0) * Number(kind.runs || 0),
+    0,
+  );
+  return weightedSeconds / node.runs;
+}
+
+function nodeActiveKinds(node: NodeProgressRow) {
+  const runningKinds = Object.entries(node.running_by_kind || {})
+    .filter(([, kind]) => Number(kind.running_tasks || 0) > 0)
+    .map(([kind, value]) => `${kind} (${formatNumber(value.running_tasks)})`);
+  if (runningKinds.length) return runningKinds.join(", ");
+  return Object.entries(node.recent_by_kind || {})
+    .sort(([, left], [, right]) => Number(right.runs || 0) - Number(left.runs || 0))
+    .slice(0, 2)
+    .map(([kind, value]) => `${kind} (${formatNumber(value.runs)})`)
+    .join(", ") || "--";
+}
+
 function formatCurrency(value: unknown) {
-  const number = Number(value || 0);
+  if (isMissing(value)) return "--";
+  const number = Number(value);
+  if (!Number.isFinite(number)) return "--";
   const abs = Math.abs(number);
   if (abs >= 1_000_000) return `${number < 0 ? "-" : ""}$${formatNumber(abs / 1_000_000)}M`;
   if (abs >= 1_000) return `${number < 0 ? "-" : ""}$${formatNumber(abs / 1_000)}K`;
   return new Intl.NumberFormat("en-US", { style: "currency", currency: "USD", maximumFractionDigits: 0 }).format(number);
 }
 
+function formatRatioPercent(value: unknown) {
+  if (isMissing(value)) return "--";
+  const number = Number(value);
+  if (!Number.isFinite(number)) return "--";
+  return `${formatNumber(number * 100)}%`;
+}
+
 function formatPrice(value: unknown) {
+  if (isMissing(value)) return "--";
   const number = Number(value);
   if (!Number.isFinite(number)) return "--";
   return `${formatNumber(number * 100)}c`;
 }
 
 function formatPercent(value: unknown) {
+  if (isMissing(value)) return "--";
   const number = Number(value);
   if (!Number.isFinite(number)) return "--";
   return `${formatNumber(number)}%`;
@@ -1144,9 +1608,9 @@ function formatShortDate(value: string | null | undefined) {
 }
 
 function formatRelativeTime(value: string | null | undefined) {
-  if (!value) return "just now";
+  if (!value) return "--";
   const time = new Date(value).getTime();
-  if (Number.isNaN(time)) return "just now";
+  if (Number.isNaN(time)) return "--";
   const seconds = Math.max(0, Math.floor((Date.now() - time) / 1000));
   if (seconds < 60) return `${seconds}s ago`;
   const minutes = Math.floor(seconds / 60);
@@ -1187,6 +1651,17 @@ function shortId(value: string | undefined) {
   if (!value) return "--";
   if (value.length < 14) return value;
   return `${value.slice(0, 6)}...${value.slice(-6)}`;
+}
+
+function isMissing(value: unknown) {
+  return value === null || value === undefined || value === "";
+}
+
+function ProfitCell({ value }: { value: unknown }) {
+  if (isMissing(value)) return <span className="num mutedText">--</span>;
+  const number = Number(value);
+  if (!Number.isFinite(number)) return <span className="num mutedText">--</span>;
+  return <span className={number >= 0 ? "num positive" : "num negative"}>{formatCurrency(number)}</span>;
 }
 
 createRoot(document.getElementById("root")!).render(<App />);

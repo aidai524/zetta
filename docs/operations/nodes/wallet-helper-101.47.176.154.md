@@ -4,7 +4,7 @@ Role: wallet helper.
 
 Node ID: `wallet-helper-2`.
 
-This node has 16 CPU cores and 32 GB RAM. It should only process wallet snapshot
+This node has 16 CPU cores and 32 GB RAM. It should only process wallet-scoped
 tasks. It should not run API, full-site frontier, chain, mart, web frontend, or
 local database services. Use 4 worker processes by default; increase only after
 Polymarket API error rates and memory are stable.
@@ -59,7 +59,7 @@ Expected values:
 - `ZETTA_CLICKHOUSE_HOST=10.17.12.97`
 - `ZETTA_RAW_DIR=/var/lib/zetta/wallet-raw`
 - `ZETTA_STATE_DIR=/var/lib/zetta/wallet-state`
-- `ZETTA_WORKER_TASK_KINDS=wallet-portfolio,wallet-pnl`
+- `ZETTA_WORKER_TASK_KINDS=wallet-trades,wallet-activity,wallet-portfolio,wallet-pnl`
 - `ZETTA_WORKER_PROCESSES=4`
 
 ## Verify

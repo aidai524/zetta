@@ -1,0 +1,11 @@
+[Unit]
+Description=Prune old Zetta raw collector files
+
+[Service]
+Type=oneshot
+EnvironmentFile=/etc/zetta/zetta.env
+ExecStart=/usr/local/bin/zetta-prune-raw
+Nice=10
+IOSchedulingClass=best-effort
+IOSchedulingPriority=7
+TimeoutStartSec=12h

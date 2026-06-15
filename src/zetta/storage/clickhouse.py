@@ -66,6 +66,27 @@ class ClickHouseWriter:
         except Exception as exc:
             raise ClickHouseUnavailable(f"ClickHouse query failed: {exc}") from exc
 
+    def query_body_text(self, query: str) -> str:
+        request = Request(
+            f"{self.base_url}?{urlencode({'database': self.settings.clickhouse_database})}",
+            data=query.encode("utf-8"),
+            headers={
+                "Authorization": self.auth_header,
+                "Content-Type": "text/plain; charset=utf-8",
+            },
+            method="POST",
+        )
+        try:
+            with urlopen(request, timeout=self.settings.request_timeout_seconds) as response:
+                return response.read().decode("utf-8")
+        except HTTPError as exc:
+            details = exc.read().decode("utf-8", errors="replace")
+            raise ClickHouseUnavailable(
+                f"ClickHouse query failed with HTTP {exc.code}: {details}"
+            ) from exc
+        except Exception as exc:
+            raise ClickHouseUnavailable(f"ClickHouse query failed: {exc}") from exc
+
     def execute(self, query: str) -> str:
         request = Request(
             f"{self.base_url}?{urlencode({'database': self.settings.clickhouse_database, 'query': query})}",

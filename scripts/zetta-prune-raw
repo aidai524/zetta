@@ -1,0 +1,19 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+RAW_DIR="${ZETTA_RAW_DIR:-/var/lib/zetta/raw}"
+KEEP_DAYS="${ZETTA_RAW_KEEP_DAYS:-3}"
+
+if [[ ! -d "$RAW_DIR" ]]; then
+  echo "raw dir not found: $RAW_DIR"
+  exit 0
+fi
+
+if ! [[ "$KEEP_DAYS" =~ ^[0-9]+$ ]] || [[ "$KEEP_DAYS" -lt 1 ]]; then
+  echo "invalid ZETTA_RAW_KEEP_DAYS: $KEEP_DAYS" >&2
+  exit 2
+fi
+
+echo "pruning raw files older than ${KEEP_DAYS} days under $RAW_DIR"
+find "$RAW_DIR" -xdev -type f -mtime +"$KEEP_DAYS" -print -delete
+find "$RAW_DIR" -xdev -type d -empty -delete

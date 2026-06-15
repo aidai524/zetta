@@ -4,7 +4,7 @@ This runbook describes the current wallet-processing split:
 
 - Master node keeps the main Postgres task queue, ClickHouse warehouse, API, full-site
   Polymarket trade ingestion, loaders, chain jobs, and marts.
-- Helper nodes only claim wallet snapshot tasks from the master's Postgres queue and load
+- Helper nodes only claim wallet-scoped tasks from the master's Postgres queue and load
   the wallet raw files they collect into the master's ClickHouse.
 
 ## Current Nodes
@@ -12,9 +12,9 @@ This runbook describes the current wallet-processing split:
 | Role | Node ID | IP | Responsibilities |
 | --- | --- | --- | --- |
 | Master | `zetta-ubuntu-1` | `101.47.178.69` | Postgres, ClickHouse, API, full-site trades, Gamma, chain, marts, wallet task seeders. |
-| Wallet helper | `wallet-helper-1` | `101.47.179.91` | `wallet-portfolio` and `wallet-pnl` workers only. |
-| Wallet helper | `wallet-helper-2` | `101.47.176.154` | `wallet-portfolio` and `wallet-pnl` workers only. |
-| Wallet helper | `wallet-helper-3` | `101.47.176.175` | `wallet-portfolio` and `wallet-pnl` workers only. |
+| Wallet helper | `wallet-helper-1` | `101.47.179.91` | `wallet-trades`, `wallet-activity`, `wallet-portfolio`, and `wallet-pnl` workers only. |
+| Wallet helper | `wallet-helper-2` | `101.47.176.154` | `wallet-trades`, `wallet-activity`, `wallet-portfolio`, and `wallet-pnl` workers only. |
+| Wallet helper | `wallet-helper-3` | `101.47.176.175` | `wallet-trades`, `wallet-activity`, `wallet-portfolio`, and `wallet-pnl` workers only. |
 
 ## Data Flow
 
@@ -23,6 +23,8 @@ This runbook describes the current wallet-processing split:
    - `zetta-wallet-pnl-candidates.timer`
 2. Helper workers connect to master Postgres at `101.47.178.69:55432`.
 3. Helper workers claim only:
+   - `wallet-trades`
+   - `wallet-activity`
    - `wallet-portfolio`
    - `wallet-pnl`
 4. Helper workers write raw wallet JSONL locally under `/var/lib/zetta/wallet-raw`.
@@ -39,7 +41,7 @@ The three helper nodes are 16 CPU cores and 32 GB RAM. They should run a conserv
 wallet-only profile:
 
 - `ZETTA_WORKER_PROCESSES=4`
-- `ZETTA_WORKER_TASK_KINDS=wallet-portfolio,wallet-pnl`
+- `ZETTA_WORKER_TASK_KINDS=wallet-trades,wallet-activity,wallet-portfolio,wallet-pnl`
 - `ZETTA_RAW_DIR=/var/lib/zetta/wallet-raw`
 - `ZETTA_STATE_DIR=/var/lib/zetta/wallet-state`
 
@@ -68,6 +70,10 @@ Safe to remove on helper nodes after the wallet helper is configured:
 
 The helper loader timer is still named `zetta-load-trades-realtime.timer`, but with the
 wallet-only raw directory it only sees wallet helper raw files collected on that helper.
+The wallet trade/activity task kinds write the same raw source/entity names as normal
+`trades` and `activity`, so the existing data loaders can ingest them without a separate
+loader path. Helpers must not claim normal `trades` or `activity`; those remain master
+full-site tasks.
 
 ## Master Configuration
 
