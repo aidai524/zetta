@@ -9,6 +9,11 @@ export default defineConfig(({ mode }) => {
     plugins: [react()],
     server: {
       proxy: {
+        "/api/polymarket-data": {
+          target: "https://data-api.polymarket.com",
+          changeOrigin: true,
+          rewrite: (path) => path.replace(/^\/api\/polymarket-data/, ""),
+        },
         "/api": {
           target: apiProxyTarget,
           changeOrigin: true,
