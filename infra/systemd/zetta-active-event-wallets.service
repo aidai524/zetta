@@ -1,0 +1,13 @@
+[Unit]
+Description=Zetta active event wallet task seeder
+After=network-online.target docker.service
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+EnvironmentFile=/etc/zetta/zetta.env
+ExecStart=/usr/local/bin/zetta-runner active-event-wallets
+MemoryAccounting=true
+MemoryMax=1G
+TasksMax=64
+TimeoutStartSec=2min

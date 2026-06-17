@@ -3,6 +3,7 @@ import json
 
 from zetta.config import Settings
 from zetta.cli import (
+    ACTIVE_EVENT_WALLET_PRIORITY,
     DISCOVERY_PRIORITY,
     FRONTIER_EVENT_PRIORITY,
     FRONTIER_BOOK_PRIORITY,
@@ -12,6 +13,7 @@ from zetta.cli import (
     WALLET_EXPLICIT_REFRESH_PRIORITY,
     WALLET_REFRESH_PRIORITY,
     cmd_tasks_seed_basic,
+    cmd_tasks_seed_active_event_wallets,
     cmd_tasks_seed_frontier,
     cmd_tasks_seed_history,
     cmd_tasks_seed_wallets,
@@ -407,6 +409,7 @@ def test_seed_wallets_adds_wallet_trade_and_activity_tasks(monkeypatch, tmp_path
             "include_activity": True,
             "include_wallet_portfolio": False,
             "include_wallet_pnl": False,
+            "include_tracked_wallets": False,
             "refresh_run": "realtime-wallets",
             "requeue_done": True,
             "wallets": [],
@@ -454,6 +457,7 @@ def test_seed_wallets_can_use_smart_candidate_wallets(monkeypatch, tmp_path) -> 
             "include_activity": False,
             "include_wallet_portfolio": True,
             "include_wallet_pnl": False,
+            "include_tracked_wallets": False,
             "refresh_run": "smart-candidates",
             "requeue_done": True,
             "wallets": [],
@@ -497,6 +501,7 @@ def test_seed_wallets_allows_explicit_wallet_without_candidate_discovery(monkeyp
             "include_activity": True,
             "include_wallet_portfolio": True,
             "include_wallet_pnl": True,
+            "include_tracked_wallets": False,
             "refresh_run": "manual-wallet",
             "requeue_done": True,
             "wallets": ["0xABC"],
@@ -517,6 +522,200 @@ def test_seed_wallets_allows_explicit_wallet_without_candidate_discovery(monkeyp
     }
     assert {task.params["user"] for task in tasks} == {"0xabc"}
     assert {task.priority for task in tasks} == {WALLET_EXPLICIT_REFRESH_PRIORITY}
+
+
+def test_seed_wallets_includes_tracked_wallets_as_explicit(monkeypatch, tmp_path) -> None:
+    class FakeClickHouse:
+        def __init__(self, _settings):
+            pass
+
+        def query_text(self, query):
+            assert "mart_wallet_trade_rollup" in query
+            return '{"user_address":"0xaaa0000000000000000000000000000000000000"}\n'
+
+    class FakeTrackedWalletStore:
+        def __init__(self, **_kwargs):
+            pass
+
+        def tracked_addresses(self):
+            return ["0xbbb0000000000000000000000000000000000000"]
+
+    monkeypatch.setattr("zetta.cli.ClickHouseWriter", FakeClickHouse)
+    monkeypatch.setattr("zetta.cli.TrackedWalletStore", FakeTrackedWalletStore)
+    args = type(
+        "Args",
+        (),
+        {
+            "task_store": "local",
+            "task_file": str(tmp_path / "tasks.json"),
+            "node_id": "node-1",
+            "lease_seconds": 300,
+            "wallet_limit": 10,
+            "since_hours": 48,
+            "page_limit": 500,
+            "max_pages": 2,
+            "candidate_mode": "recent",
+            "min_notional": 10_000.0,
+            "include_trades": True,
+            "include_activity": False,
+            "include_wallet_portfolio": False,
+            "include_wallet_pnl": True,
+            "include_tracked_wallets": True,
+            "refresh_run": "realtime-wallets",
+            "requeue_done": True,
+            "wallets": [],
+        },
+    )()
+
+    result = cmd_tasks_seed_wallets(args, Settings())
+    tasks = LocalTaskStore(tmp_path / "tasks.json").load()
+
+    assert result["wallets"] == 2
+    assert result["explicit_wallets"] == 1
+    assert {task.params["user"] for task in tasks} == {
+        "0xaaa0000000000000000000000000000000000000",
+        "0xbbb0000000000000000000000000000000000000",
+    }
+    assert {
+        task.priority
+        for task in tasks
+        if task.params["user"] == "0xbbb0000000000000000000000000000000000000"
+    } == {WALLET_EXPLICIT_REFRESH_PRIORITY}
+
+
+def test_seed_active_event_wallets_adds_market_and_wallet_tasks(monkeypatch, tmp_path) -> None:
+    queries = []
+
+    class FakeClickHouse:
+        def __init__(self, _settings):
+            pass
+
+        def query_text(self, query):
+            queries.append(query)
+            assert "active = true" in query
+            assert "closed = false" in query
+            assert "archived = false" in query
+            if "from fact_trade_by_time" in query:
+                assert "timestamp >= now64(3) - interval 90 minute" in query
+                assert "sum(abs(notional)) >= 250.0" in query
+                return '{"user_address":"0xabc"}\n{"user_address":"0xdef"}\n'
+            if "select distinct condition_id" in query:
+                return '{"condition_id":"condition-1"}\n{"condition_id":"condition-2"}\n'
+            return ""
+
+    monkeypatch.setattr("zetta.cli.ClickHouseWriter", FakeClickHouse)
+    args = type(
+        "Args",
+        (),
+        {
+            "task_store": "local",
+            "task_file": str(tmp_path / "tasks.json"),
+            "node_id": "node-1",
+            "lease_seconds": 300,
+            "wallets": [],
+            "event_limit": 10,
+            "condition_limit": 25,
+            "wallet_limit": 10,
+            "since_minutes": 90,
+            "min_notional": 250.0,
+            "trade_page_limit": 500,
+            "trade_max_pages": 1,
+            "wallet_page_limit": 500,
+            "wallet_max_pages": 1,
+            "include_market_trades": True,
+            "include_wallet_trades": True,
+            "include_wallet_activity": True,
+            "include_wallet_portfolio": True,
+            "include_wallet_pnl": True,
+            "include_tracked_wallets": False,
+            "refresh_run": "active-event-wallets",
+            "requeue_done": True,
+        },
+    )()
+
+    result = cmd_tasks_seed_active_event_wallets(args, Settings())
+    tasks = LocalTaskStore(tmp_path / "tasks.json").load()
+
+    assert len(queries) == 2
+    assert result["condition_ids"] == 2
+    assert result["wallets"] == 2
+    assert result["candidate_tasks"] == 10
+    assert result["added"] == 10
+    assert [task.kind for task in tasks].count("trades") == 2
+    assert [task.kind for task in tasks].count("wallet-trades") == 2
+    assert [task.kind for task in tasks].count("wallet-activity") == 2
+    assert [task.kind for task in tasks].count("wallet-portfolio") == 2
+    assert [task.kind for task in tasks].count("wallet-pnl") == 2
+    assert {task.priority for task in tasks if task.kind == "trades"} == {
+        FRONTIER_TRADES_PRIORITY
+    }
+    assert {task.priority for task in tasks if task.kind in {"wallet-trades", "wallet-activity"}} == {
+        ACTIVE_EVENT_WALLET_PRIORITY
+    }
+    assert all(task.params["_refresh_run"] == "active-event-wallets" for task in tasks)
+    assert all(requeue_done_task(task.params) for task in tasks)
+
+
+def test_seed_active_event_wallets_treats_tracked_wallets_as_explicit(
+    monkeypatch, tmp_path
+) -> None:
+    class FakeClickHouse:
+        def __init__(self, _settings):
+            pass
+
+        def query_text(self, query):
+            assert "from fact_trade_by_time" in query
+            return '{"user_address":"0xabc"}\n'
+
+    class FakeTrackedWalletStore:
+        def __init__(self, **_kwargs):
+            pass
+
+        def tracked_addresses(self):
+            return ["0xDEF"]
+
+    monkeypatch.setattr("zetta.cli.ClickHouseWriter", FakeClickHouse)
+    monkeypatch.setattr("zetta.cli.TrackedWalletStore", FakeTrackedWalletStore)
+    args = type(
+        "Args",
+        (),
+        {
+            "task_store": "local",
+            "task_file": str(tmp_path / "tasks.json"),
+            "node_id": "node-1",
+            "lease_seconds": 300,
+            "wallets": [],
+            "event_limit": 0,
+            "condition_limit": 25,
+            "wallet_limit": 10,
+            "since_minutes": 90,
+            "min_notional": 0.0,
+            "trade_page_limit": 500,
+            "trade_max_pages": 1,
+            "wallet_page_limit": 500,
+            "wallet_max_pages": 1,
+            "include_market_trades": False,
+            "include_wallet_trades": False,
+            "include_wallet_activity": False,
+            "include_wallet_portfolio": True,
+            "include_wallet_pnl": True,
+            "include_tracked_wallets": True,
+            "refresh_run": "active-event-wallets",
+            "requeue_done": True,
+        },
+    )()
+
+    result = cmd_tasks_seed_active_event_wallets(args, Settings())
+    tasks = LocalTaskStore(tmp_path / "tasks.json").load()
+
+    assert result["wallets"] == 2
+    assert result["explicit_wallets"] == 1
+    assert {task.params["user"] for task in tasks} == {"0xabc", "0xdef"}
+    assert {
+        task.priority
+        for task in tasks
+        if task.params["user"] == "0xdef"
+    } == {WALLET_EXPLICIT_REFRESH_PRIORITY}
 
 
 def test_local_task_store_retries_then_dead_letters(tmp_path) -> None:

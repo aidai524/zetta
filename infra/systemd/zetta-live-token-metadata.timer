@@ -1,0 +1,11 @@
+[Unit]
+Description=Refresh missing live Polymarket token metadata
+
+[Timer]
+OnBootSec=2min
+OnUnitInactiveSec=30s
+AccuracySec=5s
+Unit=zetta-live-token-metadata.service
+
+[Install]
+WantedBy=timers.target

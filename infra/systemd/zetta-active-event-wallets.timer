@@ -1,0 +1,11 @@
+[Unit]
+Description=Seed Zetta active event wallet tasks every 2 minutes
+
+[Timer]
+OnBootSec=4min
+OnUnitInactiveSec=2min
+AccuracySec=20s
+Unit=zetta-active-event-wallets.service
+
+[Install]
+WantedBy=timers.target

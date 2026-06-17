@@ -67,6 +67,16 @@ class PolymarketClient:
         )
         return _keyset_page(response)
 
+    def gamma_markets_by_clob_token_id(self, *, token_id: str, limit: int = 10) -> Page:
+        response = self.http.get(
+            f"{self.settings.gamma_base_url}/markets",
+            {
+                "limit": limit,
+                "clob_token_ids": token_id,
+            },
+        )
+        return Page(response=response, items=_list_body(response.body))
+
     def data_trades(
         self,
         *,

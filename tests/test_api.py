@@ -1,5 +1,6 @@
 import json
 import re
+from types import SimpleNamespace
 
 from zetta.api import ProductApi, ch_string, collect_system_stats, int_param, rows_json
 from zetta.config import Settings
@@ -37,6 +38,22 @@ def test_product_api_market_search_returns_rows() -> None:
     assert response.status == 200
     assert response.body["markets"][0]["market_id"] == "m1"
     assert "positionCaseInsensitive" in fake.queries[0]
+
+
+def test_product_api_market_search_worldcup_scope_adds_filter() -> None:
+    fake = FakeClickHouse('{"market_id":"m1","question":"Will Canada win?"}\n')
+    api = ProductApi(clickhouse=fake)
+
+    response = api.handle(
+        "/markets/search",
+        {"scope": ["world_cup"], "q": ["World Cup"], "limit": ["1"]},
+    )
+
+    assert response.status == 200
+    assert response.body["markets"][0]["market_id"] == "m1"
+    query = fake.queries[0]
+    assert "startsWith(events.slug, 'fifwc-')" in query
+    assert "World Cup') > 0" in query
 
 
 def test_product_api_trader_profile_not_found() -> None:
@@ -222,6 +239,24 @@ def test_product_api_wallet_screener_smart_mode_uses_roi_definition() -> None:
     assert "screener.pnl_roi desc" in query
 
 
+def test_product_api_wallet_screener_filters_by_category_and_range() -> None:
+    fake = FakeClickHouse("")
+    api = ProductApi(clickhouse=fake)
+
+    response = api.handle(
+        "/wallets/screener",
+        {"mode": ["smart"], "category": ["体育"], "range": ["7d"], "limit": ["5"]},
+    )
+
+    assert response.status == 200
+    query = fake.queries[0]
+    assert "from fact_trade_by_user as trades" in query
+    assert "trades.timestamp >= now64(3) - interval 7 day" in query
+    assert "positionCaseInsensitive" in query
+    assert "'Sports'" in query
+    assert "category_traded_notional" in query
+
+
 def test_product_api_wallet_detail_returns_portfolio_pnl_and_activity() -> None:
     portfolio_raw = {
         "positions": [
@@ -326,6 +361,8 @@ def test_product_api_wallet_detail_returns_portfolio_pnl_and_activity() -> None:
     assert body["wallet"]["trade_count_7d"] == 7
     assert body["wallet"]["avg_bet"] == 62.5
     assert body["wallet"]["win_rate"] == 0.6
+    assert body["wallet"]["data_freshness_status"] == "ok"
+    assert body["wallet"]["pnl_lag_minutes"] == 0.0
     assert body["position_summary"]["position_count"] == 2
     assert body["position_summary"]["worldcup_position_count"] == 1
     assert body["positions_available"] == 1
@@ -340,6 +377,247 @@ def test_product_api_wallet_detail_returns_portfolio_pnl_and_activity() -> None:
     assert "from fact_wallet_portfolio_snapshot" in fake.queries[0]
     assert "from fact_wallet_pnl_snapshot" in fake.queries[1]
     assert "from fact_user_activity" in fake.queries[2]
+
+
+def test_product_api_wallet_detail_live_uses_polymarket_wallet_apis(monkeypatch) -> None:
+    def page(items):
+        return SimpleNamespace(response=SimpleNamespace(body=items, url="https://example.test"), items=items)
+
+    class FakePolymarketClient:
+        def __init__(self, settings) -> None:
+            self.settings = settings
+
+        def data_positions(self, *, user):
+            return page(
+                [
+                    {
+                        "proxyWallet": user,
+                        "asset": "asset-1",
+                        "conditionId": "c1",
+                        "title": "Will Belgium win?",
+                        "slug": "fifwc-bel-egy-win",
+                        "eventSlug": "fifwc-bel-egy",
+                        "outcome": "Yes",
+                        "size": 100,
+                        "avgPrice": 0.5,
+                        "curPrice": 0.7,
+                        "initialValue": 50,
+                        "currentValue": 70,
+                        "cashPnl": 20,
+                    }
+                ]
+            )
+
+        def data_value(self, *, user):
+            return page([{"user": user, "value": 70}])
+
+        def user_pnl(self, *, user, interval, fidelity):
+            return page([{"t": 1781481600, "p": -636.8}, {"t": 1781568000, "p": -500.0}])
+
+        def data_activity(self, *, user, limit, offset):
+            return page(
+                [
+                    {
+                        "proxyWallet": user,
+                        "timestamp": "2026-06-15T19:39:43Z",
+                        "type": "TRADE",
+                        "conditionId": "c1",
+                        "asset": "asset-1",
+                        "transactionHash": "0xhash2",
+                        "side": "SELL",
+                        "price": 0.8,
+                        "size": 10,
+                        "usdcSize": 8,
+                        "title": "Newest trade",
+                        "slug": "newest-trade",
+                        "eventSlug": "event-newest",
+                        "outcome": "Yes",
+                    },
+                    {
+                        "proxyWallet": user,
+                        "timestamp": "2026-06-15T18:39:43Z",
+                        "type": "TRADE",
+                        "conditionId": "c1",
+                        "asset": "asset-1",
+                        "transactionHash": "0xhash1",
+                        "side": "BUY",
+                        "price": 0.6,
+                        "size": 25,
+                        "usdcSize": 15,
+                        "title": "Older trade",
+                        "slug": "older-trade",
+                        "eventSlug": "event-older",
+                        "outcome": "Yes",
+                    },
+                ]
+            )
+
+    monkeypatch.setattr("zetta.api.PolymarketClient", FakePolymarketClient)
+    monkeypatch.setattr(ProductApi, "live_pusd_balance", lambda _self, _user: 12.5)
+    fake = FakeClickHouse(outputs=[""])
+    api = ProductApi(clickhouse=fake, settings=Settings())
+
+    response = api.handle("/wallets/detail", {"user": ["0xABC"], "live": ["1"]})
+
+    assert response.status == 200
+    body = response.body
+    assert body["wallet"]["data_source"] == "live"
+    assert body["wallet"]["cash"] == 12.5
+    assert body["wallet"]["portfolio_value"] == 82.5
+    assert body["wallet"]["latest_total_pnl"] == -500.0
+    assert body["positions"][0]["title"] == "Will Belgium win?"
+    assert body["activity_summary"]["trade_activity_count"] == 2
+    assert body["activity_summary"]["traded_notional"] == 23.0
+    assert body["recent_activity"][0]["title"] == "Newest trade"
+    assert "mart_wallet_reputation" in fake.queries[0]
+
+
+def test_product_api_live_trades_uses_polymarket_data_api(monkeypatch) -> None:
+    def page(items):
+        return SimpleNamespace(response=SimpleNamespace(body=items, url="https://example.test/trades"), items=items)
+
+    class FakePolymarketClient:
+        def __init__(self, settings) -> None:
+            self.settings = settings
+            self.calls = []
+
+        def data_trades(self, *, limit, offset):
+            self.calls.append((limit, offset))
+            assert limit == 100
+            return page(
+                [
+                    {
+                        "proxyWallet": "0xABC",
+                        "side": "BUY",
+                        "asset": "token-1",
+                        "conditionId": "cond-1",
+                        "size": 10,
+                        "price": 0.42,
+                        "timestamp": 1781599722,
+                        "title": "Will Bitcoin rise?",
+                        "slug": "bitcoin-rise",
+                        "eventSlug": "bitcoin",
+                        "outcome": "Yes",
+                        "name": "trader",
+                        "pseudonym": "Alias",
+                        "transactionHash": "0xhash",
+                    },
+                    {
+                        "proxyWallet": "0xABC",
+                        "side": "BUY",
+                        "asset": "token-1",
+                        "conditionId": "cond-1",
+                        "size": 10,
+                        "price": 0.42,
+                        "timestamp": 1781599722,
+                        "title": "Will Bitcoin rise?",
+                        "slug": "bitcoin-rise",
+                        "eventSlug": "bitcoin",
+                        "outcome": "Yes",
+                        "name": "trader",
+                        "pseudonym": "Alias",
+                        "transactionHash": "0xhash",
+                    },
+                    {
+                        "proxyWallet": "0xDEF",
+                        "side": "SELL",
+                        "asset": "token-2",
+                        "conditionId": "cond-2",
+                        "size": 5,
+                        "price": 0.8,
+                        "timestamp": 1781599730 + offset,
+                        "title": "Will Ethereum rise?",
+                        "slug": "ethereum-rise",
+                        "eventSlug": "ethereum",
+                        "outcome": "No",
+                        "name": "seller",
+                        "pseudonym": "Seller",
+                        "transactionHash": f"0xhash{offset}",
+                    },
+                ]
+            )
+
+    monkeypatch.setattr("zetta.api.PolymarketClient", FakePolymarketClient)
+    fake = FakeClickHouse("")
+    api = ProductApi(clickhouse=fake, settings=Settings())
+
+    response = api.handle(
+        "/trades/live",
+        {"limit": ["10"], "ttl": ["0.5"], "pages": ["2"], "min_notional": ["4"], "side": ["BUY"]},
+    )
+
+    assert response.status == 200
+    body = response.body
+    assert body["source"] == "live"
+    assert body["status"] == "ok"
+    assert body["request_url"] == "https://example.test/trades"
+    assert body["request_urls"] == ["https://example.test/trades", "https://example.test/trades"]
+    assert body["candidate_count"] == 4
+    assert fake.queries == []
+    assert len(body["trades"]) == 1
+    trade = body["trades"][0]
+    assert trade["timestamp"] == "2026-06-16 08:48:42.000"
+    assert trade["question"] == "Will Bitcoin rise?"
+    assert trade["outcome"] == "Yes"
+    assert trade["user_address"] == "0xabc"
+    assert trade["notional"] == 4.2
+    assert trade["source"] == "polymarket-live"
+    assert len(trade["trade_id"]) == 40
+    assert isinstance(body["latency_seconds"], float)
+
+
+def test_product_api_live_trades_prefers_chain_fills(monkeypatch) -> None:
+    class UnexpectedPolymarketClient:
+        def __init__(self, settings) -> None:
+            self.settings = settings
+
+        def data_trades(self, **_kwargs):
+            raise AssertionError("data api should not be called when chain rows are available")
+
+    row = {
+        "trade_id": "0xhash-1-maker-token-1",
+        "transaction_hash": "0xhash",
+        "log_index": 1,
+        "timestamp": "2026-06-16 08:48:42.000",
+        "market_id": "market-1",
+        "condition_id": "cond-1",
+        "token_id": "token-1",
+        "user_address": "0xabc",
+        "side": "BUY",
+        "price": 0.42,
+        "size": 10,
+        "notional": 4.2,
+        "source": "chain-live",
+        "ingested_at": "2026-06-16 08:48:42.000",
+        "question": "Will Bitcoin rise?",
+        "market_slug": "bitcoin-rise",
+        "event_id": "event-1",
+        "event_title": "Bitcoin",
+        "event_slug": "bitcoin",
+        "category": "Crypto",
+        "outcome": "Yes",
+        "trader_name": "",
+        "trader_pseudonym": "",
+        "is_smart": False,
+        "is_whale": False,
+        "wallet_total_pnl": 0,
+        "wallet_pnl_roi": 0,
+        "wallet_traded_notional": 0,
+    }
+    fake = FakeClickHouse(json.dumps(row) + "\n")
+    monkeypatch.setattr("zetta.api.PolymarketClient", UnexpectedPolymarketClient)
+    api = ProductApi(clickhouse=fake, settings=Settings())
+
+    response = api.handle("/trades/live", {"limit": ["5"], "ttl": ["0.5"]})
+
+    assert response.status == 200
+    body = response.body
+    assert body["source"] == "chain-live"
+    assert body["request_url"] == "clickhouse:fact_exchange_fill"
+    assert body["metadata_missing_count"] == 0
+    assert body["trades"][0]["source"] == "chain-live"
+    assert body["trades"][0]["question"] == "Will Bitcoin rise?"
+    assert "from fact_exchange_fill" in fake.queries[0]
 
 
 def test_product_api_wallet_detail_not_found() -> None:
@@ -382,6 +660,67 @@ def test_product_api_wallet_detail_refresh_enqueues_high_priority_tasks(monkeypa
     assert {task.priority for task in tasks} == {-2}
     assert {task.params["user"] for task in tasks} == {"0xabc"}
     assert all(task.params["_requeue_done"] is True for task in tasks)
+
+
+def test_product_api_tracked_wallets_get_post_delete(monkeypatch) -> None:
+    captured = {"refresh": []}
+
+    class FakeTrackedWalletStore:
+        def __init__(self, **kwargs) -> None:
+            captured["store_kwargs"] = kwargs
+
+        def list_wallets(self):
+            return [{"address": "0xabc0000000000000000000000000000000000000", "name": "Alpha"}]
+
+        def upsert_wallet(self, *, user_address, name):
+            captured["upsert"] = (user_address, name)
+            return {"address": user_address, "user_address": user_address, "name": name}
+
+        def delete_wallet(self, *, user_address):
+            captured["delete"] = user_address
+            return True
+
+    class FakeTaskStore:
+        def __init__(self, **_kwargs) -> None:
+            pass
+
+        def add_many(self, tasks):
+            captured["refresh"].extend(tasks)
+            return len(tasks)
+
+    monkeypatch.setattr("zetta.api.TrackedWalletStore", FakeTrackedWalletStore)
+    monkeypatch.setattr("zetta.api.PostgresTaskStore", FakeTaskStore)
+    api = ProductApi(clickhouse=FakeClickHouse(), settings=Settings(postgres_dsn="postgresql://example"))
+
+    listed = api.handle_request("GET", "/wallets/tracked", {}, None)
+    posted = api.handle_request(
+        "POST",
+        "/wallets/tracked",
+        {},
+        {"address": "0xABC0000000000000000000000000000000000000", "name": "Alpha"},
+    )
+    deleted = api.handle_request(
+        "DELETE",
+        "/wallets/tracked",
+        {},
+        {"address": "0xABC0000000000000000000000000000000000000"},
+    )
+
+    assert listed.status == 200
+    assert listed.body["wallets"][0]["name"] == "Alpha"
+    assert posted.status == 200
+    assert posted.body["wallet"]["address"] == "0xabc0000000000000000000000000000000000000"
+    assert deleted.status == 200
+    assert deleted.body["deleted"] is True
+    assert captured["store_kwargs"]["dsn"] == "postgresql://example"
+    assert captured["upsert"] == ("0xabc0000000000000000000000000000000000000", "Alpha")
+    assert captured["delete"] == "0xabc0000000000000000000000000000000000000"
+    assert {task.kind for task in captured["refresh"]} == {
+        "wallet-activity",
+        "wallet-pnl",
+        "wallet-portfolio",
+        "wallet-trades",
+    }
 
 
 def test_product_api_tasks_nodes_returns_node_progress(monkeypatch) -> None:
@@ -750,6 +1089,7 @@ def test_product_api_market_detail_includes_tokens() -> None:
     fake = FakeClickHouse(
         outputs=[
             '{"market_id":"m1","condition_id":"c1","question":"Q?"}\n',
+            '{"market_id":"m1","last_price":0.55,"volume_24h":12.5}\n',
             '{"token_id":"t1","market_id":"m1","condition_id":"c1","outcome":"Yes","outcome_index":0}\n',
         ],
     )
@@ -759,10 +1099,12 @@ def test_product_api_market_detail_includes_tokens() -> None:
 
     assert response.status == 200
     assert response.body["market"]["market_id"] == "m1"
+    assert response.body["market"]["last_price"] == 0.55
+    assert response.body["market"]["volume_24h"] == 12.5
     assert response.body["market"]["tokens"] == [
         {"token_id": "t1", "market_id": "m1", "condition_id": "c1", "outcome": "Yes", "outcome_index": 0}
     ]
-    assert "from dim_outcome_token final" in fake.queries[1]
+    assert "from dim_outcome_token final" in fake.queries[2]
 
 
 def test_product_api_market_trades_requires_market_or_condition() -> None:
@@ -774,6 +1116,36 @@ def test_product_api_market_trades_requires_market_or_condition() -> None:
     assert response.status == 200
     assert "and 1 = 0" in fake.queries[0]
     assert response.body == {"trades": []}
+
+
+def test_product_api_recent_trades_is_global_and_filterable() -> None:
+    fake = FakeClickHouse(
+        '{"user_address":"0xabc","side":"BUY","notional":125.5,'
+        '"question":"Q?","category":"Sports","outcome":"Yes"}\n'
+    )
+    api = ProductApi(clickhouse=fake)
+
+    response = api.handle(
+        "/trades/recent",
+        {
+            "limit": ["5"],
+            "side": ["buy"],
+            "wallet_type": ["smart"],
+            "category": ["Sports"],
+            "min_notional": ["100"],
+            "q": ["abc"],
+        },
+    )
+
+    assert response.status == 200
+    assert response.body["trades"][0]["notional"] == 125.5
+    query = fake.queries[0]
+    assert "from fact_trade_by_time as trades" in query
+    assert "trades.side = 'BUY'" in query
+    assert "trades.notional >= 100.0" in query
+    assert "events.category = 'Sports'" in query
+    assert "ifNull(screener.is_smart, false)" in query
+    assert "positionCaseInsensitive(user_address, 'abc')" in query
 
 
 def test_product_api_analytics_routes_are_read_only() -> None:

@@ -106,3 +106,13 @@ create index if not exists idx_event_sync_runs_latest
 
 create index if not exists idx_event_sync_runs_status
   on event_sync_runs (status, finished_at desc);
+
+create table if not exists tracked_wallets (
+  user_address text primary key,
+  name text not null default '',
+  created_at timestamptz not null default now(),
+  updated_at timestamptz not null default now()
+);
+
+create index if not exists idx_tracked_wallets_updated
+  on tracked_wallets (updated_at desc);

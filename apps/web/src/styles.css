@@ -340,6 +340,139 @@ nav {
   margin-top: 12px;
 }
 
+.machineProgressPanel {
+  margin-top: 12px;
+}
+
+.machineProgressHead {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  margin-bottom: 10px;
+}
+
+.machineProgressHead .panelTitle {
+  margin-bottom: 0;
+}
+
+.machineProgressHead > span {
+  color: var(--muted);
+  font-size: 12px;
+  white-space: nowrap;
+}
+
+.machineGrid {
+  display: grid;
+  grid-template-columns: repeat(4, minmax(0, 1fr));
+  gap: 10px;
+}
+
+.machineCard {
+  display: grid;
+  gap: 10px;
+  min-width: 0;
+  border: 1px solid var(--line-soft);
+  border-radius: 8px;
+  background: var(--surface);
+  padding: 12px;
+}
+
+.machineCardHead {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 10px;
+}
+
+.machineCardHead strong,
+.machineKinds strong {
+  display: block;
+  overflow: hidden;
+  color: #fff;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.machineCardHead small,
+.machineKinds span {
+  display: block;
+  margin-top: 3px;
+  color: var(--muted);
+  font-size: 12px;
+}
+
+.statusPill {
+  flex: 0 0 auto;
+  border: 1px solid var(--line-soft);
+  border-radius: 999px;
+  background: #0b111c;
+  color: var(--muted);
+  padding: 4px 8px;
+  font-size: 12px;
+  white-space: nowrap;
+}
+
+.statusPill.active {
+  border-color: rgba(74, 222, 128, 0.35);
+  background: rgba(74, 222, 128, 0.1);
+  color: var(--positive);
+}
+
+.machineMeter {
+  height: 8px;
+  border-radius: 999px;
+  background: #1b2635;
+  overflow: hidden;
+}
+
+.machineMeter div {
+  height: 100%;
+  border-radius: inherit;
+  background: var(--blue);
+}
+
+.machineCard[data-role="wallet-helper"] .machineMeter div {
+  background: var(--positive);
+}
+
+.machineStats {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 8px 12px;
+}
+
+.machineStat {
+  min-width: 0;
+}
+
+.machineStat span {
+  display: block;
+  color: var(--muted);
+  font-size: 12px;
+}
+
+.machineStat strong {
+  display: block;
+  margin-top: 3px;
+  overflow: hidden;
+  color: #fff;
+  font-size: 14px;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.machineKinds {
+  min-width: 0;
+  border-top: 1px solid var(--line-soft);
+  padding-top: 8px;
+}
+
+.machineKinds strong {
+  margin-top: 4px;
+  font-size: 13px;
+}
+
 .boardToolbar {
   display: flex;
   align-items: center;
@@ -670,13 +803,6 @@ nav {
   color: var(--muted);
 }
 
-.trackedLayout {
-  display: grid;
-  grid-template-columns: minmax(0, 1fr) 380px;
-  gap: 16px;
-  align-items: start;
-}
-
 .trackedRow {
   grid-template-columns:
     minmax(180px, 1.1fr)
@@ -729,12 +855,28 @@ nav {
   padding: 24px 14px;
 }
 
-.walletDetailPanel {
-  position: sticky;
-  top: 22px;
+.walletDetailPage {
+  display: grid;
+  gap: 14px;
 }
 
-.walletDetailPanel code {
+.detailPageHeader {
+  display: grid;
+  grid-template-columns: auto minmax(0, 1fr);
+  align-items: center;
+  gap: 12px;
+  border-bottom: 1px solid var(--line-soft);
+  padding-bottom: 12px;
+}
+
+.detailPageHeader h2 {
+  overflow: hidden;
+  font-size: 20px;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.detailPageHeader code {
   color: var(--muted);
   font-size: 12px;
 }
@@ -756,6 +898,35 @@ nav {
 
 .walletDetailHero strong {
   font-size: 30px;
+}
+
+.walletDataStatus {
+  display: grid;
+  gap: 3px;
+  border: 1px solid var(--line-soft);
+  border-radius: 7px;
+  background: #101723;
+  padding: 9px 10px;
+}
+
+.walletDataStatus span {
+  color: #d9f99d;
+  font-size: 12px;
+  font-weight: 700;
+}
+
+.walletDataStatus small {
+  color: var(--muted);
+  font-size: 12px;
+}
+
+.walletDataStatus.lagging {
+  border-color: rgba(245, 158, 11, 0.42);
+  background: rgba(245, 158, 11, 0.08);
+}
+
+.walletDataStatus.lagging span {
+  color: #fbbf24;
 }
 
 .walletPositionList {
@@ -983,17 +1154,12 @@ th {
 
 @media (max-width: 1180px) {
   .marketWorkspace,
-  .leaderboardGrid,
-  .trackedLayout {
+  .leaderboardGrid {
     grid-template-columns: 1fr;
   }
 
   .workspaceSide {
     grid-template-columns: repeat(2, minmax(0, 1fr));
-  }
-
-  .walletDetailPanel {
-    position: static;
   }
 
   .livePanel,
@@ -1034,6 +1200,7 @@ th {
   .leaderboardHero,
   .marketStats,
   .metrics,
+  .machineGrid,
   .resourceGrid,
   .gridPage,
   .workspaceSide {
@@ -1041,9 +1208,14 @@ th {
   }
 
   .leaderboardControls,
-  .boardToolbar {
+  .boardToolbar,
+  .machineProgressHead {
     align-items: stretch;
     flex-direction: column;
+  }
+
+  .machineProgressHead > span {
+    white-space: normal;
   }
 
   .trackedToolbar {

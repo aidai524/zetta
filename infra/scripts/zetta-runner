@@ -148,7 +148,42 @@ case "$MODE" in
         --include-trades \
         --include-activity \
         --include-wallet-portfolio \
+        --include-wallet-pnl \
         --refresh-run realtime-wallets \
+        --requeue-done
+    ;;
+  active-event-wallets)
+    WALLET_ARGS=()
+    if [[ -n "${ZETTA_WALLET_WATCHLIST:-}" ]]; then
+      IFS=',' read -r -a WATCHED_WALLETS <<< "$ZETTA_WALLET_WATCHLIST"
+      for wallet in "${WATCHED_WALLETS[@]}"; do
+        wallet="${wallet//[[:space:]]/}"
+        if [[ -n "$wallet" ]]; then
+          WALLET_ARGS+=(--wallet "$wallet")
+        fi
+      done
+    fi
+    "$ZETTA_PYTHON" -m zetta.cli \
+      "${COMMON_ARGS[@]}" \
+      --task-store postgres \
+      --node-id "$ZETTA_NODE_ID" \
+      tasks seed-active-event-wallets \
+        "${WALLET_ARGS[@]}" \
+        --event-limit "${ZETTA_ACTIVE_EVENT_WALLET_EVENT_LIMIT:-0}" \
+        --condition-limit "${ZETTA_ACTIVE_EVENT_WALLET_CONDITION_LIMIT:-1000}" \
+        --wallet-limit "${ZETTA_ACTIVE_EVENT_WALLET_LIMIT:-1000}" \
+        --since-minutes "${ZETTA_ACTIVE_EVENT_WALLET_SINCE_MINUTES:-120}" \
+        --min-notional "${ZETTA_ACTIVE_EVENT_WALLET_MIN_NOTIONAL:-0}" \
+        --trade-page-limit "${ZETTA_ACTIVE_EVENT_TRADE_PAGE_LIMIT:-500}" \
+        --trade-max-pages "${ZETTA_ACTIVE_EVENT_TRADE_MAX_PAGES:-1}" \
+        --wallet-page-limit "${ZETTA_ACTIVE_EVENT_WALLET_PAGE_LIMIT:-500}" \
+        --wallet-max-pages "${ZETTA_ACTIVE_EVENT_WALLET_MAX_PAGES:-1}" \
+        "--${ZETTA_ACTIVE_EVENT_INCLUDE_MARKET_TRADES:-include-market-trades}" \
+        "--${ZETTA_ACTIVE_EVENT_INCLUDE_WALLET_TRADES:-include-wallet-trades}" \
+        "--${ZETTA_ACTIVE_EVENT_INCLUDE_WALLET_ACTIVITY:-include-wallet-activity}" \
+        "--${ZETTA_ACTIVE_EVENT_INCLUDE_WALLET_PORTFOLIO:-include-wallet-portfolio}" \
+        "--${ZETTA_ACTIVE_EVENT_INCLUDE_WALLET_PNL:-include-wallet-pnl}" \
+        --refresh-run "${ZETTA_ACTIVE_EVENT_WALLET_REFRESH_RUN:-active-event-wallets}" \
         --requeue-done
     ;;
   wallet-candidates)
@@ -221,6 +256,14 @@ case "$MODE" in
     else
       printf '{"loader":"wallet_snapshots","skipped":true,"reason":"disabled"}\n'
     fi
+    ;;
+  live-token-metadata)
+    "$ZETTA_PYTHON" -m zetta.cli "${COMMON_ARGS[@]}" refresh live-token-metadata \
+      --lookback-minutes "${ZETTA_LIVE_TOKEN_METADATA_LOOKBACK_MINUTES:-30}" \
+      --limit "${ZETTA_LIVE_TOKEN_METADATA_LIMIT:-200}" \
+      --min-notional "${ZETTA_LIVE_TOKEN_METADATA_MIN_NOTIONAL:-100}" \
+      --sleep-seconds "${ZETTA_LIVE_TOKEN_METADATA_SLEEP_SECONDS:-0.05}" \
+      --load-batch-size "${ZETTA_LIVE_TOKEN_METADATA_LOAD_BATCH_SIZE:-1000}"
     ;;
   wallet-rollup)
     "$ZETTA_PYTHON" -m zetta.cli "${COMMON_ARGS[@]}" build wallet-trade-rollup \

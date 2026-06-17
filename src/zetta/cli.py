@@ -3,6 +3,7 @@ from __future__ import annotations
 import argparse
 import json
 import sys
+import time
 from dataclasses import asdict, is_dataclass
 from datetime import UTC, datetime
 from pathlib import Path
@@ -40,6 +41,7 @@ from zetta.storage.clickhouse import ClickHouseWriter
 from zetta.storage.raw import RawJsonlWriter
 from zetta.storage.redpanda import RpkPublisher
 from zetta.storage.state import LocalStateStore
+from zetta.tracked_wallets import TrackedWalletStore
 
 
 FRONTIER_GAMMA_PRIORITY = 1
@@ -49,6 +51,7 @@ FRONTIER_PRICE_HISTORY_PRIORITY = 4
 FRONTIER_BOOK_PRIORITY = 5
 WALLET_REFRESH_PRIORITY = 2
 WALLET_EXPLICIT_REFRESH_PRIORITY = -2
+ACTIVE_EVENT_WALLET_PRIORITY = -1
 WALLET_PORTFOLIO_PRIORITY = 0
 WALLET_PNL_PRIORITY = -1
 DISCOVERY_PRIORITY = 50
@@ -292,6 +295,20 @@ def build_parser() -> argparse.ArgumentParser:
     wallets.add_argument("--limit", type=int, default=100)
     wallets.set_defaults(func=cmd_discover_wallets)
 
+    refresh = subparsers.add_parser("refresh", help="Refresh targeted derived data.")
+    refresh_subparsers = refresh.add_subparsers(required=True)
+
+    live_token_metadata = refresh_subparsers.add_parser(
+        "live-token-metadata",
+        help="Refresh Gamma metadata for live chain tokens missing from dim_outcome_token.",
+    )
+    live_token_metadata.add_argument("--lookback-minutes", type=int, default=15)
+    live_token_metadata.add_argument("--limit", type=int, default=200)
+    live_token_metadata.add_argument("--min-notional", type=float, default=100.0)
+    live_token_metadata.add_argument("--sleep-seconds", type=float, default=0.05)
+    live_token_metadata.add_argument("--load-batch-size", type=int, default=1000)
+    live_token_metadata.set_defaults(func=cmd_refresh_live_token_metadata)
+
     tasks = subparsers.add_parser("tasks", help="Manage local collection tasks.")
     task_subparsers = tasks.add_subparsers(required=True)
 
@@ -367,9 +384,59 @@ def build_parser() -> argparse.ArgumentParser:
         "--include-wallet-portfolio", action=argparse.BooleanOptionalAction, default=True
     )
     seed_wallets.add_argument("--include-wallet-pnl", action=argparse.BooleanOptionalAction, default=False)
+    seed_wallets.add_argument(
+        "--include-tracked-wallets",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help=argparse.SUPPRESS,
+    )
     seed_wallets.add_argument("--refresh-run", help=argparse.SUPPRESS)
     seed_wallets.add_argument("--requeue-done", action="store_true", help=argparse.SUPPRESS)
     seed_wallets.set_defaults(func=cmd_tasks_seed_wallets)
+
+    seed_active_event_wallets = task_subparsers.add_parser(
+        "seed-active-event-wallets",
+        help="Seed hot wallet refresh tasks from wallets trading unfinished active events.",
+    )
+    seed_active_event_wallets.add_argument("--wallet", action="append", dest="wallets", default=[])
+    seed_active_event_wallets.add_argument("--event-limit", type=int, default=0)
+    seed_active_event_wallets.add_argument("--condition-limit", type=int, default=1000)
+    seed_active_event_wallets.add_argument("--wallet-limit", type=int, default=1000)
+    seed_active_event_wallets.add_argument("--since-minutes", type=int, default=120)
+    seed_active_event_wallets.add_argument("--min-notional", type=float, default=0.0)
+    seed_active_event_wallets.add_argument("--trade-page-limit", type=int, default=500)
+    seed_active_event_wallets.add_argument("--trade-max-pages", type=int, default=1)
+    seed_active_event_wallets.add_argument("--wallet-page-limit", type=int, default=500)
+    seed_active_event_wallets.add_argument("--wallet-max-pages", type=int, default=1)
+    seed_active_event_wallets.add_argument(
+        "--include-market-trades", action=argparse.BooleanOptionalAction, default=True
+    )
+    seed_active_event_wallets.add_argument(
+        "--include-wallet-trades", action=argparse.BooleanOptionalAction, default=True
+    )
+    seed_active_event_wallets.add_argument(
+        "--include-wallet-activity", action=argparse.BooleanOptionalAction, default=True
+    )
+    seed_active_event_wallets.add_argument(
+        "--include-wallet-portfolio", action=argparse.BooleanOptionalAction, default=True
+    )
+    seed_active_event_wallets.add_argument(
+        "--include-wallet-pnl", action=argparse.BooleanOptionalAction, default=True
+    )
+    seed_active_event_wallets.add_argument(
+        "--include-tracked-wallets",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help=argparse.SUPPRESS,
+    )
+    seed_active_event_wallets.add_argument("--refresh-run", help=argparse.SUPPRESS)
+    seed_active_event_wallets.add_argument(
+        "--requeue-done",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help=argparse.SUPPRESS,
+    )
+    seed_active_event_wallets.set_defaults(func=cmd_tasks_seed_active_event_wallets)
 
     seed_history = task_subparsers.add_parser(
         "seed-history", help="Seed deep historical backfill tasks from ClickHouse."
@@ -1067,6 +1134,86 @@ def cmd_discover_wallets(args: argparse.Namespace, app_settings: Settings) -> An
     return {"wallets": wallets, "count": len(wallets)}
 
 
+def discover_missing_live_token_metadata(
+    clickhouse: ClickHouseWriter,
+    *,
+    lookback_minutes: int,
+    limit: int,
+    min_notional: float,
+) -> list[str]:
+    if lookback_minutes <= 0:
+        raise ValueError("lookback_minutes must be positive")
+    if limit <= 0:
+        raise ValueError("limit must be positive")
+    if min_notional < 0:
+        raise ValueError("min_notional must be non-negative")
+
+    query = f"""
+        select fills.token_id
+        from fact_exchange_fill as fills final
+        left join dim_outcome_token as tokens final on fills.token_id = tokens.token_id
+        where fills.ingested_at >= now64(3) - interval {lookback_minutes} minute
+          and fills.token_id != ''
+          and fills.notional >= {min_notional}
+          and tokens.token_id = ''
+        group by fills.token_id
+        order by max(fills.ingested_at) desc, sum(fills.notional) desc
+        limit {limit}
+        format JSONEachRow
+    """
+    return [
+        json.loads(line)["token_id"]
+        for line in clickhouse.query_text(query).splitlines()
+        if line.strip()
+    ]
+
+
+def cmd_refresh_live_token_metadata(args: argparse.Namespace, app_settings: Settings) -> Any:
+    clickhouse = ClickHouseWriter(app_settings)
+    token_ids = discover_missing_live_token_metadata(
+        clickhouse,
+        lookback_minutes=args.lookback_minutes,
+        limit=args.limit,
+        min_notional=args.min_notional,
+    )
+    client = PolymarketClient(app_settings)
+    writer = raw_writer(app_settings)
+    raw_paths: list[str] = []
+    requests = 0
+    markets_by_token: dict[str, int] = {}
+
+    for token_id in token_ids:
+        page = client.gamma_markets_by_clob_token_id(token_id=token_id)
+        requests += 1
+        markets_by_token[token_id] = len(page.items)
+        if page.items:
+            raw_path = writer.write(
+                source="gamma",
+                entity="markets",
+                request_url=page.response.url,
+                payload=page.response.body,
+            )
+            if not str(raw_path).endswith(".open"):
+                raw_paths.append(str(raw_path))
+        if args.sleep_seconds > 0:
+            time.sleep(args.sleep_seconds)
+
+    raw_paths.extend(str(path) for path in writer.flush())
+    raw_paths = list(dict.fromkeys(raw_paths))
+    load_result = GammaRawLoader(clickhouse=clickhouse).load(
+        raw_root=app_settings.raw_data_dir,
+        batch_size=args.load_batch_size,
+    )
+    return {
+        "candidate_token_ids": len(token_ids),
+        "requests": requests,
+        "markets": sum(markets_by_token.values()),
+        "raw_paths": raw_paths,
+        "markets_by_token": markets_by_token,
+        "load": asdict(load_result),
+    }
+
+
 def discover_condition_ids_for_history(
     clickhouse: ClickHouseWriter,
     *,
@@ -1297,6 +1444,110 @@ def discover_recent_wallets(
     ]
 
 
+def active_event_condition_query(*, event_limit: int, condition_limit: int) -> str:
+    if event_limit < 0:
+        raise ValueError("event_limit must not be negative")
+    if condition_limit <= 0:
+        raise ValueError("condition_limit must be positive")
+
+    markets_where = (
+        "where event_id != '' and condition_id != '' "
+        "and active = true and closed = false and archived = false"
+    )
+    if event_limit <= 0:
+        return f"""
+            select distinct condition_id
+            from dim_market final
+            {markets_where}
+            order by condition_id
+            limit {condition_limit}
+            format JSONEachRow
+        """
+
+    return f"""
+        with selected_events as
+        (
+          select event_id
+          from dim_market final
+          {markets_where}
+          group by event_id
+          order by max(updated_at) desc, event_id
+          limit {event_limit}
+        )
+        select distinct condition_id
+        from dim_market final
+        where condition_id != ''
+          and active = true
+          and closed = false
+          and archived = false
+          and event_id in selected_events
+        order by condition_id
+        limit {condition_limit}
+        format JSONEachRow
+    """
+
+
+def discover_active_event_conditions(
+    clickhouse: ClickHouseWriter,
+    *,
+    event_limit: int,
+    condition_limit: int,
+) -> list[str]:
+    return [
+        json.loads(line)["condition_id"]
+        for line in clickhouse.query_text(
+            active_event_condition_query(
+                event_limit=event_limit,
+                condition_limit=condition_limit,
+            )
+        ).splitlines()
+        if line.strip()
+    ]
+
+
+def discover_active_event_wallets(
+    clickhouse: ClickHouseWriter,
+    *,
+    wallet_limit: int,
+    since_minutes: int,
+    event_limit: int,
+    condition_limit: int,
+    min_notional: float,
+) -> list[str]:
+    if wallet_limit <= 0:
+        raise ValueError("wallet_limit must be positive")
+    if since_minutes <= 0:
+        raise ValueError("since_minutes must be positive")
+    if min_notional < 0:
+        raise ValueError("min_notional must be non-negative")
+
+    condition_query = active_event_condition_query(
+        event_limit=event_limit,
+        condition_limit=condition_limit,
+    ).replace("format JSONEachRow", "")
+    query = f"""
+        with active_conditions as
+        (
+          {condition_query}
+        )
+        select user_address
+        from fact_trade_by_time
+        where user_address != ''
+          and condition_id in active_conditions
+          and timestamp >= now64(3) - interval {since_minutes} minute
+        group by user_address
+        having sum(abs(notional)) >= {min_notional}
+        order by max(timestamp) desc, sum(abs(notional)) desc, user_address
+        limit {wallet_limit}
+        format JSONEachRow
+    """
+    return [
+        json.loads(line)["user_address"]
+        for line in clickhouse.query_text(query).splitlines()
+        if line.strip()
+    ]
+
+
 def discover_wallet_candidates(
     clickhouse: ClickHouseWriter,
     *,
@@ -1383,6 +1634,14 @@ def normalize_wallet_list(wallets: list[str]) -> list[str]:
     return merge_wallet_lists([], wallets)
 
 
+def tracked_wallet_addresses(app_settings: Settings) -> list[str]:
+    try:
+        return TrackedWalletStore(dsn=app_settings.postgres_dsn).tracked_addresses()
+    except Exception as exc:
+        print(f"tracked wallet discovery skipped: {exc}", file=sys.stderr)
+        return []
+
+
 def cmd_tasks_seed_basic(args: argparse.Namespace, app_settings: Settings) -> Any:
     store = task_store_for_args(args, app_settings)
     trade_max_pages = args.max_pages if args.max_pages > 0 else 1
@@ -1428,7 +1687,8 @@ def cmd_tasks_seed_wallets(args: argparse.Namespace, app_settings: Settings) -> 
         )
     store = task_store_for_args(args, app_settings)
     refresh_run = args.refresh_run or datetime.now(UTC).replace(microsecond=0).isoformat()
-    explicit_wallets = normalize_wallet_list(args.wallets)
+    tracked_wallets = tracked_wallet_addresses(app_settings) if args.include_tracked_wallets else []
+    explicit_wallets = normalize_wallet_list([*args.wallets, *tracked_wallets])
     candidate_wallets = []
     if args.wallet_limit > 0:
         candidate_wallets = discover_wallet_candidates(
@@ -1517,6 +1777,147 @@ def cmd_tasks_seed_wallets(args: argparse.Namespace, app_settings: Settings) -> 
         "include_wallet_pnl": args.include_wallet_pnl,
         "candidate_mode": args.candidate_mode,
         "explicit_wallets": len(explicit_wallets),
+        "summary": store.summary(),
+        "task_store": args.task_store,
+    }
+
+
+def cmd_tasks_seed_active_event_wallets(args: argparse.Namespace, app_settings: Settings) -> Any:
+    if (
+        not args.include_market_trades
+        and not args.include_wallet_trades
+        and not args.include_wallet_activity
+        and not args.include_wallet_portfolio
+        and not args.include_wallet_pnl
+    ):
+        raise ValueError("at least one active-event refresh target must be enabled")
+
+    store = task_store_for_args(args, app_settings)
+    clickhouse = ClickHouseWriter(app_settings)
+    refresh_run = args.refresh_run or "active-event-wallets"
+
+    condition_ids: list[str] = []
+    if args.include_market_trades:
+        condition_ids = discover_active_event_conditions(
+            clickhouse,
+            event_limit=args.event_limit,
+            condition_limit=args.condition_limit,
+        )
+
+    discovered_wallets: list[str] = []
+    if (
+        args.include_wallet_trades
+        or args.include_wallet_activity
+        or args.include_wallet_portfolio
+        or args.include_wallet_pnl
+    ):
+        discovered_wallets = discover_active_event_wallets(
+            clickhouse,
+            wallet_limit=args.wallet_limit,
+            since_minutes=args.since_minutes,
+            event_limit=args.event_limit,
+            condition_limit=args.condition_limit,
+            min_notional=args.min_notional,
+        )
+
+    tracked_wallets = tracked_wallet_addresses(app_settings) if args.include_tracked_wallets else []
+    explicit_wallets = normalize_wallet_list([*args.wallets, *tracked_wallets])
+    wallets = merge_wallet_lists(discovered_wallets, explicit_wallets)
+    explicit_wallet_set = set(explicit_wallets)
+
+    tasks: list[Task] = []
+    if args.include_market_trades:
+        for condition_id in condition_ids:
+            params = {
+                "page_limit": min(args.trade_page_limit, 500),
+                "max_pages": args.trade_max_pages,
+                "resume": False,
+                "user": None,
+                "market": condition_id,
+                "event_id": None,
+                "_refresh_run": refresh_run,
+            }
+            if args.requeue_done:
+                params["_requeue_done"] = True
+            tasks.append(Task(kind="trades", params=params, priority=FRONTIER_TRADES_PRIORITY))
+
+    for wallet in wallets:
+        is_explicit_wallet = wallet in explicit_wallet_set
+        wallet_refresh_priority = (
+            WALLET_EXPLICIT_REFRESH_PRIORITY if is_explicit_wallet else ACTIVE_EVENT_WALLET_PRIORITY
+        )
+        wallet_portfolio_priority = (
+            WALLET_EXPLICIT_REFRESH_PRIORITY if is_explicit_wallet else WALLET_PORTFOLIO_PRIORITY
+        )
+        wallet_pnl_priority = WALLET_EXPLICIT_REFRESH_PRIORITY if is_explicit_wallet else WALLET_PNL_PRIORITY
+        base_params = {
+            "user": wallet,
+            "page_limit": min(args.wallet_page_limit, 500),
+            "max_pages": args.wallet_max_pages,
+            "resume": False,
+            "_refresh_run": refresh_run,
+        }
+        if args.requeue_done:
+            base_params["_requeue_done"] = True
+        if args.include_wallet_trades:
+            tasks.append(
+                Task(
+                    kind="wallet-trades",
+                    params={**base_params, "market": None, "event_id": None},
+                    priority=wallet_refresh_priority,
+                )
+            )
+        if args.include_wallet_activity:
+            tasks.append(
+                Task(
+                    kind="wallet-activity",
+                    params=dict(base_params),
+                    priority=wallet_refresh_priority,
+                )
+            )
+        if args.include_wallet_portfolio:
+            portfolio_params = {"user": wallet, "_refresh_run": refresh_run}
+            if args.requeue_done:
+                portfolio_params["_requeue_done"] = True
+            tasks.append(
+                Task(
+                    kind="wallet-portfolio",
+                    params=portfolio_params,
+                    priority=wallet_portfolio_priority,
+                )
+            )
+        if args.include_wallet_pnl:
+            pnl_params = {
+                "user": wallet,
+                "interval": "all",
+                "fidelity": "1d",
+                "_refresh_run": refresh_run,
+            }
+            if args.requeue_done:
+                pnl_params["_requeue_done"] = True
+            tasks.append(
+                Task(
+                    kind="wallet-pnl",
+                    params=pnl_params,
+                    priority=wallet_pnl_priority,
+                )
+            )
+
+    added = store.add_many(tasks)
+    return {
+        "added": added,
+        "candidate_tasks": len(tasks),
+        "condition_ids": len(condition_ids),
+        "wallets": len(wallets),
+        "discovered_wallets": len(discovered_wallets),
+        "explicit_wallets": len(explicit_wallets),
+        "since_minutes": args.since_minutes,
+        "refresh_run": refresh_run,
+        "include_market_trades": args.include_market_trades,
+        "include_wallet_trades": args.include_wallet_trades,
+        "include_wallet_activity": args.include_wallet_activity,
+        "include_wallet_portfolio": args.include_wallet_portfolio,
+        "include_wallet_pnl": args.include_wallet_pnl,
         "summary": store.summary(),
         "task_store": args.task_store,
     }

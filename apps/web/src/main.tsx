@@ -3,6 +3,7 @@ import { createRoot } from "react-dom/client";
 import {
   Activity,
   AlertTriangle,
+  ArrowLeft,
   ChevronRight,
   Cpu,
   Database,
@@ -34,8 +35,10 @@ const API_BASE = import.meta.env.VITE_ZETTA_API_BASE || "/api";
 const SYSTEM_REFRESH_MS = 30_000;
 const MARKET_REFRESH_MS = 30_000;
 const LEADERBOARD_REFRESH_MS = 30_000;
+const TRACKED_WALLET_REFRESH_MS = 15_000;
 const WORLD_CUP_DEFAULT_QUERY = "World Cup";
 const TRACKED_WALLETS_STORAGE_KEY = "zetta.trackedWallets.v1";
+const TRACKED_WALLET_SUMMARIES_STORAGE_KEY = "zetta.trackedWalletSummaries.v1";
 
 type Overview = {
   events?: number;
@@ -196,6 +199,12 @@ type NodeProgress = {
   };
 };
 
+type MachineProgressRow = NodeProgressRow & {
+  machine_id: string;
+  label: string;
+  ip: string;
+};
+
 type LeaderboardUser = {
   rank: string;
   proxyWallet: string;
@@ -228,6 +237,14 @@ type TrackedWallet = {
   address: string;
   name: string;
   addedAt: string;
+};
+
+type ApiTrackedWallet = {
+  address?: string;
+  user_address?: string;
+  name?: string;
+  created_at?: string | null;
+  updated_at?: string | null;
 };
 
 type WalletPosition = {
@@ -265,6 +282,8 @@ type WalletDetail = {
   wallet: {
     user_address: string;
     latest_total_pnl?: number | null;
+    current_pnl?: number | null;
+    position_cash_pnl?: number | null;
     pnl_7d?: number | null;
     win_rate?: number | null;
     avg_bet?: number | null;
@@ -278,6 +297,8 @@ type WalletDetail = {
     position_count?: number | null;
     pnl_captured_at?: string | null;
     portfolio_captured_at?: string | null;
+    pnl_lag_minutes?: number | null;
+    data_freshness_status?: string | null;
   };
   position_summary: {
     position_count: number;
@@ -295,6 +316,8 @@ type WalletDetail = {
   recent_activity: WalletActivity[];
   reputation: Record<string, string | number | null>;
 };
+
+type WalletListSummary = WalletDetail["wallet"];
 
 type WalletDetailState = {
   loading: boolean;
@@ -351,6 +374,9 @@ function App() {
   const [leaderboardLoading, setLeaderboardLoading] = useState(false);
   const [trackedWallets, setTrackedWallets] = useState<TrackedWallet[]>(() => loadTrackedWallets());
   const [walletDetails, setWalletDetails] = useState<Record<string, WalletDetailState>>({});
+  const [walletSummaries, setWalletSummaries] = useState<Record<string, WalletListSummary>>(
+    () => loadTrackedWalletSummaries(),
+  );
   const [selectedTrackedWallet, setSelectedTrackedWallet] = useState("");
   const [trackedWalletAddress, setTrackedWalletAddress] = useState("");
   const [trackedWalletName, setTrackedWalletName] = useState("");
@@ -400,12 +426,52 @@ function App() {
   }, [trackedWallets]);
 
   useEffect(() => {
+    saveTrackedWalletSummaries(walletSummaries);
+  }, [walletSummaries]);
+
+  useEffect(() => {
+    const trackedAddresses = new Set(trackedWallets.map((wallet) => wallet.address));
+    setWalletSummaries((current) => {
+      const next = Object.fromEntries(
+        Object.entries(current).filter(([address]) => trackedAddresses.has(address)),
+      ) as Record<string, WalletListSummary>;
+      return Object.keys(next).length === Object.keys(current).length ? current : next;
+    });
+  }, [trackedWallets.map((item) => item.address).join("|")]);
+
+  useEffect(() => {
+    void loadTrackedWalletList();
+  }, []);
+
+  useEffect(() => {
     if (!trackedWallets.length) return;
     void refreshTrackedWallets();
   }, [trackedWallets.map((item) => item.address).join("|")]);
 
+  useEffect(() => {
+    if (view !== "tracked-wallets" || !selectedTrackedWallet) return;
+    const refreshSelectedWallet = () => {
+      void refreshTrackedWallet(selectedTrackedWallet, { live: true });
+    };
+    refreshSelectedWallet();
+    const timer = window.setInterval(refreshSelectedWallet, TRACKED_WALLET_REFRESH_MS);
+    return () => window.clearInterval(timer);
+  }, [view, selectedTrackedWallet]);
+
   async function getJson<T>(path: string): Promise<T> {
     const response = await fetch(`${API_BASE}${path}`);
+    if (!response.ok) {
+      throw new Error(`${response.status} ${response.statusText}`);
+    }
+    return (await response.json()) as T;
+  }
+
+  async function sendJson<T>(path: string, method: "POST" | "DELETE", body: Record<string, unknown>): Promise<T> {
+    const response = await fetch(`${API_BASE}${path}`, {
+      method,
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(body),
+    });
     if (!response.ok) {
       throw new Error(`${response.status} ${response.statusText}`);
     }
@@ -516,14 +582,33 @@ function App() {
     }
   }
 
-  async function fetchWalletDetail(address: string, options: { refresh?: boolean } = {}) {
-    const refreshParam = options.refresh ? "&refresh=1" : "";
-    return getJson<WalletDetail>(
-      `/wallets/detail?user=${encodeURIComponent(address)}&position_limit=50&activity_limit=30&pnl_points_limit=240${refreshParam}`,
-    );
+  async function fetchWalletDetail(address: string, options: { refresh?: boolean; live?: boolean } = {}) {
+    const params = new URLSearchParams({
+      user: address,
+      position_limit: "50",
+      activity_limit: "30",
+      pnl_points_limit: "240",
+    });
+    if (options.refresh) params.set("refresh", "1");
+    if (options.live) params.set("live", "1");
+    return getJson<WalletDetail>(`/wallets/detail?${params.toString()}`);
   }
 
-  async function refreshTrackedWallet(address: string, options: { enqueueRefresh?: boolean } = {}) {
+  async function loadTrackedWalletList() {
+    try {
+      const data = await getJson<{ wallets: ApiTrackedWallet[] }>("/wallets/tracked");
+      const serverWallets = normalizeTrackedWallets(data.wallets || []);
+      if (!serverWallets.length) return;
+      setTrackedWallets((current) => mergeTrackedWallets(serverWallets, current));
+    } catch {
+      return;
+    }
+  }
+
+  async function refreshTrackedWallet(
+    address: string,
+    options: { enqueueRefresh?: boolean; live?: boolean } = {},
+  ) {
     const normalized = normalizeWalletAddress(address);
     if (!normalized) return;
     setWalletDetails((current) => ({
@@ -531,11 +616,15 @@ function App() {
       [normalized]: { ...current[normalized], loading: true, error: "" },
     }));
     try {
-      const detail = await fetchWalletDetail(normalized, { refresh: options.enqueueRefresh });
+      const detail = await fetchWalletDetail(normalized, {
+        refresh: options.enqueueRefresh,
+        live: options.live,
+      });
       setWalletDetails((current) => ({
         ...current,
         [normalized]: { loading: false, detail },
       }));
+      recordWalletSummary(normalized, detail);
     } catch (exc) {
       setWalletDetails((current) => ({
         ...current,
@@ -545,7 +634,9 @@ function App() {
   }
 
   async function refreshTrackedWallets() {
-    await Promise.all(trackedWallets.map((item) => refreshTrackedWallet(item.address)));
+    await Promise.all(
+      trackedWallets.map((item) => refreshTrackedWallet(item.address, { live: false })),
+    );
   }
 
   async function addTrackedWallet() {
@@ -555,6 +646,12 @@ function App() {
       return;
     }
     const name = trackedWalletName.trim() || shortId(address);
+    setError("");
+    try {
+      await sendJson("/wallets/tracked", "POST", { address, name });
+    } catch (exc) {
+      setError(errorMessage(exc));
+    }
     setTrackedWallets((current) => {
       const existing = current.find((item) => item.address === address);
       if (existing) {
@@ -565,13 +662,22 @@ function App() {
     setSelectedTrackedWallet(address);
     setTrackedWalletAddress("");
     setTrackedWalletName("");
-    setError("");
-    await refreshTrackedWallet(address, { enqueueRefresh: true });
+    await refreshTrackedWallet(address, { enqueueRefresh: true, live: true });
   }
 
-  function removeTrackedWallet(address: string) {
+  async function removeTrackedWallet(address: string) {
+    try {
+      await sendJson("/wallets/tracked", "DELETE", { address });
+    } catch (exc) {
+      setError(errorMessage(exc));
+    }
     setTrackedWallets((current) => current.filter((item) => item.address !== address));
     setWalletDetails((current) => {
+      const next = { ...current };
+      delete next[address];
+      return next;
+    });
+    setWalletSummaries((current) => {
       const next = { ...current };
       delete next[address];
       return next;
@@ -579,6 +685,18 @@ function App() {
     if (selectedTrackedWallet === address) {
       setSelectedTrackedWallet("");
     }
+  }
+
+  function recordWalletSummary(address: string, detail: WalletDetail) {
+    const normalized = normalizeWalletAddress(address || detail.wallet.user_address);
+    if (!normalized) return;
+    setWalletSummaries((current) => ({
+      ...current,
+      [normalized]: {
+        ...detail.wallet,
+        user_address: normalized,
+      },
+    }));
   }
 
   const progressRows = useMemo(() => {
@@ -611,7 +729,17 @@ function App() {
           </div>
           <button
             className="iconButton"
-            onClick={() => view === "leaderboard" ? loadLeaderboard() : view === "markets" ? searchMarkets() : view === "tracked-wallets" ? refreshTrackedWallets() : refreshSystem()}
+            onClick={() =>
+              view === "leaderboard"
+                ? loadLeaderboard()
+                : view === "markets"
+                  ? searchMarkets()
+                  : view === "tracked-wallets"
+                    ? selectedTrackedWallet
+                      ? refreshTrackedWallet(selectedTrackedWallet, { live: true })
+                      : refreshTrackedWallets()
+                    : refreshSystem()
+            }
             title="Refresh"
           >
             <RefreshCw size={18} />
@@ -656,6 +784,7 @@ function App() {
           <TrackedWallets
             wallets={trackedWallets}
             details={walletDetails}
+            summaries={walletSummaries}
             selectedAddress={selectedTrackedWallet}
             addressInput={trackedWalletAddress}
             nameInput={trackedWalletName}
@@ -663,7 +792,8 @@ function App() {
             setNameInput={setTrackedWalletName}
             onAdd={addTrackedWallet}
             onSelect={setSelectedTrackedWallet}
-            onRefresh={(address) => refreshTrackedWallet(address, { enqueueRefresh: true })}
+            onBack={() => setSelectedTrackedWallet("")}
+            onRefresh={(address) => refreshTrackedWallet(address, { enqueueRefresh: true, live: true })}
             onRemove={removeTrackedWallet}
           />
         ) : null}
@@ -978,6 +1108,8 @@ function SystemPage({
 
       <SystemPressure system={system} wide />
 
+      <MachineProgressSummary nodeProgress={nodeProgress} wide />
+
       <div className="panel">
         <PanelTitle icon={<Activity size={18} />} title="Task State" />
         <ResponsiveContainer width="100%" height={240}>
@@ -1106,6 +1238,7 @@ function SystemPage({
 function TrackedWallets({
   wallets,
   details,
+  summaries,
   selectedAddress,
   addressInput,
   nameInput,
@@ -1113,11 +1246,13 @@ function TrackedWallets({
   setNameInput,
   onAdd,
   onSelect,
+  onBack,
   onRefresh,
   onRemove,
 }: {
   wallets: TrackedWallet[];
   details: Record<string, WalletDetailState>;
+  summaries: Record<string, WalletListSummary>;
   selectedAddress: string;
   addressInput: string;
   nameInput: string;
@@ -1125,13 +1260,22 @@ function TrackedWallets({
   setNameInput: (value: string) => void;
   onAdd: () => void;
   onSelect: (address: string) => void;
+  onBack: () => void;
   onRefresh: (address: string) => void;
   onRemove: (address: string) => void;
 }) {
   const selected = selectedAddress
     ? wallets.find((wallet) => wallet.address === selectedAddress) || null
-    : wallets[0] || null;
+    : null;
   const selectedState = selected ? details[selected.address] : undefined;
+
+  if (selectedAddress) {
+    return (
+      <section className="trackedWalletPage">
+        <WalletDetailPanel wallet={selected} state={selectedState} onBack={onBack} />
+      </section>
+    );
+  }
 
   return (
     <section className="trackedWalletPage">
@@ -1162,61 +1306,58 @@ function TrackedWallets({
         </button>
       </div>
 
-      <div className="trackedLayout">
-        <div className="panelFlush trackedTable">
-          <div className="trackedRow trackedHeader">
-            <span>Wallet</span>
-            <span>7d PnL</span>
-            <span>Win Rate / Avg Bet</span>
-            <span>Cash</span>
-            <span>7d Volume / Trades</span>
-            <span>Last Active</span>
-            <span>Actions</span>
-          </div>
-          {wallets.map((wallet) => {
-            const state = details[wallet.address];
-            const detail = state?.detail;
-            return (
-              <button
-                className={wallet.address === selected?.address ? "trackedRow active" : "trackedRow"}
-                key={wallet.address}
-                onClick={() => onSelect(wallet.address)}
-              >
-                <span className="walletNameCell">
-                  <strong>{wallet.name}</strong>
-                  <small>{shortId(wallet.address)}</small>
-                </span>
-                <ProfitCell value={detail?.wallet.pnl_7d} />
-                <span className="stackedMetric">
-                  <strong>{formatRatioPercent(detail?.wallet.win_rate)}</strong>
-                  <small>{formatCurrency(detail?.wallet.avg_bet)}</small>
-                </span>
-                <span className="num">{formatCurrency(detail?.wallet.cash)}</span>
-                <span className="stackedMetric right">
-                  <strong>{formatCurrency(detail?.wallet.trade_volume_7d)}</strong>
-                  <small>{formatCount(detail?.wallet.trade_count_7d)}</small>
-                </span>
-                <span className="mutedText">{formatRelativeTime(detail?.wallet.last_activity_at)}</span>
-                <span className="rowActions" onClick={(event) => event.stopPropagation()}>
-                  <button className="iconButton small" onClick={() => onRefresh(wallet.address)} title="Refresh wallet">
-                    {state?.loading ? <Loader2 className="spin" size={15} /> : <RefreshCw size={15} />}
-                  </button>
-                  <button className="iconButton small" onClick={() => onSelect(wallet.address)} title="Open wallet">
-                    <Eye size={15} />
-                  </button>
-                  <button className="iconButton small danger" onClick={() => onRemove(wallet.address)} title="Remove wallet">
-                    <Trash2 size={15} />
-                  </button>
-                </span>
-              </button>
-            );
-          })}
-          {!wallets.length ? (
-            <div className="empty trackedEmpty">Add a wallet address to build a tracked wallet list.</div>
-          ) : null}
+      <div className="panelFlush trackedTable">
+        <div className="trackedRow trackedHeader">
+          <span>Wallet</span>
+          <span>7d PnL</span>
+          <span>Win Rate / Avg Bet</span>
+          <span>Cash</span>
+          <span>7d Volume / Trades</span>
+          <span>Last Active</span>
+          <span>Actions</span>
         </div>
-
-        <WalletDetailPanel wallet={selected} state={selectedState} />
+        {wallets.map((wallet) => {
+          const state = details[wallet.address];
+          const detail = state?.detail;
+          const summary = detail?.wallet || summaries[wallet.address];
+          return (
+            <button
+              className="trackedRow"
+              key={wallet.address}
+              onClick={() => onSelect(wallet.address)}
+            >
+              <span className="walletNameCell">
+                <strong>{wallet.name}</strong>
+                <small>{shortId(wallet.address)}</small>
+              </span>
+              <ProfitCell value={summary?.pnl_7d} />
+              <span className="stackedMetric">
+                <strong>{formatRatioPercent(summary?.win_rate)}</strong>
+                <small>{formatCurrency(summary?.avg_bet)}</small>
+              </span>
+              <span className="num">{formatCurrency(summary?.cash)}</span>
+              <span className="stackedMetric right">
+                <strong>{formatCurrency(summary?.trade_volume_7d)}</strong>
+                <small>{formatCount(summary?.trade_count_7d)}</small>
+              </span>
+              <span className="mutedText">{formatRelativeTime(summary?.last_activity_at)}</span>
+              <span className="rowActions" onClick={(event) => event.stopPropagation()}>
+                <button className="iconButton small" onClick={() => onRefresh(wallet.address)} title="Refresh wallet">
+                  {state?.loading ? <Loader2 className="spin" size={15} /> : <RefreshCw size={15} />}
+                </button>
+                <button className="iconButton small" onClick={() => onSelect(wallet.address)} title="Open wallet">
+                  <Eye size={15} />
+                </button>
+                <button className="iconButton small danger" onClick={() => onRemove(wallet.address)} title="Remove wallet">
+                  <Trash2 size={15} />
+                </button>
+              </span>
+            </button>
+          );
+        })}
+        {!wallets.length ? (
+          <div className="empty trackedEmpty">Add a wallet address to build a tracked wallet list.</div>
+        ) : null}
       </div>
     </section>
   );
@@ -1225,47 +1366,92 @@ function TrackedWallets({
 function WalletDetailPanel({
   wallet,
   state,
+  onBack,
 }: {
   wallet: TrackedWallet | null;
   state: WalletDetailState | undefined;
+  onBack: () => void;
 }) {
   const detail = state?.detail;
-  if (!wallet) {
-    return <aside className="sidePanel emptyPanel">Select a tracked wallet to inspect positions and activity.</aside>;
-  }
-  if (state?.loading && !detail) {
-    return <aside className="sidePanel emptyPanel"><Loader2 className="spin" size={18} /> Loading wallet detail</aside>;
-  }
-  if (state?.error && !detail) {
-    return <aside className="sidePanel emptyPanel">Wallet detail is not available yet.</aside>;
-  }
-  if (!detail) {
-    return <aside className="sidePanel emptyPanel">Wallet detail has not been loaded yet.</aside>;
+  const title = wallet?.name || "Wallet Detail";
+  const subtitle = wallet?.address ? shortId(wallet.address) : "";
+  const content = (() => {
+    if (!wallet) {
+      return <div className="emptyPanel">Wallet is no longer tracked.</div>;
+    }
+    if (state?.loading && !detail) {
+      return <div className="emptyPanel"><Loader2 className="spin" size={18} /> Loading wallet detail</div>;
+    }
+    if (state?.error && !detail) {
+      return <div className="emptyPanel">Wallet detail is not available yet.</div>;
+    }
+    if (!detail) {
+      return <div className="emptyPanel">Wallet detail has not been loaded yet.</div>;
+    }
+    return null;
+  })();
+
+  if (content) {
+    return (
+      <section className="walletDetailPage panel">
+        <div className="detailPageHeader">
+          <button className="iconButton" onClick={onBack} title="Back to tracked wallets">
+            <ArrowLeft size={18} />
+          </button>
+          <div>
+            <h2>{title}</h2>
+            {subtitle ? <code>{subtitle}</code> : null}
+          </div>
+        </div>
+        {content}
+      </section>
+    );
   }
 
+  const activeWallet = wallet;
+  const activeDetail = detail;
+  if (!activeWallet || !activeDetail) return null;
+
+  const pnlLagMinutes = activeDetail.wallet.pnl_lag_minutes ?? minutesBetween(activeDetail.wallet.pnl_captured_at, activeDetail.wallet.portfolio_captured_at);
+  const pnlStatus = activeDetail.wallet.data_freshness_status === "pnl_lagging" || (pnlLagMinutes !== null && pnlLagMinutes > 10)
+    ? "PnL lagging"
+    : "PnL current";
+
   return (
-    <aside className="walletDetailPanel sidePanel">
-      <div className="sideTitle">
-        <h2>{wallet.name}</h2>
-        <code>{shortId(wallet.address)}</code>
+    <section className="walletDetailPage panel">
+      <div className="detailPageHeader">
+        <button className="iconButton" onClick={onBack} title="Back to tracked wallets">
+          <ArrowLeft size={18} />
+        </button>
+        <div>
+          <h2>{activeWallet.name}</h2>
+          <code>{shortId(activeWallet.address)}</code>
+        </div>
       </div>
       <div className="walletDetailHero">
         <span>Total PnL</span>
-        <strong className={Number(detail.wallet.latest_total_pnl || 0) >= 0 ? "positive" : "negative"}>
-          {formatCurrency(detail.wallet.latest_total_pnl)}
+        <strong className={Number(activeDetail.wallet.latest_total_pnl || 0) >= 0 ? "positive" : "negative"}>
+          {formatCurrency(activeDetail.wallet.latest_total_pnl)}
         </strong>
-        <small>Last active {formatRelativeTime(detail.wallet.last_activity_at)}</small>
+        <small>Last active {formatRelativeTime(activeDetail.wallet.last_activity_at)}</small>
+      </div>
+      <div className={pnlStatus === "PnL lagging" ? "walletDataStatus lagging" : "walletDataStatus"}>
+        <span>{pnlStatus}</span>
+        <small>
+          PnL {formatRelativeTime(activeDetail.wallet.pnl_captured_at)} / Portfolio {formatRelativeTime(activeDetail.wallet.portfolio_captured_at)}
+          {pnlLagMinutes !== null ? ` / Lag ${formatNumber(pnlLagMinutes)}m` : ""}
+        </small>
       </div>
       <div className="miniGrid">
-        <MiniStat label="Portfolio" value={formatCurrency(detail.wallet.portfolio_value)} />
-        <MiniStat label="Open value" value={formatCurrency(detail.wallet.positions_value)} />
-        <MiniStat label="Cash" value={formatCurrency(detail.wallet.cash)} />
-        <MiniStat label="Win rate" value={formatRatioPercent(detail.wallet.win_rate)} />
+        <MiniStat label="Portfolio" value={formatCurrency(activeDetail.wallet.portfolio_value)} />
+        <MiniStat label="Open value" value={formatCurrency(activeDetail.wallet.positions_value)} />
+        <MiniStat label="Cash" value={formatCurrency(activeDetail.wallet.cash)} />
+        <MiniStat label="Current PnL" value={formatCurrency(activeDetail.wallet.current_pnl)} />
       </div>
 
       <h3>Positions</h3>
       <div className="walletPositionList">
-        {detail.positions.slice(0, 8).map((position) => (
+        {activeDetail.positions.slice(0, 8).map((position) => (
           <div className="walletPosition" key={`${position.asset}-${position.slug}`}>
             <div>
               <strong>{position.title || position.slug}</strong>
@@ -1276,12 +1462,12 @@ function WalletDetailPanel({
             </span>
           </div>
         ))}
-        {!detail.positions.length ? <div className="empty">No positions in the selected scope.</div> : null}
+        {!activeDetail.positions.length ? <div className="empty">No positions in the selected scope.</div> : null}
       </div>
 
       <h3>Recent Activity</h3>
       <div className="activityList compact">
-        {detail.recent_activity.slice(0, 8).map((activity) => (
+        {activeDetail.recent_activity.slice(0, 8).map((activity) => (
           <div className="activityItem" key={`${activity.timestamp}-${activity.slug}-${activity.notional}`}>
             <div>
               <strong>{activity.side || activity.activity_type}</strong>
@@ -1292,7 +1478,73 @@ function WalletDetailPanel({
           </div>
         ))}
       </div>
-    </aside>
+    </section>
+  );
+}
+
+function MachineProgressSummary({
+  nodeProgress,
+  wide = false,
+}: {
+  nodeProgress: NodeProgress | null;
+  wide?: boolean;
+}) {
+  const machines = aggregateMachineProgress(nodeProgress?.nodes || []);
+  const maxItems = Math.max(...machines.map((machine) => machine.items), 1);
+  const totals = machines.reduce(
+    (acc, machine) => ({
+      runs: acc.runs + machine.runs,
+      items: acc.items + machine.items,
+      running: acc.running + machine.running_tasks,
+    }),
+    { runs: 0, items: 0, running: 0 },
+  );
+
+  return (
+    <div className={wide ? "machineProgressPanel wide" : "machineProgressPanel"}>
+      <div className="machineProgressHead">
+        <PanelTitle icon={<Server size={18} />} title="Machine Progress" />
+        <span>{nodeProgress?.lookback_minutes || 30}m / {formatNumber(totals.runs)} runs / {formatNumber(totals.running)} running</span>
+      </div>
+      <div className="machineGrid">
+        {machines.map((machine) => (
+          <div className="machineCard" data-role={machine.role} key={machine.machine_id}>
+            <div className="machineCardHead">
+              <div>
+                <strong>{machine.label}</strong>
+                <small>{machine.ip} / {machine.role}</small>
+              </div>
+              <span className={machine.running_tasks > 0 ? "statusPill active" : "statusPill"}>
+                {machine.running_tasks > 0 ? `${formatNumber(machine.running_tasks)} running` : "idle"}
+              </span>
+            </div>
+            <div className="machineMeter">
+              <div style={{ width: `${Math.max(4, (machine.items / maxItems) * 100)}%` }} />
+            </div>
+            <div className="machineStats">
+              <MachineStat label="30m Runs" value={formatNumber(machine.runs)} />
+              <MachineStat label="Items" value={formatNumber(machine.items)} />
+              <MachineStat label="Avg Task" value={formatSeconds(nodeAverageSeconds(machine))} />
+              <MachineStat label="Last Done" value={formatRelativeTime(machine.latest_finished)} />
+            </div>
+            <div className="machineKinds">
+              <span>Active Kinds</span>
+              <strong>{nodeActiveKinds(machine)}</strong>
+            </div>
+          </div>
+        ))}
+      </div>
+      {!nodeProgress?.nodes?.length ? <div className="empty">No machine progress rows loaded yet.</div> : null}
+    </div>
+  );
+}
+
+function MachineStat({ label, value }: { label: string; value: string }) {
+  return (
+    <div className="machineStat">
+      <span>{label}</span>
+      <strong>{value}</strong>
+    </div>
   );
 }
 
@@ -1434,7 +1686,7 @@ function filterMarkets(markets: Market[], filter: MarketFilter) {
   if (filter === "closing") {
     return sorted
       .filter((market) => market.end_time || market.start_time)
-      .sort((a, b) => new Date(a.end_time || a.start_time || 0).getTime() - new Date(b.end_time || b.start_time || 0).getTime());
+      .sort((a, b) => parseApiDate(a.end_time || a.start_time || 0).getTime() - parseApiDate(b.end_time || b.start_time || 0).getTime());
   }
   return sorted;
 }
@@ -1481,6 +1733,65 @@ function saveTrackedWallets(wallets: TrackedWallet[]) {
   window.localStorage.setItem(TRACKED_WALLETS_STORAGE_KEY, JSON.stringify(wallets));
 }
 
+function loadTrackedWalletSummaries(): Record<string, WalletListSummary> {
+  if (typeof window === "undefined") return {};
+  try {
+    const raw = window.localStorage.getItem(TRACKED_WALLET_SUMMARIES_STORAGE_KEY);
+    const parsed = raw ? JSON.parse(raw) : {};
+    if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) return {};
+    const summaries: Record<string, WalletListSummary> = {};
+    for (const [address, value] of Object.entries(parsed)) {
+      const normalized = normalizeWalletAddress(address);
+      if (!normalized || !value || typeof value !== "object" || Array.isArray(value)) continue;
+      summaries[normalized] = {
+        ...(value as WalletListSummary),
+        user_address: normalized,
+      };
+    }
+    return summaries;
+  } catch {
+    return {};
+  }
+}
+
+function saveTrackedWalletSummaries(summaries: Record<string, WalletListSummary>) {
+  if (typeof window === "undefined") return;
+  window.localStorage.setItem(TRACKED_WALLET_SUMMARIES_STORAGE_KEY, JSON.stringify(summaries));
+}
+
+function normalizeTrackedWallets(wallets: ApiTrackedWallet[]): TrackedWallet[] {
+  return wallets
+    .map((item) => {
+      const address = normalizeWalletAddress(String(item.address || item.user_address || ""));
+      return {
+        address,
+        name: String(item.name || ""),
+        addedAt: String(item.created_at || item.updated_at || new Date().toISOString()),
+      };
+    })
+    .filter((item) => item.address)
+    .map((item) => ({ ...item, name: item.name || shortId(item.address) }));
+}
+
+function mergeTrackedWallets(primary: TrackedWallet[], fallback: TrackedWallet[]) {
+  const byAddress = new Map<string, TrackedWallet>();
+  for (const wallet of [...fallback, ...primary]) {
+    byAddress.set(wallet.address, {
+      ...wallet,
+      name: wallet.name || shortId(wallet.address),
+    });
+  }
+  return Array.from(byAddress.values());
+}
+
+function minutesBetween(older: string | null | undefined, newer: string | null | undefined) {
+  if (!older || !newer) return null;
+  const olderMs = parseApiDate(older).getTime();
+  const newerMs = parseApiDate(newer).getTime();
+  if (!Number.isFinite(olderMs) || !Number.isFinite(newerMs)) return null;
+  return Math.max(0, (newerMs - olderMs) / 60_000);
+}
+
 function normalizeWalletAddress(value: string) {
   const address = value.trim().toLowerCase();
   return /^0x[a-f0-9]{40}$/.test(address) ? address : "";
@@ -1516,6 +1827,102 @@ function formatSeconds(value: unknown) {
   const number = Number(value);
   if (!Number.isFinite(number)) return "--";
   return `${formatNumber(number)}s`;
+}
+
+function aggregateMachineProgress(nodes: NodeProgressRow[]): MachineProgressRow[] {
+  const machines = new Map<string, MachineProgressRow>();
+  for (const node of nodes) {
+    const meta = machineMeta(node.node_id);
+    const current = machines.get(meta.machine_id) || emptyMachineProgress(meta);
+    current.runs += Number(node.runs || 0);
+    current.done += Number(node.done || 0);
+    current.not_done += Number(node.not_done || 0);
+    current.items += Number(node.items || 0);
+    current.pages += Number(node.pages || 0);
+    current.running_tasks += Number(node.running_tasks || 0);
+    current.latest_finished = latestIso(current.latest_finished, node.latest_finished);
+    mergeNodeKinds(current.recent_by_kind, node.recent_by_kind);
+    mergeNodeKinds(current.running_by_kind, node.running_by_kind);
+    machines.set(meta.machine_id, current);
+  }
+  return machineOrder().map((meta) => machines.get(meta.machine_id) || emptyMachineProgress(meta));
+}
+
+function machineMeta(nodeId: string) {
+  if (nodeId.startsWith("wallet-helper-1")) {
+    return { machine_id: "wallet-helper-1", label: "Helper 1", ip: "101.47.179.91", role: "wallet-helper" };
+  }
+  if (nodeId.startsWith("wallet-helper-2")) {
+    return { machine_id: "wallet-helper-2", label: "Helper 2", ip: "101.47.176.154", role: "wallet-helper" };
+  }
+  if (nodeId.startsWith("wallet-helper-3")) {
+    return { machine_id: "wallet-helper-3", label: "Helper 3", ip: "101.47.176.175", role: "wallet-helper" };
+  }
+  return { machine_id: "master", label: "Master", ip: "101.47.178.69", role: "master" };
+}
+
+function machineOrder() {
+  return [
+    { machine_id: "master", label: "Master", ip: "101.47.178.69", role: "master" },
+    { machine_id: "wallet-helper-1", label: "Helper 1", ip: "101.47.179.91", role: "wallet-helper" },
+    { machine_id: "wallet-helper-2", label: "Helper 2", ip: "101.47.176.154", role: "wallet-helper" },
+    { machine_id: "wallet-helper-3", label: "Helper 3", ip: "101.47.176.175", role: "wallet-helper" },
+  ];
+}
+
+function emptyMachineProgress(meta: ReturnType<typeof machineMeta>): MachineProgressRow {
+  return {
+    node_id: meta.machine_id,
+    machine_id: meta.machine_id,
+    label: meta.label,
+    ip: meta.ip,
+    role: meta.role,
+    recent_by_kind: {},
+    running_by_kind: {},
+    runs: 0,
+    done: 0,
+    not_done: 0,
+    items: 0,
+    pages: 0,
+    running_tasks: 0,
+    latest_finished: null,
+  };
+}
+
+function mergeNodeKinds(target: Record<string, NodeProgressKind>, source: Record<string, NodeProgressKind>) {
+  for (const [kind, value] of Object.entries(source || {})) {
+    const current = target[kind] || {};
+    const currentRuns = Number(current.runs || 0);
+    const nextRuns = Number(value.runs || 0);
+    const totalRuns = currentRuns + nextRuns;
+    const weightedAverage = totalRuns
+      ? ((Number(current.avg_seconds || 0) * currentRuns) + (Number(value.avg_seconds || 0) * nextRuns)) / totalRuns
+      : Number(current.avg_seconds || value.avg_seconds || 0);
+    target[kind] = {
+      runs: totalRuns,
+      done: Number(current.done || 0) + Number(value.done || 0),
+      not_done: Number(current.not_done || 0) + Number(value.not_done || 0),
+      items: Number(current.items || 0) + Number(value.items || 0),
+      pages: Number(current.pages || 0) + Number(value.pages || 0),
+      avg_seconds: weightedAverage,
+      latest_finished: latestIso(current.latest_finished, value.latest_finished),
+      running_tasks: Number(current.running_tasks || 0) + Number(value.running_tasks || 0),
+      oldest_claim: earliestIso(current.oldest_claim, value.oldest_claim),
+      newest_claim: latestIso(current.newest_claim, value.newest_claim),
+    };
+  }
+}
+
+function latestIso(left: string | null | undefined, right: string | null | undefined) {
+  if (!left) return right || null;
+  if (!right) return left || null;
+  return parseApiDate(left).getTime() >= parseApiDate(right).getTime() ? left : right;
+}
+
+function earliestIso(left: string | null | undefined, right: string | null | undefined) {
+  if (!left) return right || null;
+  if (!right) return left || null;
+  return parseApiDate(left).getTime() <= parseApiDate(right).getTime() ? left : right;
 }
 
 function nodeAverageSeconds(node: NodeProgressRow) {
@@ -1597,19 +2004,19 @@ function formatCores(value: unknown) {
 
 function formatDate(value: string | null | undefined) {
   if (!value) return "";
-  return new Date(value).toLocaleString();
+  return parseApiDate(value).toLocaleString();
 }
 
 function formatShortDate(value: string | null | undefined) {
   if (!value) return "--";
-  const date = new Date(value);
+  const date = parseApiDate(value);
   if (Number.isNaN(date.getTime())) return "--";
   return date.toLocaleDateString(undefined, { month: "short", day: "numeric" });
 }
 
 function formatRelativeTime(value: string | null | undefined) {
   if (!value) return "--";
-  const time = new Date(value).getTime();
+  const time = parseApiDate(value).getTime();
   if (Number.isNaN(time)) return "--";
   const seconds = Math.max(0, Math.floor((Date.now() - time) / 1000));
   if (seconds < 60) return `${seconds}s ago`;
@@ -1618,6 +2025,17 @@ function formatRelativeTime(value: string | null | undefined) {
   const hours = Math.floor(minutes / 60);
   if (hours < 24) return `${hours}h ago`;
   return `${Math.floor(hours / 24)}d ago`;
+}
+
+function parseApiDate(value: string | number | null | undefined) {
+  if (value === null || value === undefined || value === "") return new Date(NaN);
+  if (typeof value === "number") return new Date(value);
+  const text = String(value).trim();
+  if (!text) return new Date(NaN);
+  if (/^\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}(?:\.\d+)?$/.test(text)) {
+    return new Date(`${text.replace(" ", "T")}Z`);
+  }
+  return new Date(text);
 }
 
 function formatDuration(value: unknown) {

@@ -1,22 +1,32 @@
 from __future__ import annotations
 
+import hashlib
 import json
+import math
 import os
 import shutil
 import time
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, replace
 from datetime import UTC, datetime
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
+from threading import Lock
 from typing import Any
 from urllib.parse import parse_qs, urlparse
 
+from zetta.chain.rpc import PolygonRpcClient
 from zetta.config import Settings
+from zetta.collectors.data import PUSD_ADDRESS, PUSD_DECIMALS, erc20_balance_of_data
+from zetta.loaders.data import activity_rows, wallet_pnl_snapshot_rows, wallet_portfolio_rows
+from zetta.polymarket import PolymarketClient
 from zetta.scheduler.tasks import PostgresTaskStore, Task
 from zetta.storage.clickhouse import ClickHouseWriter
+from zetta.tracked_wallets import TrackedWalletStore, normalize_wallet_address
 from zetta.worldcup_wallets import (
     RANKING_LIST_NAMES,
+    base_match_slug,
     compact_worldcup_wallet_rankings,
     parse_slug_values,
     worldcup_event_slugs_for_scope,
@@ -39,8 +49,21 @@ class ProductApi:
         ] = {}
         self._tasks_progress_cache: dict[tuple[int], tuple[float, dict[str, Any]]] = {}
         self._tasks_nodes_cache: dict[tuple[int], tuple[float, dict[str, Any]]] = {}
+        self._market_search_cache: dict[tuple[str, str, int], tuple[float, list[dict[str, Any]]]] = {}
+        self._live_trades_cache: dict[tuple[Any, ...], tuple[float, dict[str, Any]]] = {}
+        self._unusual_betting_cache: dict[tuple[Any, ...], tuple[float, dict[str, Any]]] = {}
+        self._live_trades_lock = Lock()
 
     def handle(self, path: str, query: dict[str, list[str]]) -> ApiResponse:
+        return self.handle_request("GET", path, query, None)
+
+    def handle_request(
+        self,
+        method: str,
+        path: str,
+        query: dict[str, list[str]],
+        body: dict[str, Any] | None = None,
+    ) -> ApiResponse:
         if path == "/health":
             return ApiResponse(HTTPStatus.OK, {"ok": True})
         if path == "/stats/overview":
@@ -68,6 +91,10 @@ class ProductApi:
             return ApiResponse(HTTPStatus.OK, {"market": market})
         if path == "/markets/trades":
             return ApiResponse(HTTPStatus.OK, {"trades": self.market_trades(query)})
+        if path == "/trades/recent":
+            return ApiResponse(HTTPStatus.OK, {"trades": self.recent_trades(query)})
+        if path == "/trades/live":
+            return ApiResponse(HTTPStatus.OK, self.live_trades(query))
         if path == "/events/timeline":
             return ApiResponse(HTTPStatus.OK, {"events": self.event_timeline(query)})
         if path == "/events/wallet-flow":
@@ -78,6 +105,20 @@ class ProductApi:
             return ApiResponse(HTTPStatus.OK, self.event_smart_wallet_options_response(query))
         if path == "/events/smart-wallets":
             return ApiResponse(HTTPStatus.OK, self.event_smart_wallets(query))
+        if path == "/events/unusual-betting/summary":
+            output = self.event_unusual_betting_summary(query)
+            if output.get("status") == "event_not_found":
+                return ApiResponse(HTTPStatus.NOT_FOUND, output)
+            if output.get("status") == "missing_event":
+                return ApiResponse(HTTPStatus.BAD_REQUEST, output)
+            return ApiResponse(HTTPStatus.OK, output)
+        if path == "/events/unusual-betting":
+            output = self.event_unusual_betting(query)
+            if output.get("status") == "event_not_found":
+                return ApiResponse(HTTPStatus.NOT_FOUND, output)
+            if output.get("status") == "missing_event":
+                return ApiResponse(HTTPStatus.BAD_REQUEST, output)
+            return ApiResponse(HTTPStatus.OK, output)
         if path == "/traders/profile":
             profile = self.trader_profile(query)
             if profile is None:
@@ -97,6 +138,8 @@ class ProductApi:
             if detail is None:
                 return ApiResponse(HTTPStatus.NOT_FOUND, {"error": "wallet_not_found"})
             return ApiResponse(HTTPStatus.OK, detail)
+        if path == "/wallets/tracked":
+            return self.tracked_wallets_response(method, query, body)
         if path == "/wallets/live-positions":
             return ApiResponse(HTTPStatus.OK, {"positions": self.wallet_live_positions(query)})
         if path == "/wallets/smart-money/activity":
@@ -219,6 +262,40 @@ class ProductApi:
         if cache_ttl_seconds > 0:
             self._tasks_nodes_cache[cache_key] = (time.time(), output)
         return output
+
+    def tracked_wallets_response(
+        self,
+        method: str,
+        query: dict[str, list[str]],
+        body: dict[str, Any] | None = None,
+    ) -> ApiResponse:
+        if self.settings is None:
+            return ApiResponse(HTTPStatus.SERVICE_UNAVAILABLE, {"error": "tracked_wallet_store_unavailable"})
+        store = TrackedWalletStore(dsn=self.settings.postgres_dsn)
+        if method == "GET":
+            return ApiResponse(HTTPStatus.OK, {"wallets": store.list_wallets()})
+        if method == "POST":
+            payload = body or {}
+            user_address = normalize_wallet_address(
+                str(payload.get("address") or payload.get("user_address") or param(query, "user"))
+            )
+            if not user_address:
+                return ApiResponse(HTTPStatus.BAD_REQUEST, {"error": "invalid_wallet_address"})
+            wallet = store.upsert_wallet(
+                user_address=user_address,
+                name=str(payload.get("name") or ""),
+            )
+            self.enqueue_wallet_refresh(user_address)
+            return ApiResponse(HTTPStatus.OK, {"wallet": wallet})
+        if method == "DELETE":
+            user_address = normalize_wallet_address(
+                str((body or {}).get("address") or (body or {}).get("user_address") or param(query, "user"))
+            )
+            if not user_address:
+                return ApiResponse(HTTPStatus.BAD_REQUEST, {"error": "invalid_wallet_address"})
+            deleted = store.delete_wallet(user_address=user_address)
+            return ApiResponse(HTTPStatus.OK, {"deleted": deleted})
+        return ApiResponse(HTTPStatus.METHOD_NOT_ALLOWED, {"error": "method_not_allowed"})
 
     def market_overview(self) -> dict[str, Any]:
         sql = """
@@ -379,30 +456,48 @@ class ProductApi:
         return rows_json(self.clickhouse.query_text(sql))
 
     def market_search(self, query: dict[str, list[str]]) -> list[dict[str, Any]]:
-        text = param(query, "q").lower()
+        text = param(query, "q").strip().lower()
         limit = int_param(query, "limit", 25, maximum=100)
+        scope = param(query, "scope").lower()
+        cache_ttl_seconds = bounded_int_param(
+            query,
+            "cache_ttl_seconds",
+            15,
+            minimum=0,
+            maximum=300,
+        )
+        worldcup_scope = scope in ("world_cup", "worldcup", "fifwc")
+        if worldcup_scope and text in ("world cup", "worldcup", "fifa world cup"):
+            text = ""
+        cache_key = (scope, text, limit)
+        cached = self._market_search_cache.get(cache_key)
+        if (
+            cache_ttl_seconds > 0
+            and cached is not None
+            and time.time() - cached[0] <= cache_ttl_seconds
+        ):
+            return cached[1]
         where = "where 1 = 1"
+        if worldcup_scope:
+            where += (
+                " and (startsWith(events.slug, 'fifwc-')"
+                " or startsWith(markets.slug, 'fifwc-')"
+                " or positionCaseInsensitive(events.title, 'World Cup') > 0"
+                " or positionCaseInsensitive(markets.question, 'World Cup') > 0)"
+            )
         if text:
             escaped = ch_string(text)
             where += (
-                " and (positionCaseInsensitive(question, "
-                f"{escaped}) > 0 or positionCaseInsensitive(slug, {escaped}) > 0"
-                f" or positionCaseInsensitive(condition_id, {escaped}) > 0"
-                f" or positionCaseInsensitive(category, {escaped}) > 0)"
+                " and (positionCaseInsensitive(markets.question, "
+                f"{escaped}) > 0 or positionCaseInsensitive(markets.slug, {escaped}) > 0"
+                f" or positionCaseInsensitive(markets.condition_id, {escaped}) > 0"
+                f" or positionCaseInsensitive(if(events.category = '', 'Uncategorized', events.category), {escaped}) > 0"
+                f" or positionCaseInsensitive(events.title, {escaped}) > 0"
+                f" or positionCaseInsensitive(events.slug, {escaped}) > 0)"
             )
         sql = f"""
-            select
-              market_id,
-              event_id,
-              condition_id,
-              question,
-              slug,
-              category,
-              active,
-              closed,
-              volume,
-              liquidity
-            from
+            with
+            selected_markets as
             (
               select
                 markets.market_id as market_id,
@@ -410,29 +505,206 @@ class ProductApi:
                 markets.condition_id as condition_id,
                 markets.question as question,
                 markets.slug as slug,
+                events.slug as event_slug,
+                events.title as event_title,
                 if(events.category = '', 'Uncategorized', events.category) as category,
                 markets.active as active,
                 markets.closed as closed,
                 markets.volume as volume,
-                markets.liquidity as liquidity
+                markets.liquidity as liquidity,
+                markets.start_time as start_time,
+                markets.end_time as end_time,
+                markets.updated_at as updated_at
               from dim_market as markets final
               left join dim_event as events final on markets.event_id = events.event_id
+              {where}
+            ),
+            market_tokens as
+            (
+              select market_id, token_id, outcome, outcome_index
+              from dim_outcome_token final
+              where market_id in (select market_id from selected_markets)
+                and token_id != ''
+            ),
+            primary_tokens as
+            (
+              select
+                market_id,
+                argMin(token_id, outcome_index) as primary_token_id,
+                argMin(outcome, outcome_index) as primary_outcome
+              from market_tokens
+              group by market_id
+            ),
+            price_stats as
+            (
+              select
+                token_id,
+                argMax(price, timestamp) as last_price,
+                argMinIf(
+                  price,
+                  abs(dateDiff('second', timestamp, now64(3) - interval 24 hour)),
+                  timestamp <= now64(3) - interval 23 hour
+                ) as price_24h_ago,
+                countIf(timestamp <= now64(3) - interval 23 hour) as price_24h_count
+              from fact_price_history
+              where token_id in (select primary_token_id from primary_tokens)
+              group by token_id
+            ),
+            book_stats as
+            (
+              select
+                token_id,
+                argMax(best_bid, captured_at) as book_best_bid,
+                argMax(best_ask, captured_at) as book_best_ask
+              from fact_orderbook_snapshot
+              where token_id in (select primary_token_id from primary_tokens)
+                and best_bid is not null
+                and best_ask is not null
+              group by token_id
+            ),
+            trade_stats as
+            (
+              select
+                market_id,
+                max(timestamp) as latest_trade_at,
+                count() as trade_count_24h,
+                sum(notional) as volume_24h
+              from
+              (
+                select
+                  raw_trade_key,
+                  argMax(raw_market_id, raw_ingested_at) as market_id,
+                  argMax(raw_timestamp, raw_ingested_at) as timestamp,
+                  argMax(raw_notional, raw_ingested_at) as notional
+                from
+                (
+                  select
+                    if(
+                      trades.trade_id != '',
+                      concat(
+                        trades.trade_id, '|', lower(trades.user_address), '|',
+                        trades.token_id, '|', trades.side
+                      ),
+                      concat(
+                        trades.transaction_hash, '|', toString(trades.log_index), '|',
+                        lower(trades.user_address), '|', trades.token_id, '|', trades.side
+                      )
+                    ) as raw_trade_key,
+                    market_tokens.market_id as raw_market_id,
+                    trades.timestamp as raw_timestamp,
+                    trades.notional as raw_notional,
+                    trades.ingested_at as raw_ingested_at
+                  from fact_trade_by_time as trades
+                  inner join market_tokens on trades.token_id = market_tokens.token_id
+                  where trades.timestamp >= now64(3) - interval 24 hour
+                )
+                group by raw_trade_key
+              )
+              group by market_id
+            )
+            select
+              market_id,
+              event_id,
+              condition_id,
+              question,
+              slug,
+              event_slug,
+              event_title,
+              category,
+              active,
+              closed,
+              volume,
+              liquidity,
+              start_time,
+              end_time,
+              updated_at,
+              primary_token_id,
+              primary_outcome,
+              last_price,
+              if(
+                last_price is null or price_24h_ago is null,
+                cast(null, 'Nullable(Float64)'),
+                last_price - price_24h_ago
+              ) as price_change_24h,
+              if(
+                last_price is null or price_24h_ago is null or price_24h_ago = 0,
+                cast(null, 'Nullable(Float64)'),
+                (last_price - price_24h_ago) / price_24h_ago
+              ) as price_change_pct_24h,
+              volume_24h,
+              trade_count_24h,
+              latest_trade_at,
+              best_bid,
+              best_ask,
+              spread
+            from
+            (
+              select
+                selected_markets.market_id as market_id,
+                selected_markets.event_id as event_id,
+                selected_markets.condition_id as condition_id,
+                selected_markets.question as question,
+                selected_markets.slug as slug,
+                selected_markets.event_slug as event_slug,
+                selected_markets.event_title as event_title,
+                selected_markets.category as category,
+                selected_markets.active as active,
+                selected_markets.closed as closed,
+                selected_markets.volume as volume,
+                selected_markets.liquidity as liquidity,
+                selected_markets.start_time as start_time,
+                selected_markets.end_time as end_time,
+                selected_markets.updated_at as updated_at,
+                primary_tokens.primary_token_id as primary_token_id,
+                primary_tokens.primary_outcome as primary_outcome,
+                multiIf(
+                  book_stats.book_best_bid is not null and book_stats.book_best_ask is not null,
+                    cast((book_stats.book_best_bid + book_stats.book_best_ask) / 2, 'Nullable(Float64)'),
+                  price_stats.last_price is not null,
+                    cast(price_stats.last_price, 'Nullable(Float64)'),
+                  cast(null, 'Nullable(Float64)')
+                ) as last_price,
+                if(
+                  price_stats.price_24h_count > 0,
+                  cast(price_stats.price_24h_ago, 'Nullable(Float64)'),
+                  cast(null, 'Nullable(Float64)')
+                ) as price_24h_ago,
+                ifNull(trade_stats.volume_24h, 0.0) as volume_24h,
+                ifNull(trade_stats.trade_count_24h, 0) as trade_count_24h,
+                trade_stats.latest_trade_at as latest_trade_at,
+                book_stats.book_best_bid as best_bid,
+                book_stats.book_best_ask as best_ask,
+                if(
+                  book_stats.book_best_bid is null or book_stats.book_best_ask is null,
+                  cast(null, 'Nullable(Float64)'),
+                  book_stats.book_best_ask - book_stats.book_best_bid
+                ) as spread
+              from selected_markets
+              left join primary_tokens on selected_markets.market_id = primary_tokens.market_id
+              left join price_stats on primary_tokens.primary_token_id = price_stats.token_id
+              left join book_stats on primary_tokens.primary_token_id = book_stats.token_id
+              left join trade_stats on selected_markets.market_id = trade_stats.market_id
             ) as base
-            {where}
-            order by volume desc, liquidity desc
+            order by volume_24h desc, volume desc, liquidity desc
             limit {limit}
             format JSONEachRow
         """
-        return rows_json(self.clickhouse.query_text(sql))
+        rows = rows_json(self.clickhouse.query_text(sql))
+        if cache_ttl_seconds > 0:
+            self._market_search_cache[cache_key] = (time.time(), rows)
+        return rows
 
     def market_detail(self, query: dict[str, list[str]]) -> dict[str, Any] | None:
         market_id = param(query, "market_id")
         condition_id = param(query, "condition_id")
         where = "where 1 = 1"
+        search_query: dict[str, list[str]]
         if market_id:
             where += f" and markets.market_id = {ch_string(market_id)}"
+            search_query = {"market_id": [market_id], "limit": ["1"]}
         elif condition_id:
             where += f" and markets.condition_id = {ch_string(condition_id)}"
+            search_query = {"condition_id": [condition_id], "limit": ["1"]}
         else:
             return None
         sql = f"""
@@ -464,8 +736,160 @@ class ProductApi:
         if not rows:
             return None
         market = rows[0]
+        market.update(self.market_enrichment(search_query))
         market["tokens"] = self.market_tokens(str(market.get("market_id", "")))
         return market
+
+    def market_enrichment(self, query: dict[str, list[str]]) -> dict[str, Any]:
+        market_id = param(query, "market_id")
+        condition_id = param(query, "condition_id")
+        where = "where 1 = 1"
+        if market_id:
+            where += f" and market_id = {ch_string(market_id)}"
+        elif condition_id:
+            where += f" and condition_id = {ch_string(condition_id)}"
+        else:
+            return {}
+        sql = f"""
+            with
+            selected_markets as
+            (
+              select
+                market_id,
+                condition_id
+              from dim_market final
+              {where}
+              limit 1
+            ),
+            market_tokens as
+            (
+              select market_id, token_id, outcome, outcome_index
+              from dim_outcome_token final
+              where market_id in (select market_id from selected_markets)
+                and token_id != ''
+            ),
+            primary_tokens as
+            (
+              select
+                market_id,
+                argMin(token_id, outcome_index) as primary_token_id,
+                argMin(outcome, outcome_index) as primary_outcome
+              from market_tokens
+              group by market_id
+            ),
+            price_stats as
+            (
+              select
+                token_id,
+                argMax(price, timestamp) as last_trade_price,
+                argMinIf(
+                  price,
+                  abs(dateDiff('second', timestamp, now64(3) - interval 24 hour)),
+                  timestamp <= now64(3) - interval 23 hour
+                ) as price_24h_ago,
+                countIf(timestamp <= now64(3) - interval 23 hour) as price_24h_count
+              from fact_price_history
+              where token_id in (select primary_token_id from primary_tokens)
+              group by token_id
+            ),
+            book_stats as
+            (
+              select
+                token_id,
+                argMax(best_bid, captured_at) as book_best_bid,
+                argMax(best_ask, captured_at) as book_best_ask
+              from fact_orderbook_snapshot
+              where token_id in (select primary_token_id from primary_tokens)
+                and best_bid is not null
+                and best_ask is not null
+              group by token_id
+            ),
+            trade_stats as
+            (
+              select
+                market_id,
+                max(timestamp) as latest_trade_at,
+                count() as trade_count_24h,
+                sum(notional) as volume_24h
+              from
+              (
+                select
+                  raw_trade_key,
+                  argMax(raw_market_id, raw_ingested_at) as market_id,
+                  argMax(raw_timestamp, raw_ingested_at) as timestamp,
+                  argMax(raw_notional, raw_ingested_at) as notional
+                from
+                (
+                  select
+                    if(
+                      trades.trade_id != '',
+                      concat(
+                        trades.trade_id, '|', lower(trades.user_address), '|',
+                        trades.token_id, '|', trades.side
+                      ),
+                      concat(
+                        trades.transaction_hash, '|', toString(trades.log_index), '|',
+                        lower(trades.user_address), '|', trades.token_id, '|', trades.side
+                      )
+                    ) as raw_trade_key,
+                    market_tokens.market_id as raw_market_id,
+                    trades.timestamp as raw_timestamp,
+                    trades.notional as raw_notional,
+                    trades.ingested_at as raw_ingested_at
+                  from fact_trade_by_time as trades
+                  inner join market_tokens on trades.token_id = market_tokens.token_id
+                  where trades.timestamp >= now64(3) - interval 24 hour
+                )
+                group by raw_trade_key
+              )
+              group by market_id
+            )
+            select
+              selected_markets.market_id as market_id,
+              primary_tokens.primary_token_id as primary_token_id,
+              primary_tokens.primary_outcome as primary_outcome,
+              multiIf(
+                book_stats.book_best_bid is not null and book_stats.book_best_ask is not null,
+                  cast((book_stats.book_best_bid + book_stats.book_best_ask) / 2, 'Nullable(Float64)'),
+                price_stats.last_trade_price is not null,
+                  cast(price_stats.last_trade_price, 'Nullable(Float64)'),
+                cast(null, 'Nullable(Float64)')
+              ) as last_price,
+              if(
+                price_stats.price_24h_count > 0,
+                cast(price_stats.price_24h_ago, 'Nullable(Float64)'),
+                cast(null, 'Nullable(Float64)')
+              ) as price_24h_ago,
+              if(
+                last_price is null or price_24h_ago is null,
+                cast(null, 'Nullable(Float64)'),
+                last_price - price_24h_ago
+              ) as price_change_24h,
+              if(
+                last_price is null or price_24h_ago is null or price_24h_ago = 0,
+                cast(null, 'Nullable(Float64)'),
+                (last_price - price_24h_ago) / price_24h_ago
+              ) as price_change_pct_24h,
+              ifNull(trade_stats.volume_24h, 0.0) as volume_24h,
+              ifNull(trade_stats.trade_count_24h, 0) as trade_count_24h,
+              trade_stats.latest_trade_at as latest_trade_at,
+              book_stats.book_best_bid as best_bid,
+              book_stats.book_best_ask as best_ask,
+              if(
+                book_stats.book_best_bid is null or book_stats.book_best_ask is null,
+                cast(null, 'Nullable(Float64)'),
+                book_stats.book_best_ask - book_stats.book_best_bid
+              ) as spread
+            from selected_markets
+            left join primary_tokens on selected_markets.market_id = primary_tokens.market_id
+            left join price_stats on primary_tokens.primary_token_id = price_stats.token_id
+            left join book_stats on primary_tokens.primary_token_id = book_stats.token_id
+            left join trade_stats on selected_markets.market_id = trade_stats.market_id
+            limit 1
+            format JSONEachRow
+        """
+        rows = rows_json(self.clickhouse.query_text(sql))
+        return rows[0] if rows else {}
 
     def market_tokens(self, market_id: str) -> list[dict[str, Any]]:
         if not market_id:
@@ -519,6 +943,332 @@ class ProductApi:
             format JSONEachRow
         """
         return rows_json(self.clickhouse.query_text(sql))
+
+    def recent_trades(self, query: dict[str, list[str]]) -> list[dict[str, Any]]:
+        limit = int_param(query, "limit", 100, maximum=500)
+        candidate_limit = min(max(limit * 50, 1000), 10000)
+        side = param(query, "side").upper()
+        category = param(query, "category")
+        wallet_type = param(query, "wallet_type").lower()
+        search = param(query, "q")
+        min_notional = float_param(query, "min_notional", 0.0, minimum=0.0)
+        max_notional = float_param(query, "max_notional", 0.0, minimum=0.0)
+
+        trade_where = [
+            "trades.timestamp >= now64(3) - interval 7 day",
+            "trades.user_address != ''",
+        ]
+        if side in ("BUY", "SELL"):
+            trade_where.append(f"trades.side = {ch_string(side)}")
+        if min_notional > 0:
+            trade_where.append(f"trades.notional >= {min_notional}")
+        if max_notional > 0:
+            trade_where.append(f"trades.notional <= {max_notional}")
+
+        outer_where = ["1 = 1"]
+        if wallet_type == "smart":
+            outer_where.append("ifNull(screener.is_smart, false)")
+        elif wallet_type == "whale":
+            outer_where.append("ifNull(screener.is_whale, false)")
+        elif wallet_type == "new":
+            outer_where.append(
+                "screener.first_trade_at is not null "
+                "and screener.first_trade_at >= now64(3) - interval 7 day"
+            )
+        if search:
+            quoted = ch_string(search)
+            outer_where.append(
+                "("
+                f"positionCaseInsensitive(markets.question, {quoted}) > 0 "
+                f"or positionCaseInsensitive(events.title, {quoted}) > 0 "
+                f"or positionCaseInsensitive(user_address, {quoted}) > 0"
+                ")"
+            )
+
+        sql = f"""
+            with recent_candidates as
+            (
+              select
+                raw_trade_key,
+                argMax(raw_trade_id, raw_ingested_at) as trade_id,
+                argMax(raw_transaction_hash, raw_ingested_at) as transaction_hash,
+                argMax(raw_timestamp, raw_ingested_at) as timestamp,
+                argMax(raw_market_id, raw_ingested_at) as market_id,
+                argMax(raw_condition_id, raw_ingested_at) as condition_id,
+                argMax(raw_token_id, raw_ingested_at) as token_id,
+                argMax(raw_user_address, raw_ingested_at) as user_address,
+                argMax(raw_side, raw_ingested_at) as side,
+                argMax(raw_price, raw_ingested_at) as price,
+                argMax(raw_size, raw_ingested_at) as size,
+                argMax(raw_notional, raw_ingested_at) as notional,
+                argMax(raw_source, raw_ingested_at) as source,
+                argMax(raw_raw_json, raw_ingested_at) as raw_json,
+                max(raw_ingested_at) as ingested_at
+              from
+              (
+                select
+                  if(
+                    trades.trade_id != '',
+                    concat(
+                      trades.trade_id, '|', lower(trades.user_address), '|',
+                      trades.token_id, '|', trades.side
+                    ),
+                    concat(
+                      trades.transaction_hash, '|', toString(trades.log_index), '|',
+                      lower(trades.user_address), '|', trades.token_id, '|', trades.side
+                    )
+                  ) as raw_trade_key,
+                  trades.trade_id as raw_trade_id,
+                  trades.transaction_hash as raw_transaction_hash,
+                  trades.timestamp as raw_timestamp,
+                  trades.market_id as raw_market_id,
+                  trades.condition_id as raw_condition_id,
+                  trades.token_id as raw_token_id,
+                  lower(trades.user_address) as raw_user_address,
+                  trades.side as raw_side,
+                  trades.price as raw_price,
+                  trades.size as raw_size,
+                  trades.notional as raw_notional,
+                  trades.source as raw_source,
+                  trades.raw_json as raw_raw_json,
+                  trades.ingested_at as raw_ingested_at
+                from fact_trade_by_time as trades
+                where {" and ".join(trade_where)}
+                order by trades.timestamp desc
+                limit {candidate_limit}
+              )
+              group by raw_trade_key
+            )
+            select
+              recent_candidates.trade_id as trade_id,
+              recent_candidates.transaction_hash as transaction_hash,
+              recent_candidates.timestamp as timestamp,
+              recent_candidates.market_id as market_id,
+              recent_candidates.condition_id as condition_id,
+              recent_candidates.token_id as token_id,
+              recent_candidates.user_address as user_address,
+              recent_candidates.side as side,
+              recent_candidates.price as price,
+              recent_candidates.size as size,
+              recent_candidates.notional as notional,
+              recent_candidates.source as source,
+              recent_candidates.ingested_at as ingested_at,
+              if(markets.question != '', markets.question, JSONExtractString(recent_candidates.raw_json, 'title'))
+                as question,
+              if(markets.slug != '', markets.slug, JSONExtractString(recent_candidates.raw_json, 'slug'))
+                as market_slug,
+              markets.event_id as event_id,
+              events.title as event_title,
+              if(events.slug != '', events.slug, JSONExtractString(recent_candidates.raw_json, 'eventSlug'))
+                as event_slug,
+              events.category as category,
+              if(tokens.outcome != '', tokens.outcome, JSONExtractString(recent_candidates.raw_json, 'outcome'))
+                as outcome,
+              JSONExtractString(recent_candidates.raw_json, 'name') as trader_name,
+              JSONExtractString(recent_candidates.raw_json, 'pseudonym') as trader_pseudonym,
+              ifNull(screener.is_smart, false) as is_smart,
+              ifNull(screener.is_whale, false) as is_whale,
+              ifNull(screener.total_pnl, 0.0) as wallet_total_pnl,
+              ifNull(screener.pnl_roi, 0.0) as wallet_pnl_roi,
+              ifNull(screener.traded_notional, 0.0) as wallet_traded_notional
+            from recent_candidates
+            left join dim_market as markets final on recent_candidates.condition_id = markets.condition_id
+            left join dim_event as events final on markets.event_id = events.event_id
+            left join dim_outcome_token as tokens final on recent_candidates.token_id = tokens.token_id
+            left join mart_wallet_screener as screener final on recent_candidates.user_address = screener.user_address
+            where {" and ".join(outer_where)}
+            order by recent_candidates.timestamp desc
+            limit {limit}
+            format JSONEachRow
+        """
+        return rows_json(self.clickhouse.query_text(sql))
+
+    def live_trades(self, query: dict[str, list[str]]) -> dict[str, Any]:
+        if self.settings is None:
+            return {"source": "live", "status": "settings_unavailable", "trades": []}
+        limit = int_param(query, "limit", 100, maximum=500)
+        page_count = bounded_int_param(query, "pages", 6, minimum=1, maximum=10)
+        page_size = bounded_int_param(query, "page_size", 100, minimum=100, maximum=500)
+        ttl_seconds = float_param(query, "ttl", 2.0, minimum=0.5, maximum=15.0)
+        side = param(query, "side").upper()
+        search = param(query, "q").strip().lower()
+        category = param(query, "category")
+        min_notional = float_param(query, "min_notional", 0.0, minimum=0.0)
+        max_notional = float_param(query, "max_notional", 0.0, minimum=0.0)
+        cache_key = (
+            page_count,
+            page_size,
+            side if side in ("BUY", "SELL") else "all",
+            search,
+            category.lower(),
+            min_notional,
+            max_notional,
+        )
+        now = time.monotonic()
+        cached = self._live_trades_cache.get(cache_key)
+        if cached is not None and now - cached[0] <= ttl_seconds:
+            return limit_live_trades_response(cached[1], limit)
+
+        with self._live_trades_lock:
+            now = time.monotonic()
+            cached = self._live_trades_cache.get(cache_key)
+            if cached is not None and now - cached[0] <= ttl_seconds:
+                return limit_live_trades_response(cached[1], limit)
+            captured_at = datetime.now(UTC)
+            chain_body = self.chain_live_trades_body(query, captured_at)
+            if chain_body is not None:
+                self._live_trades_cache[cache_key] = (time.monotonic(), chain_body)
+                return limit_live_trades_response(chain_body, limit)
+            pages: list[str] = []
+            items: list[dict[str, Any]] = []
+            try:
+                client = PolymarketClient(self.settings)
+                for page_index in range(page_count):
+                    page = client.data_trades(limit=page_size, offset=page_index * page_size)
+                    pages.append(page.response.url)
+                    items.extend(page.items)
+                    if len(page.items) < page_size:
+                        break
+            except Exception as exc:
+                fallback = self._live_trades_cache.get(cache_key)
+                fallback_body = fallback[1] if fallback is not None else None
+                if fallback is not None:
+                    body = limit_live_trades_response(fallback_body, limit)
+                    body["status"] = "stale"
+                    body["error"] = str(exc)
+                    return body
+                return {
+                    "source": "live",
+                    "status": "error",
+                    "captured_at": api_datetime(captured_at),
+                    "trades": [],
+                    "error": str(exc),
+                }
+            trades = filter_live_trade_rows(compact_live_trade_rows(items, captured_at), query)
+            body = {
+                "source": "live",
+                "status": "ok",
+                "captured_at": api_datetime(captured_at),
+                "request_url": pages[0] if pages else "",
+                "request_urls": pages,
+                "candidate_count": len(items),
+                "latency_seconds": live_trades_latency_seconds(trades, captured_at),
+                "trades": trades,
+            }
+            self._live_trades_cache[cache_key] = (time.monotonic(), body)
+            return limit_live_trades_response(body, limit)
+
+    def chain_live_trades_body(
+        self,
+        query: dict[str, list[str]],
+        captured_at: datetime,
+    ) -> dict[str, Any] | None:
+        lookback_minutes = bounded_int_param(
+            query, "chain_lookback_minutes", 30, minimum=1, maximum=180
+        )
+        candidate_limit = min(int_param(query, "limit", 100, maximum=500) * 20, 5000)
+        side = param(query, "side").upper()
+        search = param(query, "q").strip()
+        category = param(query, "category")
+        min_notional = float_param(query, "min_notional", 0.0, minimum=0.0)
+        max_notional = float_param(query, "max_notional", 0.0, minimum=0.0)
+        where = [
+            f"fills.ingested_at >= now64(3) - interval {lookback_minutes} minute",
+            "fills.token_id != ''",
+            "trader_address not in ("
+            "'0xe111180000d2663c0091e4f400237545b87b996b',"
+            "'0xe2222d279d744050d28e00520010520000310f59',"
+            "'0x0000000000000000000000000000000000000000'"
+            ")",
+        ]
+        if side in ("BUY", "SELL"):
+            where.append("trader_side = " + ch_string(side))
+        if min_notional > 0:
+            where.append(f"fills.notional >= {min_notional}")
+        if max_notional > 0:
+            where.append(f"fills.notional <= {max_notional}")
+        if search:
+            quoted = ch_string(search)
+            where.append(
+                "("
+                f"positionCaseInsensitive(trader_address, {quoted}) > 0 "
+                f"or positionCaseInsensitive(markets.question, {quoted}) > 0 "
+                f"or positionCaseInsensitive(events.title, {quoted}) > 0 "
+                f"or positionCaseInsensitive(tokens.outcome, {quoted}) > 0"
+                ")"
+            )
+        sql = f"""
+            select
+              concat(
+                fills.transaction_hash, '-', toString(fills.log_index), '-',
+                role, '-', fills.token_id
+              ) as trade_id,
+              fills.transaction_hash as transaction_hash,
+              fills.log_index as log_index,
+              fills.ingested_at as timestamp,
+              ifNull(tokens.market_id, '') as market_id,
+              if(tokens.condition_id != '', tokens.condition_id, ifNull(markets.condition_id, ''))
+                as condition_id,
+              fills.token_id as token_id,
+              trader_address as user_address,
+              trader_side as side,
+              fills.price as price,
+              fills.size as size,
+              fills.notional as notional,
+              'chain-live' as source,
+              fills.ingested_at as ingested_at,
+              if(markets.question != '', markets.question, concat('Token ', left(fills.token_id, 8)))
+                as question,
+              ifNull(markets.slug, '') as market_slug,
+              ifNull(markets.event_id, '') as event_id,
+              ifNull(events.title, '') as event_title,
+              ifNull(events.slug, '') as event_slug,
+              ifNull(events.category, '') as category,
+              ifNull(tokens.outcome, '') as outcome,
+              '' as trader_name,
+              '' as trader_pseudonym,
+              ifNull(screener.is_smart, false) as is_smart,
+              ifNull(screener.is_whale, false) as is_whale,
+              ifNull(screener.total_pnl, 0.0) as wallet_total_pnl,
+              ifNull(screener.pnl_roi, 0.0) as wallet_pnl_roi,
+              ifNull(screener.traded_notional, 0.0) as wallet_traded_notional
+            from fact_exchange_fill as fills final
+            array join
+              ['maker', 'taker'] as role,
+              [fills.maker, fills.taker] as trader_address,
+              [fills.side, if(fills.side = 'BUY', 'SELL', 'BUY')] as trader_side
+            left join dim_outcome_token as tokens final on fills.token_id = tokens.token_id
+            left join dim_market as markets final on tokens.market_id = markets.market_id
+            left join dim_event as events final on markets.event_id = events.event_id
+            left join mart_wallet_screener as screener final on trader_address = screener.user_address
+            where {" and ".join(where)}
+            order by fills.ingested_at desc, fills.block_number desc, fills.transaction_hash desc, fills.log_index desc
+            limit {candidate_limit}
+            format JSONEachRow
+        """
+        try:
+            rows = rows_json(self.clickhouse.query_text(sql))
+        except Exception:
+            return None
+        if not rows:
+            return None
+        rows = filter_live_trade_rows([json_ready_row(row) for row in rows], query)
+        if not rows:
+            return None
+        metadata_missing_count = sum(
+            1 for row in rows if str(row.get("question") or "").startswith("Token ")
+        )
+        return {
+            "source": "chain-live",
+            "status": "ok",
+            "captured_at": api_datetime(captured_at),
+            "request_url": "clickhouse:fact_exchange_fill",
+            "request_urls": ["clickhouse:fact_exchange_fill"],
+            "candidate_count": len(rows),
+            "metadata_missing_count": metadata_missing_count,
+            "latency_seconds": live_trades_latency_seconds(rows, captured_at),
+            "trades": rows,
+        }
 
     def event_timeline(self, query: dict[str, list[str]]) -> list[dict[str, Any]]:
         event_id = param(query, "event_id")
@@ -922,6 +1672,367 @@ class ProductApi:
             event,
             self.event_smart_wallet_options(event_id),
         )
+
+    def event_unusual_betting(self, query: dict[str, list[str]]) -> dict[str, Any]:
+        event_ref = (
+            param(query, "event")
+            or param(query, "slug")
+            or param(query, "event_slug")
+            or param(query, "event_id")
+            or param(query, "q")
+        ).strip()
+        if not event_ref:
+            return {"status": "missing_event", "error": "missing_event"}
+        event = self.event_lookup(event_ref)
+        if event is None:
+            return {"status": "event_not_found", "event_ref": event_ref}
+        event_id = str(event.get("event_id") or "")
+        if not event_id:
+            return {"status": "event_not_found", "event_ref": event_ref}
+        include_related_markets = bool_param(query, "include_related_markets", True)
+        event_scope = self.event_unusual_betting_scope(event, include_related_markets)
+        event_ids = [
+            str(row.get("event_id") or "")
+            for row in event_scope
+            if str(row.get("event_id") or "")
+        ]
+        if not event_ids:
+            event_ids = [event_id]
+
+        cold_price_threshold = float_param(
+            query,
+            "cold_price_threshold",
+            0.25,
+            minimum=0.01,
+            maximum=0.5,
+        )
+        large_threshold = float_param(query, "large_threshold", 500_000.0, minimum=0.0)
+        very_large_threshold = float_param(query, "very_large_threshold", 1_000_000.0, minimum=0.0)
+        extreme_threshold = float_param(query, "extreme_threshold", 5_000_000.0, minimum=0.0)
+        wallet_limit = int_param(query, "wallet_limit", 30, maximum=100)
+        trade_limit = int_param(query, "trade_limit", 30, maximum=100)
+        cache_ttl_seconds = bounded_int_param(
+            query,
+            "cache_ttl_seconds",
+            60,
+            minimum=0,
+            maximum=900,
+        )
+        cache_key = (
+            tuple(event_ids),
+            cold_price_threshold,
+            large_threshold,
+            very_large_threshold,
+            extreme_threshold,
+            wallet_limit,
+            trade_limit,
+            include_related_markets,
+        )
+        cached = self._unusual_betting_cache.get(cache_key)
+        if (
+            cache_ttl_seconds > 0
+            and cached is not None
+            and time.time() - cached[0] <= cache_ttl_seconds
+        ):
+            return cached[1]
+        excluded_addresses = unusual_betting_excluded_addresses()
+        excluded_sql = "(" + ",".join(ch_string(address) for address in excluded_addresses) + ")"
+        event_ids_sql = "(" + ",".join(ch_string(scope_event_id) for scope_event_id in event_ids) + ")"
+        scope_event_slugs = [
+            str(row.get("slug") or "")
+            for row in event_scope
+            if str(row.get("slug") or "")
+        ]
+
+        markets = rows_json(
+            self.clickhouse.query_text(
+                f"""
+                    select
+                      market_id,
+                      condition_id,
+                      question,
+                      slug,
+                      active,
+                      closed,
+                      accepting_orders,
+                      volume,
+                      liquidity,
+                      start_time,
+                      end_time
+                    from dim_market final
+                    where event_id in {event_ids_sql}
+                    order by volume desc
+                    format JSONEachRow
+                """
+            )
+        )
+        tokens = rows_json(
+            self.clickhouse.query_text(
+                f"""
+                    select
+                      tokens.market_id,
+                      markets.question,
+                      markets.slug as market_slug,
+                      tokens.token_id,
+                      tokens.outcome,
+                      tokens.outcome_index
+                    from dim_outcome_token as tokens final
+                    inner join dim_market as markets final on tokens.market_id = markets.market_id
+                    where markets.event_id in {event_ids_sql}
+                    order by markets.volume desc, tokens.outcome_index
+                    format JSONEachRow
+                """
+            )
+        )
+        fill_summary = rows_json(
+            self.clickhouse.query_text(
+                f"""
+                    select
+                      count() as fill_rows,
+                      round(sum(toFloat64(notional)), 2) as total_fill_notional,
+                      round(max(toFloat64(notional)), 2) as max_fill_notional,
+                      min(ingested_at) as first_ts,
+                      max(ingested_at) as last_ts
+                    from fact_exchange_fill final
+                    where token_id in (
+                      select token_id
+                      from dim_outcome_token final
+                      where market_id in (
+                        select market_id
+                        from dim_market final
+                        where event_id in {event_ids_sql}
+                      )
+                    )
+                    format JSONEachRow
+                """
+            )
+        )
+        outcome_summary = rows_json(
+            self.clickhouse.query_text(
+                f"""
+                    select
+                      markets.slug as market_slug,
+                      markets.question as question,
+                      tokens.outcome as outcome,
+                      user_side,
+                      count() as user_fill_rows,
+                      uniqExact(user_address) as wallet_count,
+                      round(sum(toFloat64(fills.notional)), 2) as total_notional,
+                      round(max(toFloat64(fills.notional)), 2) as max_notional,
+                      round(avg(toFloat64(fills.price)), 4) as avg_price,
+                      round(min(toFloat64(fills.price)), 4) as min_price,
+                      round(max(toFloat64(fills.price)), 4) as max_price,
+                      countIf(toFloat64(fills.notional) >= {large_threshold} and user_address not in {excluded_sql}) as large_trade_count,
+                      countIf(toFloat64(fills.notional) >= {very_large_threshold} and user_address not in {excluded_sql}) as very_large_trade_count,
+                      countIf(toFloat64(fills.notional) >= {extreme_threshold} and user_address not in {excluded_sql}) as extreme_trade_count,
+                      round(maxIf(toFloat64(fills.notional), user_address not in {excluded_sql}), 2) as max_user_notional
+                    from fact_exchange_fill as fills final
+                    array join
+                      ['maker', 'taker'] as role,
+                      [fills.maker, fills.taker] as user_address,
+                      [fills.side, if(fills.side = 'BUY', 'SELL', 'BUY')] as user_side
+                    inner join dim_outcome_token as tokens final on fills.token_id = tokens.token_id
+                    inner join dim_market as markets final on tokens.market_id = markets.market_id
+                    where markets.event_id in {event_ids_sql}
+                    group by market_slug, question, outcome, user_side
+                    order by total_notional desc
+                    format JSONEachRow
+                """
+            )
+        )
+        signal_filters = unusual_betting_signal_filters(
+            outcome_summary,
+            cold_price_threshold,
+            large_threshold,
+        )
+        signal_condition_sql = unusual_betting_signal_condition_sql(signal_filters)
+        if signal_condition_sql:
+            signal_wallet_summary = rows_json(
+                self.clickhouse.query_text(
+                    f"""
+                        select
+                          count() as signal_wallet_count,
+                          countIf(total_notional >= {large_threshold}) as abnormal_wallet_count,
+                          round(maxIf(total_notional, total_notional >= {large_threshold}), 2) as max_abnormal_wallet_notional,
+                          round(max(total_notional), 2) as max_watch_wallet_notional,
+                          round(max(max_notional), 2) as max_watch_trade_notional
+                        from
+                        (
+                          select
+                            user_address,
+                            sum(toFloat64(fills.notional)) as total_notional,
+                            max(toFloat64(fills.notional)) as max_notional
+                          from fact_exchange_fill as fills final
+                          array join
+                            ['maker', 'taker'] as role,
+                            [fills.maker, fills.taker] as user_address,
+                            [fills.side, if(fills.side = 'BUY', 'SELL', 'BUY')] as user_side
+                          inner join dim_outcome_token as tokens final on fills.token_id = tokens.token_id
+                          inner join dim_market as markets final on tokens.market_id = markets.market_id
+                          where markets.event_id in {event_ids_sql}
+                            and user_address not in {excluded_sql}
+                            and ({signal_condition_sql})
+                          group by user_address
+                        )
+                        format JSONEachRow
+                    """
+                )
+            )
+            signal_wallets = rows_json(
+                self.clickhouse.query_text(
+                    f"""
+                        select
+                          markets.slug as market_slug,
+                          markets.question as question,
+                          tokens.outcome as outcome,
+                          user_side,
+                          user_address,
+                          count() as fills,
+                          round(sum(toFloat64(fills.notional)), 2) as total_notional,
+                          round(max(toFloat64(fills.notional)), 2) as max_notional,
+                          round(avg(toFloat64(fills.price)), 4) as avg_price,
+                          min(fills.ingested_at) as first_ts,
+                          max(fills.ingested_at) as last_ts
+                        from fact_exchange_fill as fills final
+                        array join
+                          ['maker', 'taker'] as role,
+                          [fills.maker, fills.taker] as user_address,
+                          [fills.side, if(fills.side = 'BUY', 'SELL', 'BUY')] as user_side
+                        inner join dim_outcome_token as tokens final on fills.token_id = tokens.token_id
+                        inner join dim_market as markets final on tokens.market_id = markets.market_id
+                        where markets.event_id in {event_ids_sql}
+                          and user_address not in {excluded_sql}
+                          and ({signal_condition_sql})
+                        group by market_slug, question, outcome, user_side, user_address
+                        order by total_notional desc
+                        limit {wallet_limit}
+                        format JSONEachRow
+                    """
+                )
+            )
+            signal_trades = rows_json(
+                self.clickhouse.query_text(
+                    f"""
+                        select
+                          fills.ingested_at as timestamp,
+                          markets.slug as market_slug,
+                          markets.question as question,
+                          tokens.outcome as outcome,
+                          user_side,
+                          user_address,
+                          round(toFloat64(fills.notional), 2) as notional,
+                          round(toFloat64(fills.price), 4) as price,
+                          round(toFloat64(fills.size), 2) as size,
+                          fills.transaction_hash as transaction_hash
+                        from fact_exchange_fill as fills final
+                        array join
+                          ['maker', 'taker'] as role,
+                          [fills.maker, fills.taker] as user_address,
+                          [fills.side, if(fills.side = 'BUY', 'SELL', 'BUY')] as user_side
+                        inner join dim_outcome_token as tokens final on fills.token_id = tokens.token_id
+                        inner join dim_market as markets final on tokens.market_id = markets.market_id
+                        where markets.event_id in {event_ids_sql}
+                          and user_address not in {excluded_sql}
+                          and ({signal_condition_sql})
+                        order by toFloat64(fills.notional) desc
+                        limit {trade_limit}
+                        format JSONEachRow
+                    """
+                )
+            )
+        else:
+            signal_wallet_summary = []
+            signal_wallets = []
+            signal_trades = []
+
+        analysis = summarize_unusual_betting(
+            event,
+            outcome_summary,
+            signal_wallets,
+            signal_trades,
+            signal_filters=signal_filters,
+            cold_price_threshold=cold_price_threshold,
+            large_threshold=large_threshold,
+            very_large_threshold=very_large_threshold,
+            extreme_threshold=extreme_threshold,
+        )
+        output = {
+            "status": "ok",
+            "event": event,
+            "parameters": {
+                "cold_price_threshold": cold_price_threshold,
+                "large_threshold": large_threshold,
+                "very_large_threshold": very_large_threshold,
+                "extreme_threshold": extreme_threshold,
+                "excluded_addresses": excluded_addresses,
+                "wallet_limit": wallet_limit,
+                "trade_limit": trade_limit,
+                "cache_ttl_seconds": cache_ttl_seconds,
+                "include_related_markets": include_related_markets,
+                "event_ids": event_ids,
+                "event_slugs": scope_event_slugs,
+            },
+            "event_scope": event_scope,
+            "markets": markets,
+            "tokens": tokens,
+            "fill_summary": fill_summary[0] if fill_summary else {},
+            "outcome_summary": outcome_summary,
+            "signal_outcomes": signal_filters,
+            "signal_wallet_summary": signal_wallet_summary[0] if signal_wallet_summary else {},
+            "signal_wallets": signal_wallets,
+            "signal_trades": signal_trades,
+            "cold_buy_outcomes": signal_filters,
+            "cold_wallets": signal_wallets,
+            "cold_trades": signal_trades,
+            "analysis": analysis,
+            "generated_at": api_datetime(datetime.now(UTC)),
+        }
+        if cache_ttl_seconds > 0:
+            self._unusual_betting_cache[cache_key] = (time.time(), output)
+        return output
+
+    def event_unusual_betting_scope(
+        self,
+        event: dict[str, Any],
+        include_related_markets: bool,
+    ) -> list[dict[str, Any]]:
+        event_id = str(event.get("event_id") or "")
+        slug = str(event.get("slug") or "")
+        if not include_related_markets or not slug.startswith("fifwc-"):
+            return [event] if event_id else []
+        base_slug = base_match_slug(slug)
+        slugs = worldcup_event_slugs_for_scope([base_slug], expand_variants=True)
+        slugs_sql = "(" + ",".join(ch_string(item) for item in slugs) + ")"
+        rows = rows_json(
+            self.clickhouse.query_text(
+                f"""
+                    select
+                      event_id,
+                      slug,
+                      title,
+                      category,
+                      active,
+                      closed,
+                      start_time,
+                      end_time,
+                      updated_at
+                    from dim_event final
+                    where slug in {slugs_sql}
+                    order by slug
+                    format JSONEachRow
+                """
+            )
+        )
+        return rows or ([event] if event_id else [])
+
+    def event_unusual_betting_summary(self, query: dict[str, list[str]]) -> dict[str, Any]:
+        summary_query = {key: list(values) for key, values in query.items()}
+        summary_query.setdefault("wallet_limit", ["100"])
+        summary_query.setdefault("trade_limit", ["50"])
+        detail = self.event_unusual_betting(summary_query)
+        if detail.get("status") != "ok":
+            return detail
+        return unusual_betting_summary_response(detail)
 
     def event_lookup(self, event_ref: str) -> dict[str, Any] | None:
         value = event_ref.strip()
@@ -1735,6 +2846,8 @@ class ProductApi:
         min_notional_24h = float_param(query, "min_notional_24h", 0.0, minimum=0.0)
         tier = param(query, "tier")
         mode = param(query, "mode", "active")
+        range_value = param(query, "range", "all").lower()
+        category = param(query, "category")
         whale_min_notional = float_param(
             query, "whale_min_notional", 1_000_000.0, minimum=0.0
         )
@@ -1750,6 +2863,117 @@ class ProductApi:
             f"screener.traded_notional >= {min_notional}",
             f"ifNull(rollup.traded_notional_24h, 0.0) >= {min_notional_24h}",
         ]
+        joins = [
+            "left join mart_wallet_trade_rollup as rollup final\n"
+            "              on screener.user_address = rollup.user_address",
+            "left join mart_wallet_reputation as rep final\n"
+            "              on screener.user_address = rep.user_address",
+        ]
+        select_fields = [
+            "screener.trade_count as trade_count",
+            "screener.buy_count as buy_count",
+            "screener.sell_count as sell_count",
+            "screener.traded_size as traded_size",
+            "screener.traded_notional as traded_notional",
+            "screener.first_trade_at as first_trade_at",
+            "screener.last_trade_at as last_trade_at",
+            "ifNull(rollup.traded_notional_24h, 0.0) as traded_notional_24h",
+            "ifNull(rollup.trade_count_24h, 0) as trade_count_24h",
+            "ifNull(rollup.buy_notional_24h, 0.0) as buy_notional_24h",
+            "ifNull(rollup.sell_notional_24h, 0.0) as sell_notional_24h",
+            "ifNull(rollup.net_notional_24h, 0.0) as net_notional_24h",
+            "ifNull(rollup.latest_action, '') as latest_action",
+            "0.0 as category_traded_notional",
+            "0 as category_trade_count",
+            "0.0 as category_buy_notional",
+            "0.0 as category_sell_notional",
+            "if(screener.trade_count = 0, cast(null, 'Nullable(Float64)'), screener.traded_notional / screener.trade_count) as avg_bet",
+        ]
+
+        category_filter = wallet_screener_category_filter(category)
+        range_filter = wallet_screener_range_filter(range_value)
+        scoped = bool(category_filter or range_filter)
+        if scoped:
+            scoped_where = ["trades.user_address in (select user_address from candidate_wallets)"]
+            if range_filter:
+                scoped_where.append(range_filter)
+            if category_filter:
+                scoped_where.append(category_filter)
+            joins.append(
+                f"""
+            inner join
+            (
+              select
+                user_address,
+                count() as scoped_trade_count,
+                countIf(side = 'BUY') as scoped_buy_count,
+                countIf(side = 'SELL') as scoped_sell_count,
+                sum(size) as scoped_traded_size,
+                sum(notional) as scoped_traded_notional,
+                sumIf(notional, side = 'BUY') as scoped_buy_notional,
+                sumIf(notional, side = 'SELL') as scoped_sell_notional,
+                min(timestamp) as scoped_first_trade_at,
+                max(timestamp) as scoped_last_trade_at
+              from
+              (
+                select
+                  raw_trade_key,
+                  argMax(raw_timestamp, raw_ingested_at) as timestamp,
+                  argMax(raw_user_address, raw_ingested_at) as user_address,
+                  argMax(raw_side, raw_ingested_at) as side,
+                  argMax(raw_size, raw_ingested_at) as size,
+                  argMax(raw_notional, raw_ingested_at) as notional
+                from
+                (
+                  select
+                    if(
+                      trades.trade_id != '',
+                      concat(
+                        trades.trade_id, '|', lower(trades.user_address), '|',
+                        trades.token_id, '|', trades.side
+                      ),
+                      concat(
+                        trades.transaction_hash, '|', toString(trades.log_index), '|',
+                        lower(trades.user_address), '|', trades.token_id, '|', trades.side
+                      )
+                    ) as raw_trade_key,
+                    trades.timestamp as raw_timestamp,
+                    lower(trades.user_address) as raw_user_address,
+                    trades.side as raw_side,
+                    trades.size as raw_size,
+                    trades.notional as raw_notional,
+                    trades.ingested_at as raw_ingested_at
+                  from fact_trade_by_user as trades
+                  left join dim_market as markets final on trades.condition_id = markets.condition_id
+                  left join dim_event as events final on markets.event_id = events.event_id
+                  where {" and ".join(scoped_where)}
+                )
+                group by raw_trade_key
+              )
+              group by user_address
+            ) as scoped on screener.user_address = scoped.user_address
+                """
+            )
+            select_fields = [
+                "scoped.scoped_trade_count as trade_count",
+                "scoped.scoped_buy_count as buy_count",
+                "scoped.scoped_sell_count as sell_count",
+                "scoped.scoped_traded_size as traded_size",
+                "scoped.scoped_traded_notional as traded_notional",
+                "scoped.scoped_first_trade_at as first_trade_at",
+                "scoped.scoped_last_trade_at as last_trade_at",
+                "ifNull(rollup.traded_notional_24h, 0.0) as traded_notional_24h",
+                "ifNull(rollup.trade_count_24h, 0) as trade_count_24h",
+                "scoped.scoped_buy_notional as buy_notional_24h",
+                "scoped.scoped_sell_notional as sell_notional_24h",
+                "scoped.scoped_buy_notional - scoped.scoped_sell_notional as net_notional_24h",
+                "if(scoped.scoped_buy_notional >= scoped.scoped_sell_notional, 'BUY', 'SELL') as latest_action",
+                "scoped.scoped_traded_notional as category_traded_notional",
+                "scoped.scoped_trade_count as category_trade_count",
+                "scoped.scoped_buy_notional as category_buy_notional",
+                "scoped.scoped_sell_notional as category_sell_notional",
+                "if(scoped.scoped_trade_count = 0, cast(null, 'Nullable(Float64)'), scoped.scoped_traded_notional / scoped.scoped_trade_count) as avg_bet",
+            ]
         if tier:
             tier_floor = {
                 "10m_plus": 10_000_000,
@@ -1773,29 +2997,30 @@ class ProductApi:
 
         if mode == "smart":
             order_by = (
-                "screener.pnl_roi desc, screener.total_pnl desc, "
-                "screener.traded_notional desc"
+                "screener.pnl_roi desc, screener.total_pnl desc, traded_notional desc"
             )
         elif mode == "whale":
             order_by = (
                 f"greatest(screener.traded_notional / greatest({whale_min_notional}, 1), "
                 f"screener.max_single_trade_notional / greatest({whale_min_single_trade}, 1)) desc, "
-                "screener.traded_notional desc"
+                "traded_notional desc"
             )
         else:
-            order_by = "screener.last_trade_at desc, screener.traded_notional desc"
+            order_by = "last_trade_at desc, traded_notional desc"
 
         sql = f"""
+            with candidate_wallets as
+            (
+              select screener.user_address as user_address
+              from mart_wallet_screener as screener final
+              left join mart_wallet_trade_rollup as rollup final
+                on screener.user_address = rollup.user_address
+              where {" and ".join(where)}
+            )
             select
               screener.user_address as user_address,
-              screener.trade_count as trade_count,
-              screener.buy_count as buy_count,
-              screener.sell_count as sell_count,
-              screener.traded_size as traded_size,
-              screener.traded_notional as traded_notional,
+              {",\n              ".join(select_fields)},
               screener.max_single_trade_notional as max_single_trade_notional,
-              screener.first_trade_at as first_trade_at,
-              screener.last_trade_at as last_trade_at,
               screener.position_count as position_count,
               screener.positions_value as positions_value,
               screener.portfolio_value as portfolio_value,
@@ -1809,12 +3034,6 @@ class ProductApi:
               screener.whale_reason as whale_reason,
               ifNull(rollup.buy_notional, 0.0) as recent_buy_notional,
               ifNull(rollup.sell_notional, 0.0) as recent_sell_notional,
-              ifNull(rollup.traded_notional_24h, 0.0) as traded_notional_24h,
-              ifNull(rollup.trade_count_24h, 0) as trade_count_24h,
-              ifNull(rollup.buy_notional_24h, 0.0) as buy_notional_24h,
-              ifNull(rollup.sell_notional_24h, 0.0) as sell_notional_24h,
-              ifNull(rollup.net_notional_24h, 0.0) as net_notional_24h,
-              ifNull(rollup.latest_action, '') as latest_action,
               multiIf(
                 screener.traded_notional >= 10000000, '10m_plus',
                 screener.traded_notional >= 5000000, '5m_plus',
@@ -1823,17 +3042,14 @@ class ProductApi:
                 'standard'
               ) as whale_tier,
               ifNull(rollup.data_lag_seconds, 0) as data_lag_seconds,
-              ifNull(rep.win_rate, 0.0) as win_rate,
-              ifNull(rep.realized_pnl, 0.0) as realized_pnl,
+              if(rep.completed_event_count > 0, cast(rep.win_rate, 'Nullable(Float64)'), cast(null, 'Nullable(Float64)')) as win_rate,
+              if(rep.completed_event_count > 0, cast(rep.realized_pnl, 'Nullable(Float64)'), cast(null, 'Nullable(Float64)')) as realized_pnl,
               ifNull(rep.completed_event_count, 0) as completed_event_count,
-              ifNull(rep.active_unrealized_pnl_estimate, 0.0) as active_unrealized_pnl_estimate,
+              cast(rep.active_unrealized_pnl_estimate, 'Nullable(Float64)') as active_unrealized_pnl_estimate,
               ifNull(rep.favorite_category, '') as favorite_category,
               screener.updated_at as updated_at
             from mart_wallet_screener as screener final
-            left join mart_wallet_trade_rollup as rollup final
-              on screener.user_address = rollup.user_address
-            left join mart_wallet_reputation as rep final
-              on screener.user_address = rep.user_address
+            {" ".join(joins)}
             where {" and ".join(where)}
             order by {order_by}
             limit {limit}
@@ -1845,7 +3061,7 @@ class ProductApi:
         user = param(query, "user").lower()
         if not user:
             return None
-        if param(query, "refresh").lower() in ("1", "true", "yes"):
+        if truthy_param(query, "refresh"):
             self.enqueue_wallet_refresh(user)
         position_limit = int_param(query, "position_limit", 50, maximum=500)
         activity_limit = int_param(query, "activity_limit", 50, maximum=200)
@@ -1853,19 +3069,199 @@ class ProductApi:
         position_scope = param(query, "position_scope", "all").lower()
         position_sort = param(query, "position_sort", "current_value").lower()
 
+        if truthy_param(query, "live"):
+            live_detail = self.wallet_detail_live(
+                user,
+                position_limit=position_limit,
+                activity_limit=activity_limit,
+                pnl_points_limit=pnl_points_limit,
+                position_scope=position_scope,
+                position_sort=position_sort,
+            )
+            if live_detail is not None:
+                return live_detail
+
         portfolio = self.wallet_latest_portfolio_snapshot(user)
         pnl = self.wallet_latest_pnl_snapshot(user)
         activity_summary = self.wallet_activity_summary(user)
         activity_by_type = self.wallet_activity_by_type(user)
-        recent_activity = self.wallet_recent_activity(user, activity_limit)
+        full_recent_activity = self.wallet_recent_activity(user, max(activity_limit, 500))
+        activity_positions = wallet_closed_positions_from_activity(
+            full_recent_activity,
+            include_open=True,
+        )
+        closed_positions = [
+            position for position in activity_positions if position.get("is_settled_or_redeemable")
+        ]
+        recent_activity = full_recent_activity[:activity_limit]
         reputation = self.wallet_detail_reputation(user)
+        return self.wallet_detail_response(
+            user,
+            portfolio=portfolio,
+            pnl=pnl,
+            activity_summary=activity_summary,
+            activity_by_type=activity_by_type,
+            recent_activity=recent_activity,
+            reputation=reputation,
+            closed_positions=closed_positions,
+            activity_positions=activity_positions,
+            position_limit=position_limit,
+            activity_limit=activity_limit,
+            pnl_points_limit=pnl_points_limit,
+            position_scope=position_scope,
+            position_sort=position_sort,
+            data_source="snapshot",
+        )
+
+    def wallet_detail_live(
+        self,
+        user: str,
+        *,
+        position_limit: int,
+        activity_limit: int,
+        pnl_points_limit: int,
+        position_scope: str,
+        position_sort: str,
+    ) -> dict[str, Any] | None:
+        if self.settings is None:
+            return None
+        client = PolymarketClient(self.settings)
+        live_activity_limit = max(activity_limit, 500)
+        try:
+            with ThreadPoolExecutor(max_workers=5) as executor:
+                positions_future = executor.submit(client.data_positions, user=user)
+                value_future = executor.submit(client.data_value, user=user)
+                pnl_future = executor.submit(client.user_pnl, user=user, interval="all", fidelity="1h")
+                activity_future = executor.submit(
+                    client.data_activity,
+                    user=user,
+                    limit=live_activity_limit,
+                    offset=0,
+                )
+                balance_future = executor.submit(self.live_pusd_balance, user)
+                positions_page = positions_future.result()
+                value_page = value_future.result()
+                pnl_page = pnl_future.result()
+                activity_page = activity_future.result()
+                available_balance = balance_future.result()
+        except Exception:
+            return None
+
+        captured_at = datetime.now(UTC)
+        pnl_points_payload = (
+            pnl_page.response.body if isinstance(pnl_page.response.body, list) else pnl_page.items
+        )
+        portfolio_rows = wallet_portfolio_rows(
+            {
+                "user": user,
+                "positions": positions_page.items,
+                "value": value_page.items,
+                "pnl": pnl_points_payload,
+                "availableBalance": available_balance,
+            },
+            captured_at,
+        )
+        pnl_rows = wallet_pnl_snapshot_rows(
+            {"user": user, "points": pnl_points_payload},
+            captured_at,
+        )
+        live_activity_rows = activity_rows(activity_page.items, captured_at)
+        live_activity_rows = [
+            {**row, "user_address": str(row.get("user_address") or user).lower()}
+            for row in live_activity_rows
+        ]
+        live_activity_rows = dedupe_wallet_activity_rows(live_activity_rows)
+
+        portfolio = json_ready_row(portfolio_rows[0]) if portfolio_rows else None
+        pnl = json_ready_row(pnl_rows[0]) if pnl_rows else None
+        activity_summary = summarize_activity_rows(user, live_activity_rows)
+        activity_by_type = summarize_activity_rows_by_type(live_activity_rows)
+        activity_positions = wallet_closed_positions_from_activity(
+            live_activity_rows,
+            include_open=True,
+        )
+        closed_positions = [
+            position for position in activity_positions if position.get("is_settled_or_redeemable")
+        ]
+        recent_activity = recent_activity_from_rows(live_activity_rows, activity_limit)
+        try:
+            reputation = self.wallet_detail_reputation(user)
+        except Exception:
+            reputation = None
+
+        if not any((portfolio, pnl, live_activity_rows)):
+            return None
+        return self.wallet_detail_response(
+            user,
+            portfolio=portfolio,
+            pnl=pnl,
+            activity_summary=activity_summary,
+            activity_by_type=activity_by_type,
+            recent_activity=recent_activity,
+            reputation=reputation,
+            closed_positions=closed_positions,
+            activity_positions=activity_positions,
+            position_limit=position_limit,
+            activity_limit=activity_limit,
+            pnl_points_limit=pnl_points_limit,
+            position_scope=position_scope,
+            position_sort=position_sort,
+            data_source="live",
+        )
+
+    def live_pusd_balance(self, user: str) -> float:
+        if self.settings is None or not self.settings.polygon_rpc_url:
+            return 0.0
+        try:
+            raw = PolygonRpcClient(self.settings).eth_call(
+                to=PUSD_ADDRESS,
+                data=erc20_balance_of_data(user),
+            )
+        except Exception:
+            return 0.0
+        return int(raw, 16) / PUSD_DECIMALS if raw and raw != "0x" else 0.0
+
+    def wallet_detail_response(
+        self,
+        user: str,
+        *,
+        portfolio: dict[str, Any] | None,
+        pnl: dict[str, Any] | None,
+        activity_summary: dict[str, Any] | None,
+        activity_by_type: list[dict[str, Any]],
+        recent_activity: list[dict[str, Any]],
+        reputation: dict[str, Any] | None,
+        position_limit: int,
+        activity_limit: int,
+        pnl_points_limit: int,
+        position_scope: str,
+        position_sort: str,
+        data_source: str,
+        closed_positions: list[dict[str, Any]] | None = None,
+        activity_positions: list[dict[str, Any]] | None = None,
+    ) -> dict[str, Any] | None:
         if not any((portfolio, pnl, activity_summary, activity_by_type, recent_activity)):
             return None
 
         positions = wallet_positions_from_snapshot(portfolio)
+        activity_positions = activity_positions or wallet_closed_positions_from_activity(
+            recent_activity,
+            include_open=True,
+        )
+        closed_positions = closed_positions or [
+            position for position in activity_positions if position.get("is_settled_or_redeemable")
+        ]
+        closed_positions = merge_closed_positions(
+            closed_positions,
+            positions,
+            all_activity_positions=activity_positions,
+        )
+        position_summary = summarize_wallet_positions(positions)
         filtered_positions = filter_wallet_positions(positions, position_scope)
         sorted_positions = sort_wallet_positions(filtered_positions, position_sort)
         all_pnl_points = wallet_pnl_points_from_snapshot(pnl, 10_000)
+        risk_metrics = wallet_risk_metrics(closed_positions, all_pnl_points)
+        performance_metrics = wallet_performance_metrics(closed_positions)
         pnl_points = all_pnl_points[-pnl_points_limit:]
         pnl_7d = wallet_pnl_delta(all_pnl_points, days=7)
         latest_total_pnl = (
@@ -1873,26 +3269,63 @@ class ProductApi:
             if pnl
             else float_value((portfolio or {}).get("total_pnl"))
         )
+        pnl_captured_at = (pnl or {}).get("captured_at")
+        portfolio_captured_at = (portfolio or {}).get("captured_at")
+        pnl_lag_minutes = datetime_lag_minutes(pnl_captured_at, portfolio_captured_at)
 
         return {
             "wallet": {
                 "user_address": user,
                 "data_status": "ok",
+                "data_source": data_source,
+                "data_freshness_status": wallet_data_freshness_status(
+                    pnl_captured_at,
+                    portfolio_captured_at,
+                    pnl_lag_minutes,
+                ),
                 "latest_total_pnl": latest_total_pnl,
-                "pnl_captured_at": (pnl or {}).get("captured_at"),
-                "portfolio_captured_at": (portfolio or {}).get("captured_at"),
+                "pnl_captured_at": pnl_captured_at,
+                "portfolio_captured_at": portfolio_captured_at,
+                "pnl_lag_minutes": pnl_lag_minutes,
                 "position_count": int_value((portfolio or {}).get("position_count")),
                 "positions_value": float_value((portfolio or {}).get("positions_value")),
                 "portfolio_value": float_value((portfolio or {}).get("portfolio_value")),
                 "available_balance": float_value((portfolio or {}).get("available_balance")),
                 "cash": float_value((portfolio or {}).get("available_balance")),
                 "portfolio_total_pnl": float_value((portfolio or {}).get("total_pnl")),
+                "current_pnl": float_value(position_summary.get("open_cash_pnl")),
+                "position_cash_pnl": float_value(position_summary.get("cash_pnl")),
                 "pnl_7d": pnl_7d,
-                "win_rate": (reputation or {}).get("win_rate"),
-                "completed_event_count": int_value(
-                    (reputation or {}).get("completed_event_count")
+                "win_rate": value_or_fallback(
+                    risk_metrics.get("win_rate"),
+                    (reputation or {}).get("win_rate"),
                 ),
-                "avg_event_roi": (reputation or {}).get("avg_event_roi"),
+                "completed_event_count": int_value(
+                    value_or_fallback(
+                        risk_metrics.get("completed_event_count"),
+                        (reputation or {}).get("completed_event_count"),
+                    )
+                ),
+                "profitable_event_count": int_value(
+                    value_or_fallback(
+                        risk_metrics.get("profitable_event_count"),
+                        (reputation or {}).get("profitable_event_count"),
+                    )
+                ),
+                "losing_event_count": int_value(
+                    value_or_fallback(
+                        risk_metrics.get("losing_event_count"),
+                        (reputation or {}).get("losing_event_count"),
+                    )
+                ),
+                "realized_pnl": value_or_fallback(
+                    risk_metrics.get("realized_pnl"),
+                    (reputation or {}).get("realized_pnl"),
+                ),
+                "avg_event_roi": value_or_fallback(
+                    risk_metrics.get("avg_event_roi"),
+                    (reputation or {}).get("avg_event_roi"),
+                ),
                 "avg_bet": float_value((activity_summary or {}).get("avg_bet")),
                 "trade_volume_7d": float_value(
                     (activity_summary or {}).get("traded_notional_7d")
@@ -1907,10 +3340,15 @@ class ProductApi:
                 "first_activity_at": (activity_summary or {}).get("first_activity_at"),
                 "last_activity_at": (activity_summary or {}).get("last_activity_at"),
             },
-            "position_summary": summarize_wallet_positions(positions),
+            "position_summary": position_summary,
+            "risk_metrics": risk_metrics,
+            "performance_metrics": performance_metrics,
             "positions": sorted_positions[:position_limit],
+            "closed_positions": closed_positions[:position_limit],
             "positions_returned": min(len(sorted_positions), position_limit),
             "positions_available": len(sorted_positions),
+            "closed_positions_returned": min(len(closed_positions), position_limit),
+            "closed_positions_available": len(closed_positions),
             "position_scope": position_scope,
             "position_sort": position_sort,
             "pnl_points": pnl_points,
@@ -2029,8 +3467,41 @@ class ProductApi:
               argMax(side, timestamp) as latest_side,
               min(timestamp) as first_activity_at,
               max(timestamp) as last_activity_at
-            from fact_user_activity
-            where user_address = {ch_string(user)}
+            from
+            (
+              select
+                raw_user_address as user_address,
+                trade_key,
+                argMax(raw_timestamp, raw_ingested_at) as timestamp,
+                argMax(raw_activity_type, raw_ingested_at) as activity_type,
+                argMax(raw_side, raw_ingested_at) as side,
+                argMax(raw_size, raw_ingested_at) as size,
+                argMax(raw_notional, raw_ingested_at) as notional
+              from
+              (
+                select
+                  lower(user_address) as raw_user_address,
+                  if(
+                    transaction_hash != '',
+                    concat(
+                      transaction_hash, '|', condition_id, '|', token_id, '|',
+                      side, '|', toString(price), '|', toString(size), '|',
+                      toString(timestamp)
+                    ),
+                    activity_id
+                  ) as trade_key,
+                  timestamp as raw_timestamp,
+                  activity_type as raw_activity_type,
+                  side as raw_side,
+                  size as raw_size,
+                  notional as raw_notional,
+                  ingested_at as raw_ingested_at
+                from fact_user_activity final
+                where user_address = {ch_string(user)}
+                  and timestamp <= now64(3) + interval 10 minute
+              )
+              group by raw_user_address, trade_key
+            )
             group by user_address
             limit 1
             format JSONEachRow
@@ -2074,8 +3545,39 @@ class ProductApi:
               sum(notional) as notional,
               min(timestamp) as first_activity_at,
               max(timestamp) as last_activity_at
-            from fact_user_activity
-            where user_address = {ch_string(user)}
+            from
+            (
+              select
+                raw_user_address as user_address,
+                trade_key,
+                argMax(raw_timestamp, raw_ingested_at) as timestamp,
+                argMax(raw_activity_type, raw_ingested_at) as activity_type,
+                argMax(raw_size, raw_ingested_at) as size,
+                argMax(raw_notional, raw_ingested_at) as notional
+              from
+              (
+                select
+                  lower(user_address) as raw_user_address,
+                  if(
+                    transaction_hash != '',
+                    concat(
+                      transaction_hash, '|', condition_id, '|', token_id, '|',
+                      side, '|', toString(price), '|', toString(size), '|',
+                      toString(timestamp)
+                    ),
+                    activity_id
+                  ) as trade_key,
+                  timestamp as raw_timestamp,
+                  activity_type as raw_activity_type,
+                  size as raw_size,
+                  notional as raw_notional,
+                  ingested_at as raw_ingested_at
+                from fact_user_activity final
+                where user_address = {ch_string(user)}
+                  and timestamp <= now64(3) + interval 10 minute
+              )
+              group by raw_user_address, trade_key
+            )
             group by activity_type
             order by count desc, notional desc
             format JSONEachRow
@@ -2098,8 +3600,48 @@ class ProductApi:
               JSONExtractString(raw_json, 'slug') as slug,
               JSONExtractString(raw_json, 'eventSlug') as event_slug,
               JSONExtractString(raw_json, 'outcome') as outcome
-            from fact_user_activity
-            where user_address = {ch_string(user)}
+            from
+            (
+              select
+                argMax(raw_timestamp, raw_ingested_at) as timestamp,
+                argMax(raw_activity_type, raw_ingested_at) as activity_type,
+                argMax(raw_side, raw_ingested_at) as side,
+                argMax(raw_price, raw_ingested_at) as price,
+                argMax(raw_size, raw_ingested_at) as size,
+                argMax(raw_notional, raw_ingested_at) as notional,
+                argMax(raw_condition_id, raw_ingested_at) as condition_id,
+                argMax(raw_token_id, raw_ingested_at) as token_id,
+                argMax(raw_transaction_hash, raw_ingested_at) as transaction_hash,
+                argMax(raw_json, raw_ingested_at) as raw_json
+              from
+              (
+                select
+                  if(
+                    transaction_hash != '',
+                    concat(
+                      transaction_hash, '|', condition_id, '|', token_id, '|',
+                      side, '|', toString(price), '|', toString(size), '|',
+                      toString(timestamp)
+                    ),
+                    activity_id
+                  ) as trade_key,
+                  timestamp as raw_timestamp,
+                  activity_type as raw_activity_type,
+                  side as raw_side,
+                  price as raw_price,
+                  size as raw_size,
+                  notional as raw_notional,
+                  condition_id as raw_condition_id,
+                  token_id as raw_token_id,
+                  transaction_hash as raw_transaction_hash,
+                  raw_json,
+                  ingested_at as raw_ingested_at
+                from fact_user_activity final
+                where user_address = {ch_string(user)}
+                  and timestamp <= now64(3) + interval 10 minute
+              )
+              group by trade_key
+            )
             order by timestamp desc
             limit {limit}
             format JSONEachRow
@@ -2399,18 +3941,50 @@ def serve_api(*, settings: Settings, host: str, port: int) -> None:
 
     class Handler(BaseHTTPRequestHandler):
         def do_GET(self) -> None:
+            self.handle_api_request("GET")
+
+        def do_POST(self) -> None:
+            self.handle_api_request("POST")
+
+        def do_DELETE(self) -> None:
+            self.handle_api_request("DELETE")
+
+        def do_OPTIONS(self) -> None:
+            self.send_response(HTTPStatus.NO_CONTENT)
+            self.send_header("Access-Control-Allow-Origin", "*")
+            self.send_header("Access-Control-Allow-Methods", "GET,POST,DELETE,OPTIONS")
+            self.send_header("Access-Control-Allow-Headers", "Content-Type")
+            self.end_headers()
+
+        def handle_api_request(self, method: str) -> None:
             parsed = urlparse(self.path)
             try:
-                response = api.handle(parsed.path, parse_qs(parsed.query))
+                response = api.handle_request(
+                    method,
+                    parsed.path,
+                    parse_qs(parsed.query),
+                    self.read_json_body() if method in ("POST", "DELETE") else None,
+                )
             except Exception as exc:
                 print(f"api request failed path={parsed.path}: {exc}", flush=True)
                 response = ApiResponse(HTTPStatus.INTERNAL_SERVER_ERROR, {"error": "internal_error"})
             encoded = json.dumps(response.body, ensure_ascii=False, default=str).encode("utf-8")
             self.send_response(int(response.status))
             self.send_header("Content-Type", "application/json; charset=utf-8")
+            self.send_header("Access-Control-Allow-Origin", "*")
             self.send_header("Content-Length", str(len(encoded)))
             self.end_headers()
             self.wfile.write(encoded)
+
+        def read_json_body(self) -> dict[str, Any]:
+            length = int(self.headers.get("Content-Length") or "0")
+            if length <= 0:
+                return {}
+            raw = self.rfile.read(length)
+            if not raw:
+                return {}
+            payload = json.loads(raw.decode("utf-8"))
+            return payload if isinstance(payload, dict) else {}
 
         def log_message(self, _format: str, *_args: Any) -> None:
             return
@@ -2420,6 +3994,1181 @@ def serve_api(*, settings: Settings, host: str, port: int) -> None:
 
 def rows_json(text: str) -> list[dict[str, Any]]:
     return [json.loads(line) for line in text.splitlines() if line.strip()]
+
+
+def compact_live_trade_rows(items: list[dict[str, Any]], captured_at: datetime) -> list[dict[str, Any]]:
+    rows: list[dict[str, Any]] = []
+    seen: set[tuple[str, str, str, str, float, float, int]] = set()
+    for index, item in enumerate(items):
+        if not isinstance(item, dict):
+            continue
+        timestamp = parse_clickhouse_datetime(item.get("timestamp"))
+        if timestamp is None:
+            timestamp = captured_at
+        transaction_hash = str(item.get("transactionHash") or item.get("transaction_hash") or "")
+        token_id = str(item.get("asset") or item.get("token_id") or "")
+        user_address = str(item.get("proxyWallet") or item.get("user") or item.get("user_address") or "").lower()
+        side = str(item.get("side") or "").upper()
+        price = float_value(item.get("price"))
+        size = float_value(item.get("size"))
+        key = (transaction_hash, token_id, user_address, side, price, size, int(timestamp.timestamp()))
+        if key in seen:
+            continue
+        seen.add(key)
+        condition_id = str(item.get("conditionId") or item.get("condition_id") or "")
+        rows.append(
+            {
+                "trade_id": trade_row_id(transaction_hash, token_id, timestamp, index),
+                "transaction_hash": transaction_hash,
+                "timestamp": api_datetime(timestamp),
+                "market_id": "",
+                "condition_id": condition_id,
+                "token_id": token_id,
+                "user_address": user_address,
+                "side": side,
+                "price": price,
+                "size": size,
+                "notional": price * size,
+                "source": "polymarket-live",
+                "ingested_at": api_datetime(captured_at),
+                "question": str(item.get("title") or ""),
+                "market_slug": str(item.get("slug") or ""),
+                "event_id": str(item.get("eventId") or item.get("event_id") or ""),
+                "event_title": str(item.get("eventTitle") or item.get("event_title") or ""),
+                "event_slug": str(item.get("eventSlug") or item.get("event_slug") or ""),
+                "category": str(item.get("category") or ""),
+                "outcome": str(item.get("outcome") or ""),
+                "trader_name": str(item.get("name") or ""),
+                "trader_pseudonym": str(item.get("pseudonym") or ""),
+                "is_smart": False,
+                "is_whale": False,
+                "wallet_total_pnl": 0.0,
+                "wallet_pnl_roi": 0.0,
+                "wallet_traded_notional": 0.0,
+            }
+        )
+    rows.sort(key=lambda row: parse_clickhouse_datetime(row.get("timestamp")) or captured_at, reverse=True)
+    return rows
+
+
+def live_trades_latency_seconds(rows: list[dict[str, Any]], captured_at: datetime) -> float | None:
+    if not rows:
+        return None
+    latest = parse_clickhouse_datetime(rows[0].get("timestamp"))
+    if latest is None:
+        return None
+    return max(0.0, (captured_at - latest).total_seconds())
+
+
+def filter_live_trade_rows(rows: list[dict[str, Any]], query: dict[str, list[str]]) -> list[dict[str, Any]]:
+    side = param(query, "side").upper()
+    search = param(query, "q").strip().lower()
+    category = param(query, "category")
+    min_notional = float_param(query, "min_notional", 0.0, minimum=0.0)
+    max_notional = float_param(query, "max_notional", 0.0, minimum=0.0)
+    output: list[dict[str, Any]] = []
+    for row in rows:
+        row_side = str(row.get("side") or "").upper()
+        if side in ("BUY", "SELL") and row_side != side:
+            continue
+        notional = float_value(row.get("notional"))
+        if min_notional > 0 and notional < min_notional:
+            continue
+        if max_notional > 0 and notional > max_notional:
+            continue
+        if not live_trade_matches_category(row, category):
+            continue
+        if search:
+            haystack = " ".join(
+                str(row.get(key) or "")
+                for key in (
+                    "user_address",
+                    "trader_name",
+                    "trader_pseudonym",
+                    "question",
+                    "event_title",
+                    "market_slug",
+                    "event_slug",
+                    "outcome",
+                )
+            ).lower()
+            if search not in haystack:
+                continue
+        output.append(row)
+    return output
+
+
+def live_trade_matches_category(row: dict[str, Any], category: str) -> bool:
+    normalized = str(category or "").strip().lower()
+    if not normalized or normalized in ("all", "全部"):
+        return True
+    terms = live_trade_category_terms(normalized)
+    haystack = " ".join(
+        str(row.get(key) or "")
+        for key in ("category", "question", "event_title", "market_slug", "event_slug")
+    ).lower()
+    if normalized in ("sports", "体育") and live_trade_is_esports_haystack(haystack):
+        return False
+    return any(term.lower() in haystack for term in terms)
+
+
+def live_trade_is_esports_haystack(haystack: str) -> bool:
+    return any(
+        term in haystack
+        for term in ("esports", "e-sports", "valorant", "counter-strike", "counter strike", "cs2", "dota")
+    )
+
+
+def live_trade_category_terms(category: str) -> list[str]:
+    terms_by_category = {
+        "sports": [
+            "sports",
+            "sport",
+            "nba",
+            "fifa",
+            "world cup",
+            "soccer",
+            "football",
+            "tennis",
+            "dublin",
+            "halle",
+            "argentina",
+            "france",
+            "portugal",
+        ],
+        "体育": [
+            "sports",
+            "sport",
+            "nba",
+            "fifa",
+            "world cup",
+            "soccer",
+            "football",
+            "tennis",
+            "dublin",
+            "halle",
+            "argentina",
+            "france",
+            "portugal",
+        ],
+        "politics": ["politics", "election", "congress", "senate", "trump", "biden", "referendum", "government", "starmer"],
+        "政治": ["politics", "election", "congress", "senate", "trump", "biden", "referendum", "government", "starmer"],
+        "crypto": ["crypto", "bitcoin", "btc", "ethereum", "eth", "solana", "sol", "xrp", "dogecoin"],
+        "加密货币": ["crypto", "bitcoin", "btc", "ethereum", "eth", "solana", "sol", "xrp", "dogecoin"],
+        "esports": ["esports", "e-sports", "gaming", "lol", "dota", "valorant", "counter-strike"],
+        "电竞": ["esports", "e-sports", "gaming", "lol", "dota", "valorant", "counter-strike"],
+        "finance": ["finance", "business", "stock", "nasdaq", "s&p", "fed", "rates", "treasury"],
+        "金融": ["finance", "business", "stock", "nasdaq", "s&p", "fed", "rates", "treasury"],
+        "culture": ["culture", "pop-culture", "music", "movie", "celebrity", "oscars"],
+        "文化": ["culture", "pop-culture", "music", "movie", "celebrity", "oscars"],
+        "weather": ["weather", "temperature", "hurricane", "rain", "snow", "storm"],
+        "天气": ["weather", "temperature", "hurricane", "rain", "snow", "storm"],
+    }
+    return terms_by_category.get(category, [category])
+
+
+def limit_live_trades_response(body: dict[str, Any], limit: int) -> dict[str, Any]:
+    limited = dict(body)
+    trades = body.get("trades")
+    limited["trades"] = trades[:limit] if isinstance(trades, list) else []
+    return limited
+
+
+def trade_row_id(transaction_hash: str, token_id: str, timestamp: datetime, index: int) -> str:
+    raw = f"{transaction_hash}|{token_id}|{int(timestamp.timestamp())}|{index}".encode("utf-8")
+    return hashlib.sha1(raw).hexdigest()
+
+
+def json_ready_row(row: dict[str, Any]) -> dict[str, Any]:
+    output = dict(row)
+    for key, value in output.items():
+        if isinstance(value, datetime):
+            output[key] = api_datetime(value)
+    return output
+
+
+def unusual_betting_excluded_addresses() -> list[str]:
+    return [
+        "0xe111180000d2663c0091e4f400237545b87b996b",
+        "0xe2222d279d744050d28e00520010520000310f59",
+        "0x0000000000000000000000000000000000000000",
+    ]
+
+
+def unusual_betting_signal_filters(
+    outcome_summary: list[dict[str, Any]],
+    cold_price_threshold: float,
+    large_threshold: float,
+) -> list[dict[str, Any]]:
+    filters = []
+    for row in outcome_summary:
+        signal_type = unusual_betting_signal_type(row, cold_price_threshold, large_threshold)
+        if not signal_type:
+            continue
+        avg_price = unusual_betting_user_price(row)
+        filters.append(
+            {
+                "market_slug": str(row.get("market_slug") or ""),
+                "question": str(row.get("question") or ""),
+                "outcome": str(row.get("outcome") or ""),
+                "user_side": str(row.get("user_side") or ""),
+                "signal_type": signal_type,
+                "avg_price": avg_price,
+                "total_notional": float_value(row.get("total_notional")),
+                "max_notional": float_value(row.get("max_notional")),
+                "max_user_notional": float_value(row.get("max_user_notional")),
+                "large_trade_count": int_value(row.get("large_trade_count")),
+                "very_large_trade_count": int_value(row.get("very_large_trade_count")),
+                "extreme_trade_count": int_value(row.get("extreme_trade_count")),
+            }
+        )
+    return sorted(filters, key=lambda row: float_value(row.get("total_notional")), reverse=True)
+
+
+def unusual_betting_signal_type(
+    row: dict[str, Any],
+    cold_price_threshold: float,
+    large_threshold: float,
+) -> str:
+    side = str(row.get("user_side") or "").upper()
+    outcome = str(row.get("outcome") or "")
+    outcome_lower = outcome.lower()
+    question = str(row.get("question") or "")
+    avg_price = unusual_betting_user_price(row)
+    total_notional = float_value(row.get("total_notional"))
+    if side not in ("BUY", "SELL"):
+        return ""
+    has_size = total_notional >= large_threshold
+    if not has_size and avg_price > cold_price_threshold:
+        return ""
+    if side == "BUY" and avg_price <= cold_price_threshold:
+        return "low_price_buy_no" if outcome_lower == "no" else "low_price_buy"
+    if side == "SELL" and avg_price <= cold_price_threshold:
+        return "sell_high_probability"
+    if side == "BUY" and unusual_betting_is_spread_market(question) and outcome_lower not in ("yes", "no"):
+        return "spread_side_buy"
+    if side == "SELL" and has_size:
+        return "large_sell"
+    if has_size and avg_price <= 0.5:
+        return "large_mid_price_buy" if side == "BUY" else "large_mid_price_sell"
+    return ""
+
+
+def unusual_betting_user_price(row: dict[str, Any]) -> float:
+    avg_price = float_value(row.get("avg_price"))
+    if str(row.get("user_side") or "").upper() == "SELL":
+        return max(0.0, min(1.0, 1.0 - avg_price))
+    return avg_price
+
+
+def unusual_betting_is_spread_market(question: str) -> bool:
+    normalized = question.lower()
+    return "spread:" in normalized or "handicap" in normalized
+
+
+def unusual_betting_signal_condition_sql(filters: list[dict[str, Any]]) -> str:
+    conditions = []
+    for row in filters:
+        market_slug = str(row.get("market_slug") or "")
+        outcome = str(row.get("outcome") or "")
+        user_side = str(row.get("user_side") or "")
+        if not market_slug or not outcome:
+            continue
+        conditions.append(
+            f"(markets.slug = {ch_string(market_slug)} and tokens.outcome = {ch_string(outcome)}"
+            f" and user_side = {ch_string(user_side)})"
+        )
+    return " or ".join(conditions)
+
+
+def unusual_betting_cold_buy_filters(
+    outcome_summary: list[dict[str, Any]],
+    cold_price_threshold: float,
+) -> list[dict[str, Any]]:
+    return [
+        row
+        for row in unusual_betting_signal_filters(outcome_summary, cold_price_threshold, 500_000.0)
+        if str(row.get("signal_type") or "") in ("low_price_buy", "low_price_buy_no")
+    ]
+
+
+def unusual_betting_cold_condition_sql(filters: list[dict[str, Any]]) -> str:
+    return unusual_betting_signal_condition_sql(filters)
+
+
+def summarize_unusual_betting(
+    event: dict[str, Any],
+    outcome_summary: list[dict[str, Any]],
+    signal_wallets: list[dict[str, Any]],
+    signal_trades: list[dict[str, Any]],
+    *,
+    signal_filters: list[dict[str, Any]] | None = None,
+    cold_price_threshold: float,
+    large_threshold: float,
+    very_large_threshold: float,
+    extreme_threshold: float,
+) -> dict[str, Any]:
+    signal_rows = signal_filters or unusual_betting_signal_filters(
+        outcome_summary,
+        cold_price_threshold,
+        large_threshold,
+    )
+    large_signal_count = sum(
+        1 for row in signal_wallets if float_value(row.get("total_notional")) >= large_threshold
+    )
+    very_large_signal_count = sum(
+        1 for row in signal_wallets if float_value(row.get("total_notional")) >= very_large_threshold
+    )
+    extreme_signal_count = sum(
+        1 for row in signal_wallets if float_value(row.get("total_notional")) >= extreme_threshold
+    )
+    max_signal_trade = max(
+        [float_value(row.get("max_user_notional")) for row in signal_rows]
+        + [float_value(row.get("notional")) for row in signal_trades]
+        or [0.0]
+    )
+    signal_wallet_groups = unusual_betting_aggregate_wallets(signal_wallets)
+    max_signal_wallet = max(
+        [float_value(row.get("total_notional")) for row in signal_wallet_groups] or [0.0]
+    )
+    top_mainstream = sorted(
+        [
+            row
+            for row in outcome_summary
+            if str(row.get("user_side") or "").upper() == "BUY"
+            and str(row.get("outcome") or "").lower() == "yes"
+            and float_value(row.get("avg_price")) > cold_price_threshold
+        ],
+        key=lambda row: float_value(row.get("total_notional")),
+        reverse=True,
+    )[:3]
+
+    if extreme_signal_count > 0 or max_signal_wallet >= extreme_threshold:
+        severity = "critical"
+    elif very_large_signal_count > 0 or max_signal_wallet >= very_large_threshold:
+        severity = "high"
+    elif large_signal_count > 0 or max_signal_wallet >= large_threshold:
+        severity = "medium"
+    elif max_signal_trade > 0 or max_signal_wallet > 0:
+        severity = "low"
+    else:
+        severity = "none"
+
+    event_title = str(event.get("title") or event.get("slug") or "")
+    if severity in ("critical", "high", "medium"):
+        conclusion = (
+            f"{event_title} 存在异常方向的大额成交信号："
+            f"最大钱包累计约 ${max_signal_wallet:,.0f}。"
+        )
+    elif signal_rows:
+        conclusion = (
+            f"{event_title} 未发现 ${large_threshold:,.0f}+ 级别异常方向钱包累计；"
+            f"观察到的最大钱包累计约 ${max_signal_wallet:,.0f}。"
+        )
+    else:
+        conclusion = (
+            f"{event_title} 未识别到符合当前规则的异常方向。"
+        )
+
+    return {
+        "severity": severity,
+        "has_large_signal": large_signal_count > 0,
+        "large_signal_trade_count": 0,
+        "very_large_signal_trade_count": 0,
+        "extreme_signal_trade_count": 0,
+        "large_signal_wallet_count": large_signal_count,
+        "very_large_signal_wallet_count": very_large_signal_count,
+        "extreme_signal_wallet_count": extreme_signal_count,
+        "max_signal_trade_notional": max_signal_trade,
+        "max_signal_wallet_notional": max_signal_wallet,
+        "signal_total_notional": sum(float_value(row.get("total_notional")) for row in signal_rows),
+        "signal_outcome_count": len(signal_rows),
+        "has_large_cold_buy": large_signal_count > 0,
+        "large_cold_trade_count": 0,
+        "very_large_cold_trade_count": 0,
+        "extreme_cold_trade_count": 0,
+        "max_cold_trade_notional": max_signal_trade,
+        "max_cold_wallet_notional": max_signal_wallet,
+        "cold_buy_total_notional": sum(float_value(row.get("total_notional")) for row in signal_rows),
+        "cold_buy_outcome_count": len(signal_rows),
+        "top_mainstream_yes": top_mainstream,
+        "top_signal_wallets": signal_wallets[:5],
+        "top_signal_wallet_groups": signal_wallet_groups[:5],
+        "top_signal_trades": signal_trades[:5],
+        "top_cold_wallets": signal_wallets[:5],
+        "top_cold_wallet_groups": signal_wallet_groups[:5],
+        "top_cold_trades": signal_trades[:5],
+        "conclusion": conclusion,
+        "notes": [
+            "分析基于已成交链上 fill，并按 maker/taker 展开为用户侧 BUY/SELL。",
+            "不包含未成交挂单。",
+            "系统/流动性内部地址已从阈值统计和异常钱包排行中排除。",
+            "异常方向覆盖低价买入、热门高价卖出、No 低价买入和 spread 反向大额成交。",
+        ],
+        "thresholds": {
+            "cold_price_threshold": cold_price_threshold,
+            "large_threshold": large_threshold,
+            "very_large_threshold": very_large_threshold,
+            "extreme_threshold": extreme_threshold,
+        },
+    }
+
+
+def unusual_betting_summary_response(detail: dict[str, Any]) -> dict[str, Any]:
+    event = detail.get("event") if isinstance(detail.get("event"), dict) else {}
+    parameters = detail.get("parameters") if isinstance(detail.get("parameters"), dict) else {}
+    analysis = detail.get("analysis") if isinstance(detail.get("analysis"), dict) else {}
+    signal_wallets = (
+        detail.get("signal_wallets")
+        if isinstance(detail.get("signal_wallets"), list)
+        else detail.get("cold_wallets")
+        if isinstance(detail.get("cold_wallets"), list)
+        else []
+    )
+    signal_trades = (
+        detail.get("signal_trades")
+        if isinstance(detail.get("signal_trades"), list)
+        else detail.get("cold_trades")
+        if isinstance(detail.get("cold_trades"), list)
+        else []
+    )
+    signal_outcomes = (
+        detail.get("signal_outcomes")
+        if isinstance(detail.get("signal_outcomes"), list)
+        else detail.get("cold_buy_outcomes")
+        if isinstance(detail.get("cold_buy_outcomes"), list)
+        else []
+    )
+    signal_wallet_summary = (
+        detail.get("signal_wallet_summary")
+        if isinstance(detail.get("signal_wallet_summary"), dict)
+        else {}
+    )
+    large_threshold = float_value(parameters.get("large_threshold"))
+    abnormal_rows = [
+        row
+        for row in signal_wallets
+        if float_value(row.get("total_notional")) >= large_threshold
+    ]
+    abnormal_wallets = unusual_betting_aggregate_wallets(abnormal_rows)
+    watch_wallets = unusual_betting_aggregate_wallets(signal_wallets)[:5]
+    abnormal_wallet_count = int_value(signal_wallet_summary.get("abnormal_wallet_count"))
+    if abnormal_wallet_count <= 0:
+        abnormal_wallet_count = len(abnormal_wallets)
+    max_abnormal_wallet_notional = max(
+        [float_value(signal_wallet_summary.get("max_abnormal_wallet_notional"))]
+        + [float_value(row.get("total_notional")) for row in abnormal_wallets]
+        or [0.0]
+    )
+    max_watch_wallet_notional = max(
+        [float_value(signal_wallet_summary.get("max_watch_wallet_notional"))]
+        + [float_value(row.get("total_notional")) for row in watch_wallets]
+        or [0.0]
+    )
+    max_trade_notional = max(
+        [float_value(row.get("notional")) for row in signal_trades]
+        + [
+            float_value(analysis.get("max_signal_trade_notional")),
+            float_value(analysis.get("max_cold_trade_notional")),
+            float_value(signal_wallet_summary.get("max_watch_trade_notional")),
+        ]
+        or [0.0]
+    )
+    large_wallet_count = int_value(
+        analysis.get("large_signal_wallet_count", signal_wallet_summary.get("abnormal_wallet_count"))
+    )
+    very_large_wallet_count = int_value(
+        analysis.get("very_large_signal_wallet_count")
+    )
+    extreme_wallet_count = int_value(
+        analysis.get("extreme_signal_wallet_count")
+    )
+    severity = str(analysis.get("severity") or "none")
+    slug = str(event.get("slug") or "")
+    conclusion = unusual_betting_summary_conclusion(
+        event,
+        severity=severity,
+        abnormal_wallet_count=abnormal_wallet_count,
+        large_trade_count=large_wallet_count,
+        very_large_trade_count=very_large_wallet_count,
+        extreme_trade_count=extreme_wallet_count,
+        max_trade_notional=max_trade_notional,
+        max_wallet_notional=max_abnormal_wallet_notional
+        if abnormal_wallet_count > 0
+        else max_watch_wallet_notional,
+        large_threshold=large_threshold,
+        cold_price_threshold=float_value(parameters.get("cold_price_threshold")),
+        fallback=str(analysis.get("conclusion") or ""),
+    )
+    return {
+        "status": "ok",
+        "event": event,
+        "slug": slug,
+        "severity": severity,
+        "conclusion": conclusion,
+        "abnormal_wallet_count": abnormal_wallet_count,
+        "abnormal_trade_count": 0,
+        "very_large_trade_count": 0,
+        "extreme_trade_count": 0,
+        "large_signal_wallet_count": large_wallet_count,
+        "very_large_signal_wallet_count": very_large_wallet_count,
+        "extreme_signal_wallet_count": extreme_wallet_count,
+        "max_abnormal_trade_notional": 0.0,
+        "max_abnormal_wallet_notional": max_abnormal_wallet_notional,
+        "max_watch_trade_notional": max_trade_notional,
+        "max_watch_wallet_notional": max_watch_wallet_notional,
+        "signal_outcome_count": int_value(
+            analysis.get("signal_outcome_count", analysis.get("cold_buy_outcome_count"))
+        ),
+        "signal_total_notional": float_value(
+            analysis.get("signal_total_notional", analysis.get("cold_buy_total_notional"))
+        ),
+        "signal_wallet_count": int_value(signal_wallet_summary.get("signal_wallet_count")),
+        "cold_buy_outcome_count": int_value(
+            analysis.get("signal_outcome_count", analysis.get("cold_buy_outcome_count"))
+        ),
+        "cold_buy_total_notional": float_value(
+            analysis.get("signal_total_notional", analysis.get("cold_buy_total_notional"))
+        ),
+        "thresholds": analysis.get("thresholds") or {},
+        "abnormal_wallets": abnormal_wallets,
+        "watch_wallets": watch_wallets,
+        "signal_outcomes": signal_outcomes[:5],
+        "cold_outcomes": signal_outcomes[:5],
+        "detail_url": f"/api/events/unusual-betting?slug={slug}" if slug else "",
+        "chart_url": f"/#/unusual-betting?slug={slug}" if slug else "",
+        "generated_at": detail.get("generated_at"),
+    }
+
+
+def unusual_betting_aggregate_wallets(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    grouped: dict[str, dict[str, Any]] = {}
+    for row in rows:
+        address = str(row.get("user_address") or "").lower()
+        if not address:
+            continue
+        group = grouped.setdefault(
+            address,
+            {
+                "user_address": address,
+                "total_notional": 0.0,
+                "max_notional": 0.0,
+                "fills": 0,
+                "first_ts": None,
+                "last_ts": None,
+                "selections": [],
+            },
+        )
+        total_notional = float_value(row.get("total_notional"))
+        max_notional = float_value(row.get("max_notional"))
+        group["total_notional"] = float_value(group.get("total_notional")) + total_notional
+        group["max_notional"] = max(float_value(group.get("max_notional")), max_notional)
+        group["fills"] = int_value(group.get("fills")) + int_value(row.get("fills"))
+        group["first_ts"] = earliest_datetime_value(group.get("first_ts"), row.get("first_ts"))
+        group["last_ts"] = latest_datetime_value(group.get("last_ts"), row.get("last_ts"))
+        group["selections"].append(
+            {
+                "market_slug": str(row.get("market_slug") or ""),
+                "question": str(row.get("question") or ""),
+                "outcome": str(row.get("outcome") or ""),
+                "total_notional": total_notional,
+                "max_notional": max_notional,
+                "avg_price": float_value(row.get("avg_price")),
+                "fills": int_value(row.get("fills")),
+                "first_ts": api_datetime(row.get("first_ts")),
+                "last_ts": api_datetime(row.get("last_ts")),
+            }
+        )
+    output = []
+    for group in grouped.values():
+        selections = sorted(
+            group.get("selections") or [],
+            key=lambda row: float_value(row.get("total_notional")),
+            reverse=True,
+        )
+        output.append(
+            {
+                "user_address": group.get("user_address"),
+                "total_notional": round(float_value(group.get("total_notional")), 2),
+                "max_notional": round(float_value(group.get("max_notional")), 2),
+                "fills": int_value(group.get("fills")),
+                "first_ts": api_datetime(group.get("first_ts")),
+                "last_ts": api_datetime(group.get("last_ts")),
+                "selections": selections[:5],
+            }
+        )
+    return sorted(
+        output,
+        key=lambda row: (
+            float_value(row.get("total_notional")),
+            float_value(row.get("max_notional")),
+        ),
+        reverse=True,
+    )
+
+
+def unusual_betting_summary_conclusion(
+    event: dict[str, Any],
+    *,
+    severity: str,
+    abnormal_wallet_count: int,
+    large_trade_count: int,
+    very_large_trade_count: int,
+    extreme_trade_count: int,
+    max_trade_notional: float,
+    max_wallet_notional: float,
+    large_threshold: float,
+    cold_price_threshold: float,
+    fallback: str,
+) -> str:
+    event_title = str(event.get("title") or event.get("slug") or "该比赛")
+    if abnormal_wallet_count > 0:
+        size_clause = f"最大钱包累计约 ${max_wallet_notional:,.0f}"
+        if extreme_trade_count > 0:
+            level = "五百万级/超大额"
+        elif very_large_trade_count > 0:
+            level = "百万美金级"
+        elif large_trade_count > 0:
+            level = "五十万美金级"
+        else:
+            level = "累计大额"
+        return (
+            f"{event_title} 发现 {abnormal_wallet_count} 个异常钱包在异常方向下注，"
+            f"信号级别为{level}；{size_clause}。"
+        )
+    if large_trade_count > 0:
+        return (
+            f"{event_title} 发现 {large_trade_count} 个 ${large_threshold:,.0f}+ 信号方向钱包。"
+        )
+    if max_trade_notional > 0 or max_wallet_notional > 0:
+        return (
+            f"{event_title} 暂未发现 ${large_threshold:,.0f}+ 信号方向钱包累计；"
+            f"低价方向阈值为均价 <= {cold_price_threshold:.0%}，"
+            f"当前最大钱包累计约 ${max_wallet_notional:,.0f}。"
+        )
+    if severity != "none" and fallback:
+        return fallback
+    return f"{event_title} 暂未识别到冷门 Yes 异常下注信号。"
+
+
+def earliest_datetime_value(left: Any, right: Any) -> Any:
+    left_dt = parse_clickhouse_datetime(left)
+    right_dt = parse_clickhouse_datetime(right)
+    if left_dt is None:
+        return right
+    if right_dt is None:
+        return left
+    return left if left_dt <= right_dt else right
+
+
+def latest_datetime_value(left: Any, right: Any) -> Any:
+    left_dt = parse_clickhouse_datetime(left)
+    right_dt = parse_clickhouse_datetime(right)
+    if left_dt is None:
+        return right
+    if right_dt is None:
+        return left
+    return left if left_dt >= right_dt else right
+
+
+def api_datetime(value: Any) -> str | None:
+    dt = parse_clickhouse_datetime(value)
+    if dt is None:
+        return None
+    return dt.astimezone(UTC).strftime("%Y-%m-%d %H:%M:%S.%f")[:-3]
+
+
+def dedupe_wallet_activity_rows(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    deduped: dict[tuple[Any, ...], dict[str, Any]] = {}
+    for row in rows:
+        key = wallet_activity_row_key(row)
+        current = deduped.get(key)
+        if current is None or timestamp_key(row.get("ingested_at")) >= timestamp_key(
+            current.get("ingested_at")
+        ):
+            deduped[key] = row
+    return sorted(
+        deduped.values(),
+        key=lambda row: timestamp_key(api_datetime(row.get("timestamp"))),
+        reverse=True,
+    )
+
+
+def wallet_activity_row_key(row: dict[str, Any]) -> tuple[Any, ...]:
+    transaction_hash = str(row.get("transaction_hash") or "")
+    if transaction_hash:
+        return (
+            transaction_hash,
+            str(row.get("condition_id") or ""),
+            str(row.get("token_id") or ""),
+            str(row.get("side") or ""),
+            float_value(row.get("price")),
+            float_value(row.get("size")),
+            api_datetime(row.get("timestamp")) or "",
+        )
+    return ("activity_id", str(row.get("activity_id") or ""))
+
+
+def summarize_activity_rows(user: str, rows: list[dict[str, Any]]) -> dict[str, Any]:
+    if not rows:
+        return empty_wallet_activity_summary(user)
+    now = datetime.now(UTC)
+    cutoff_24h = now.timestamp() - 86_400
+    cutoff_7d = now.timestamp() - 7 * 86_400
+    trade_rows = [row for row in rows if str(row.get("activity_type") or "") == "TRADE"]
+    buy_rows = [row for row in trade_rows if str(row.get("side") or "").upper() == "BUY"]
+    sell_rows = [row for row in trade_rows if str(row.get("side") or "").upper() == "SELL"]
+    timestamps = [parse_clickhouse_datetime(row.get("timestamp")) for row in rows]
+    timestamps = [dt for dt in timestamps if dt is not None]
+    latest = rows[0] if rows else {}
+    notional_values = [
+        float_value(row.get("notional")) for row in trade_rows if float_value(row.get("notional")) > 0
+    ]
+    rows_24h = [
+        row
+        for row in rows
+        if (parse_clickhouse_datetime(row.get("timestamp")) or datetime.fromtimestamp(0, UTC)).timestamp()
+        >= cutoff_24h
+    ]
+    trade_rows_24h = [row for row in rows_24h if str(row.get("activity_type") or "") == "TRADE"]
+    trade_rows_7d = [
+        row
+        for row in trade_rows
+        if (parse_clickhouse_datetime(row.get("timestamp")) or datetime.fromtimestamp(0, UTC)).timestamp()
+        >= cutoff_7d
+    ]
+    return {
+        "user_address": user,
+        "activity_count": len(rows),
+        "trade_activity_count": len(trade_rows),
+        "buy_count": len(buy_rows),
+        "sell_count": len(sell_rows),
+        "traded_size": sum(float_value(row.get("size")) for row in trade_rows),
+        "traded_notional": sum(float_value(row.get("notional")) for row in trade_rows),
+        "buy_notional": sum(float_value(row.get("notional")) for row in buy_rows),
+        "sell_notional": sum(float_value(row.get("notional")) for row in sell_rows),
+        "activity_count_24h": len(rows_24h),
+        "trade_activity_count_24h": len(trade_rows_24h),
+        "traded_notional_24h": sum(float_value(row.get("notional")) for row in trade_rows_24h),
+        "trade_activity_count_7d": len(trade_rows_7d),
+        "traded_notional_7d": sum(float_value(row.get("notional")) for row in trade_rows_7d),
+        "avg_bet": sum(notional_values) / len(notional_values) if notional_values else 0.0,
+        "latest_activity_type": str(latest.get("activity_type") or ""),
+        "latest_side": str(latest.get("side") or ""),
+        "first_activity_at": api_datetime(min(timestamps)) if timestamps else None,
+        "last_activity_at": api_datetime(max(timestamps)) if timestamps else None,
+    }
+
+
+def summarize_activity_rows_by_type(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    grouped: dict[str, list[dict[str, Any]]] = {}
+    for row in rows:
+        activity_type = str(row.get("activity_type") or "")
+        grouped.setdefault(activity_type, []).append(row)
+    output = []
+    for activity_type, group in grouped.items():
+        timestamps = [parse_clickhouse_datetime(row.get("timestamp")) for row in group]
+        timestamps = [dt for dt in timestamps if dt is not None]
+        output.append(
+            {
+                "activity_type": activity_type,
+                "count": len(group),
+                "size": sum(float_value(row.get("size")) for row in group),
+                "notional": sum(float_value(row.get("notional")) for row in group),
+                "first_activity_at": api_datetime(min(timestamps)) if timestamps else None,
+                "last_activity_at": api_datetime(max(timestamps)) if timestamps else None,
+            }
+        )
+    return sorted(output, key=lambda row: (int_value(row.get("count")), float_value(row.get("notional"))), reverse=True)
+
+
+def recent_activity_from_rows(rows: list[dict[str, Any]], limit: int) -> list[dict[str, Any]]:
+    output = []
+    for row in rows[:limit]:
+        raw = activity_raw_json(row)
+        output.append(
+            {
+                "timestamp": api_datetime(row.get("timestamp")),
+                "activity_type": str(row.get("activity_type") or ""),
+                "side": str(row.get("side") or ""),
+                "price": float_value(row.get("price")),
+                "size": float_value(row.get("size")),
+                "notional": float_value(row.get("notional")),
+                "condition_id": str(row.get("condition_id") or ""),
+                "token_id": str(row.get("token_id") or ""),
+                "transaction_hash": str(row.get("transaction_hash") or ""),
+                "title": str(raw.get("title") or ""),
+                "slug": str(raw.get("slug") or ""),
+                "event_slug": str(raw.get("eventSlug") or raw.get("event_slug") or ""),
+                "outcome": str(raw.get("outcome") or ""),
+            }
+        )
+    return output
+
+
+def wallet_closed_positions_from_activity(
+    rows: list[dict[str, Any]],
+    *,
+    include_open: bool = False,
+) -> list[dict[str, Any]]:
+    groups: dict[tuple[str, str, str], dict[str, Any]] = {}
+    for row in rows:
+        activity_type = str(row.get("activity_type") or "").upper()
+        side = str(row.get("side") or "").upper()
+        condition_id = str(row.get("condition_id") or "")
+        token_id = str(row.get("token_id") or "")
+        raw = activity_raw_json(row)
+        title = str(row.get("title") or raw.get("title") or "")
+        slug = str(row.get("slug") or raw.get("slug") or "")
+        event_slug = str(row.get("event_slug") or raw.get("eventSlug") or raw.get("event_slug") or "")
+        outcome = str(row.get("outcome") or raw.get("outcome") or "")
+        if activity_type == "TRADE" and not token_id:
+            continue
+        if not condition_id and not title:
+            continue
+        group_token = token_id if activity_type == "TRADE" else ""
+        group_outcome = outcome if activity_type == "TRADE" else ""
+        key = (condition_id, "", "")
+        group = groups.setdefault(
+            key,
+            {
+                "asset": group_token,
+                "condition_id": condition_id,
+                "title": title,
+                "slug": slug,
+                "event_slug": event_slug,
+                "outcome": group_outcome,
+                "size": 0.0,
+                "avg_price": 0.0,
+                "cur_price": 0.0,
+                "initial_value": 0.0,
+                "current_value": 0.0,
+                "cash_pnl": 0.0,
+                "percent_pnl": 0.0,
+                "realized_pnl": 0.0,
+                "total_bought": 0.0,
+                "redeemed_value": 0.0,
+                "redeem_count": 0,
+                "redeemed_size": 0.0,
+                "sold_value": 0.0,
+                "buy_notional": 0.0,
+                "sell_notional": 0.0,
+                "buy_size": 0.0,
+                "sell_size": 0.0,
+                "buy_count": 0,
+                "sell_count": 0,
+                "trade_count": 0,
+                "activity_count": 0,
+                "first_activity_at": None,
+                "last_activity_at": None,
+                "end_date": None,
+                "is_open": False,
+                "is_settled_or_redeemable": True,
+                "is_worldcup": False,
+            },
+        )
+        if title and not group.get("title"):
+            group["title"] = title
+        if slug and not group.get("slug"):
+            group["slug"] = slug
+        if event_slug and not group.get("event_slug"):
+            group["event_slug"] = event_slug
+        if group_token and not group.get("asset"):
+            group["asset"] = group_token
+        if group_outcome and not group.get("outcome"):
+            group["outcome"] = group_outcome
+        timestamp = api_datetime(row.get("timestamp"))
+        update_group_activity_bounds(group, timestamp)
+        notional = float_value(row.get("notional"))
+        size = float_value(row.get("size"))
+        price = float_value(row.get("price"))
+        group["activity_count"] = int_value(group.get("activity_count")) + 1
+        if activity_type == "TRADE":
+            group["trade_count"] = int_value(group.get("trade_count")) + 1
+            if side == "BUY":
+                group["buy_count"] = int_value(group.get("buy_count")) + 1
+                group["buy_notional"] = float_value(group.get("buy_notional")) + notional
+                group["buy_size"] = float_value(group.get("buy_size")) + size
+                group["total_bought"] = float_value(group.get("total_bought")) + size
+            elif side == "SELL":
+                group["sell_count"] = int_value(group.get("sell_count")) + 1
+                group["sell_notional"] = float_value(group.get("sell_notional")) + notional
+                group["sell_size"] = float_value(group.get("sell_size")) + size
+        elif activity_type in ("REDEEM", "REDEMPTION"):
+            group["redeem_count"] = int_value(group.get("redeem_count")) + 1
+            group["redeemed_size"] = float_value(group.get("redeemed_size")) + size
+            group["redeemed_value"] = float_value(group.get("redeemed_value")) + notional
+            if not group.get("outcome"):
+                group["outcome"] = "结算"
+
+    positions = []
+    for group in groups.values():
+        buy_size = float_value(group.get("buy_size"))
+        sell_size = float_value(group.get("sell_size"))
+        buy_notional = float_value(group.get("buy_notional"))
+        sell_notional = float_value(group.get("sell_notional"))
+        redeemed_value = float_value(group.get("redeemed_value"))
+        redeem_count = int_value(group.get("redeem_count"))
+        remaining_size = max(0.0, buy_size - sell_size)
+        recovered = sell_notional + redeemed_value
+        pnl = recovered - buy_notional
+        dust_threshold = max(0.01, buy_size * 0.0001)
+        is_open = remaining_size > dust_threshold and recovered <= 0 and redeem_count <= 0
+        group["size"] = remaining_size if is_open else max(buy_size, sell_size)
+        group["avg_price"] = buy_notional / buy_size if buy_size else 0.0
+        group["initial_value"] = buy_notional
+        group["current_value"] = 0.0
+        group["cash_pnl"] = pnl
+        group["realized_pnl"] = pnl
+        group["sold_value"] = sell_notional
+        group["percent_pnl"] = (pnl / buy_notional * 100.0) if buy_notional else 0.0
+        group["cost_basis_estimate"] = buy_notional
+        group["is_open"] = is_open
+        group["is_settled_or_redeemable"] = not group["is_open"]
+        group["is_worldcup"] = str(group.get("slug") or "").startswith("fifwc-") or str(
+            group.get("event_slug") or ""
+        ).startswith("fifwc-")
+        group["end_date"] = group.get("last_activity_at")
+        if (include_open or group["is_settled_or_redeemable"]) and (
+            buy_notional > 0 or recovered > 0 or redeem_count > 0
+        ):
+            positions.append(group)
+    return sort_wallet_positions(positions, "abs_pnl")
+
+
+def wallet_risk_metrics(
+    closed_positions: list[dict[str, Any]],
+    pnl_points: list[dict[str, Any]],
+) -> dict[str, Any]:
+    realized_positions = [
+        position
+        for position in closed_positions
+        if float_value(position.get("initial_value")) > 0
+        or float_value(position.get("sold_value")) > 0
+        or float_value(position.get("redeemed_value")) > 0
+    ]
+    completed_count = len(realized_positions)
+    pnl_values = [float_value(position.get("cash_pnl")) for position in realized_positions]
+    positive_pnl = sum(value for value in pnl_values if value > 0)
+    negative_pnl = sum(value for value in pnl_values if value < 0)
+    profitable_count = sum(1 for value in pnl_values if value > 0)
+    losing_count = sum(1 for value in pnl_values if value < 0)
+    buy_notional = sum(float_value(position.get("initial_value")) for position in realized_positions)
+    total_pnl = positive_pnl + negative_pnl
+    settled_positions = [
+        position for position in realized_positions if int_value(position.get("redeem_count")) > 0
+    ]
+    short_positions = [
+        position
+        for position in realized_positions
+        if wallet_position_holding_seconds(position) is not None
+        and wallet_position_holding_seconds(position) <= 86_400
+    ]
+    return {
+        "completed_event_count": completed_count if completed_count else None,
+        "profitable_event_count": profitable_count if completed_count else None,
+        "losing_event_count": losing_count if completed_count else None,
+        "realized_pnl": total_pnl if completed_count else None,
+        "win_rate": profitable_count / completed_count if completed_count else None,
+        "profit_factor": positive_pnl / abs(negative_pnl) if negative_pnl < 0 else None,
+        "max_drawdown": wallet_max_drawdown(pnl_points),
+        "sharpe_ratio": wallet_sharpe_ratio(pnl_points),
+        "short_term_ratio": len(short_positions) / completed_count if completed_count else None,
+        "short_term_win_rate": (
+            sum(1 for position in short_positions if float_value(position.get("cash_pnl")) > 0)
+            / len(short_positions)
+            if short_positions
+            else None
+        ),
+        "short_term_value": (
+            sum(float_value(position.get("cash_pnl")) for position in short_positions)
+            if short_positions
+            else None
+        ),
+        "settlement_ratio": len(settled_positions) / completed_count if completed_count else None,
+        "settlement_win_rate": (
+            sum(1 for position in settled_positions if float_value(position.get("cash_pnl")) > 0)
+            / len(settled_positions)
+            if settled_positions
+            else None
+        ),
+        "avg_event_roi": total_pnl / buy_notional if buy_notional else None,
+        "prediction_score": total_pnl / buy_notional if buy_notional else None,
+    }
+
+
+def wallet_performance_metrics(closed_positions: list[dict[str, Any]]) -> dict[str, Any]:
+    realized_positions = [
+        position
+        for position in closed_positions
+        if float_value(position.get("initial_value")) > 0
+        or float_value(position.get("sold_value")) > 0
+        or float_value(position.get("redeemed_value")) > 0
+    ]
+    holding_seconds = []
+    add_counts = []
+    for position in realized_positions:
+        duration = wallet_position_holding_seconds(position)
+        if duration is not None and duration > 0:
+            holding_seconds.append(duration)
+        buy_count = int_value(position.get("buy_count"))
+        if buy_count <= 0 and float_value(position.get("buy_notional")) > 0:
+            buy_count = 1
+        if buy_count > 0:
+            add_counts.append(max(0, buy_count - 1))
+    return {
+        "avg_holding_seconds": (
+            sum(holding_seconds) / len(holding_seconds) if holding_seconds else None
+        ),
+        "holding_sample_count": len(holding_seconds),
+        "holding_position_count": len(realized_positions),
+        "avg_add_count": sum(add_counts) / len(add_counts) if add_counts else None,
+        "add_sample_count": len(add_counts),
+    }
+
+
+def merge_closed_positions(
+    closed_activity_positions: list[dict[str, Any]],
+    snapshot_positions: list[dict[str, Any]],
+    *,
+    all_activity_positions: list[dict[str, Any]] | None = None,
+) -> list[dict[str, Any]]:
+    merged = list(closed_activity_positions)
+    activity_by_key = {
+        wallet_position_key(position): position for position in (all_activity_positions or [])
+    }
+    seen = {wallet_position_key(position) for position in merged}
+    seen_condition_ids = {
+        str(position.get("condition_id") or "")
+        for position in merged
+        if str(position.get("condition_id") or "")
+    }
+    for position in snapshot_positions:
+        if not position.get("is_settled_or_redeemable"):
+            continue
+        key = wallet_position_key(position)
+        condition_id = str(position.get("condition_id") or "")
+        if key in seen or (condition_id and condition_id in seen_condition_ids):
+            continue
+        activity_position = activity_by_key.get(key, {})
+        closed = dict(position)
+        closed["is_open"] = False
+        closed["is_settled_or_redeemable"] = True
+        closed.setdefault("sold_value", 0.0)
+        closed.setdefault("redeemed_value", 0.0)
+        closed.setdefault("buy_notional", float_value(closed.get("initial_value")))
+        closed.setdefault("sell_notional", 0.0)
+        closed.setdefault("redeem_count", 1 if closed.get("redeemable") else 0)
+        closed["first_activity_at"] = activity_position.get("first_activity_at")
+        closed["last_activity_at"] = (
+            activity_position.get("last_activity_at")
+            or closed.get("last_activity_at")
+            or closed.get("end_date")
+        )
+        if activity_position:
+            activity_buy_notional = value_or_fallback(
+                activity_position.get("buy_notional"),
+                closed.get("buy_notional"),
+            )
+            closed["buy_notional"] = activity_buy_notional
+            closed["sell_notional"] = value_or_fallback(
+                activity_position.get("sell_notional"),
+                closed.get("sell_notional"),
+            )
+            closed["sold_value"] = value_or_fallback(
+                activity_position.get("sold_value"),
+                closed.get("sold_value"),
+            )
+            closed["trade_count"] = activity_position.get("trade_count")
+            closed["activity_count"] = activity_position.get("activity_count")
+            closed["buy_count"] = activity_position.get("buy_count")
+            closed["sell_count"] = activity_position.get("sell_count")
+            recovered = float_value(closed.get("sold_value")) + float_value(
+                closed.get("redeemed_value")
+            )
+            if recovered <= 0 and float_value(activity_buy_notional) > 0:
+                closed["initial_value"] = float_value(activity_buy_notional)
+                closed["cost_basis_estimate"] = float_value(activity_buy_notional)
+                closed["cash_pnl"] = -float_value(activity_buy_notional)
+                closed["realized_pnl"] = -float_value(activity_buy_notional)
+                closed["percent_pnl"] = -100.0
+        merged.append(closed)
+        seen.add(key)
+        if condition_id:
+            seen_condition_ids.add(condition_id)
+    return sort_wallet_positions(merged, "abs_pnl")
+
+
+def wallet_position_key(position: dict[str, Any]) -> tuple[str, str, str]:
+    return (
+        str(position.get("condition_id") or ""),
+        str(position.get("asset") or ""),
+        str(position.get("outcome") or ""),
+    )
+
+
+def wallet_position_holding_seconds(position: dict[str, Any]) -> float | None:
+    first = parse_clickhouse_datetime(position.get("first_activity_at"))
+    last = parse_clickhouse_datetime(position.get("last_activity_at") or position.get("end_date"))
+    if first is None or last is None:
+        return None
+    return max(0.0, (last - first).total_seconds())
+
+
+def wallet_max_drawdown(points: list[dict[str, Any]]) -> float | None:
+    peak: float | None = None
+    drawdown = 0.0
+    for point in points:
+        value = float_value(point.get("pnl"))
+        if peak is None:
+            peak = value
+            continue
+        peak = max(peak, value)
+        drawdown = min(drawdown, value - peak)
+    return abs(drawdown) if drawdown < 0 else None
+
+
+def wallet_sharpe_ratio(points: list[dict[str, Any]]) -> float | None:
+    ordered = [
+        point
+        for point in points
+        if int_value(point.get("timestamp")) > 0 and point.get("pnl") is not None
+    ]
+    if len(ordered) < 3:
+        return None
+    deltas = [
+        float_value(current.get("pnl")) - float_value(previous.get("pnl"))
+        for previous, current in zip(ordered, ordered[1:])
+    ]
+    if len(deltas) < 2:
+        return None
+    mean_delta = sum(deltas) / len(deltas)
+    variance = sum((value - mean_delta) ** 2 for value in deltas) / (len(deltas) - 1)
+    if variance <= 0:
+        return None
+    return mean_delta / math.sqrt(variance) * math.sqrt(len(deltas))
+
+
+def update_group_activity_bounds(group: dict[str, Any], timestamp: str | None) -> None:
+    if not timestamp:
+        return
+    first = str(group.get("first_activity_at") or "")
+    last = str(group.get("last_activity_at") or "")
+    if not first or timestamp < first:
+        group["first_activity_at"] = timestamp
+    if not last or timestamp > last:
+        group["last_activity_at"] = timestamp
+
+
+def activity_raw_json(row: dict[str, Any]) -> dict[str, Any]:
+    raw_json = row.get("raw_json")
+    if isinstance(raw_json, dict):
+        return raw_json
+    try:
+        parsed = json.loads(str(raw_json or "{}"))
+    except json.JSONDecodeError:
+        return {}
+    return parsed if isinstance(parsed, dict) else {}
 
 
 def wallet_positions_from_snapshot(snapshot: dict[str, Any] | None) -> list[dict[str, Any]]:
@@ -2587,13 +5336,68 @@ def wallet_pnl_delta(points: list[dict[str, Any]], *, days: int) -> float | None
         return None
     latest = dated_points[-1]
     cutoff = int_value(latest.get("timestamp")) - days * 86400
-    baseline = dated_points[0]
+    baseline = None
     for point in dated_points:
         if int_value(point.get("timestamp")) <= cutoff:
             baseline = point
         else:
             break
+    if baseline is None:
+        return 0.0
     return float_value(latest.get("pnl")) - float_value(baseline.get("pnl"))
+
+
+def datetime_lag_minutes(older: Any, newer: Any) -> float | None:
+    older_dt = parse_clickhouse_datetime(older)
+    newer_dt = parse_clickhouse_datetime(newer)
+    if older_dt is None or newer_dt is None:
+        return None
+    return max(0.0, (newer_dt - older_dt).total_seconds() / 60.0)
+
+
+def parse_clickhouse_datetime(value: Any) -> datetime | None:
+    if value in (None, ""):
+        return None
+    if isinstance(value, datetime):
+        return value if value.tzinfo else value.replace(tzinfo=UTC)
+    if isinstance(value, (int, float)):
+        timestamp = float(value)
+        if timestamp > 10_000_000_000:
+            timestamp = timestamp / 1000
+        try:
+            return datetime.fromtimestamp(timestamp, UTC)
+        except (OSError, OverflowError, ValueError):
+            return None
+    text = str(value).strip()
+    if not text:
+        return None
+    if text.isdigit():
+        return parse_clickhouse_datetime(int(text))
+    if text.endswith("Z"):
+        text = text[:-1] + "+00:00"
+    if " " in text and "T" not in text:
+        text = text.replace(" ", "T", 1)
+    try:
+        parsed = datetime.fromisoformat(text)
+    except ValueError:
+        return None
+    return parsed if parsed.tzinfo else parsed.replace(tzinfo=UTC)
+
+
+def wallet_data_freshness_status(
+    pnl_captured_at: Any,
+    portfolio_captured_at: Any,
+    pnl_lag_minutes: float | None,
+) -> str:
+    if not pnl_captured_at and not portfolio_captured_at:
+        return "missing"
+    if not pnl_captured_at:
+        return "pnl_missing"
+    if not portfolio_captured_at:
+        return "portfolio_missing"
+    if pnl_lag_minutes is not None and pnl_lag_minutes > 10:
+        return "pnl_lagging"
+    return "ok"
 
 
 def empty_wallet_activity_summary(user: str) -> dict[str, Any]:
@@ -2868,6 +5672,17 @@ def float_value(value: Any) -> float:
         return 0.0
 
 
+def value_or_fallback(value: Any, fallback: Any) -> Any:
+    if value in (None, ""):
+        return fallback
+    try:
+        if isinstance(value, float) and math.isnan(value):
+            return fallback
+    except TypeError:
+        return fallback
+    return value
+
+
 def int_value(value: Any) -> int:
     try:
         return int(float(value or 0))
@@ -3001,6 +5816,207 @@ def ratio_percent(value: float, total: float) -> float:
 def param(query: dict[str, list[str]], key: str, default: str = "") -> str:
     value = query.get(key, [default])[0]
     return str(value or default)
+
+
+def truthy_param(query: dict[str, list[str]], key: str) -> bool:
+    return param(query, key).lower() in ("1", "true", "yes", "on")
+
+
+def bool_param(query: dict[str, list[str]], key: str, default: bool) -> bool:
+    raw = param(query, key, "1" if default else "0").strip().lower()
+    if raw in ("1", "true", "yes", "on"):
+        return True
+    if raw in ("0", "false", "no", "off"):
+        return False
+    return default
+
+
+def wallet_screener_range_filter(value: str) -> str:
+    normalized = str(value or "").strip().lower()
+    if normalized in ("1d", "1day", "day", "24h"):
+        return "trades.timestamp >= now64(3) - interval 1 day"
+    if normalized in ("7d", "7day", "week"):
+        return "trades.timestamp >= now64(3) - interval 7 day"
+    if normalized in ("30d", "30day", "month"):
+        return "trades.timestamp >= now64(3) - interval 30 day"
+    return ""
+
+
+def wallet_screener_category_filter(value: str) -> str:
+    return wallet_category_filter(value, raw_json_expr="trades.raw_json")
+
+
+def wallet_category_filter(value: str, *, raw_json_expr: str) -> str:
+    normalized = str(value or "").strip().lower()
+    if not normalized or normalized in ("all", "全部"):
+        return ""
+    terms_by_category = {
+        "sports": [
+            "Sports",
+            "NBA",
+            "Olympics",
+            "World Cup",
+            "FIFA",
+            "soccer",
+            "football",
+            "basketball",
+            "tennis",
+            "golf",
+            "ufc",
+            "f1",
+            "formula",
+        ],
+        "体育": [
+            "Sports",
+            "NBA",
+            "Olympics",
+            "World Cup",
+            "FIFA",
+            "soccer",
+            "football",
+            "basketball",
+            "tennis",
+            "golf",
+            "ufc",
+            "f1",
+            "formula",
+        ],
+        "politics": [
+            "Politics",
+            "US-current-affairs",
+            "Global Politics",
+            "election",
+            "congress",
+            "senate",
+            "trump",
+            "biden",
+            "referendum",
+            "government",
+        ],
+        "政治": [
+            "Politics",
+            "US-current-affairs",
+            "Global Politics",
+            "election",
+            "congress",
+            "senate",
+            "trump",
+            "biden",
+            "referendum",
+            "government",
+        ],
+        "crypto": [
+            "Crypto",
+            "Bitcoin",
+            "BTC",
+            "Ethereum",
+            "ETH",
+            "Solana",
+            "SOL",
+            "XRP",
+            "Dogecoin",
+            "crypto",
+        ],
+        "加密货币": [
+            "Crypto",
+            "Bitcoin",
+            "BTC",
+            "Ethereum",
+            "ETH",
+            "Solana",
+            "SOL",
+            "XRP",
+            "Dogecoin",
+            "crypto",
+        ],
+        "esports": ["Esports", "E-Sports", "gaming", "LoL", "Dota", "Valorant", "Counter-Strike"],
+        "电竞": ["Esports", "E-Sports", "gaming", "LoL", "Dota", "Valorant", "Counter-Strike"],
+        "iran": ["Iran", "Iranian"],
+        "伊朗": ["Iran", "Iranian"],
+        "finance": [
+            "Finance",
+            "Business",
+            "stock",
+            "NASDAQ",
+            "S&P",
+            "Fed",
+            "rates",
+            "Treasury",
+        ],
+        "金融": [
+            "Finance",
+            "Business",
+            "stock",
+            "NASDAQ",
+            "S&P",
+            "Fed",
+            "rates",
+            "Treasury",
+        ],
+        "geopolitics": [
+            "Global Politics",
+            "geopolitics",
+            "Ukraine",
+            "Russia",
+            "Israel",
+            "Gaza",
+            "China",
+            "war",
+            "tariff",
+        ],
+        "地缘政治": [
+            "Global Politics",
+            "geopolitics",
+            "Ukraine",
+            "Russia",
+            "Israel",
+            "Gaza",
+            "China",
+            "war",
+            "tariff",
+        ],
+        "tech": ["Tech", "Science", "AI", "OpenAI", "Apple", "Tesla", "SpaceX"],
+        "科技": ["Tech", "Science", "AI", "OpenAI", "Apple", "Tesla", "SpaceX"],
+        "culture": [
+            "Pop-Culture",
+            "Culture",
+            "Art",
+            "music",
+            "movie",
+            "celebrity",
+            "Oscars",
+        ],
+        "文化": [
+            "Pop-Culture",
+            "Culture",
+            "Art",
+            "music",
+            "movie",
+            "celebrity",
+            "Oscars",
+        ],
+        "economy": ["Economy", "Business", "GDP", "inflation", "recession", "unemployment", "CPI"],
+        "经济": ["Economy", "Business", "GDP", "inflation", "recession", "unemployment", "CPI"],
+        "weather": ["Weather", "temperature", "hurricane", "rain", "snow", "storm"],
+        "天气": ["Weather", "temperature", "hurricane", "rain", "snow", "storm"],
+        "election": ["Election", "election", "primary", "vote", "winner", "nominee"],
+        "选举": ["Election", "election", "primary", "vote", "winner", "nominee"],
+        "mentions": ["mention", "mentions", "say", "tweet", "Truth Social", "post"],
+        "提及": ["mention", "mentions", "say", "tweet", "Truth Social", "post"],
+    }
+    terms = terms_by_category.get(normalized, [value])
+    haystack = (
+        "concat("
+        "events.category, ' ', events.title, ' ', markets.question, ' ', "
+        f"JSONExtractString({raw_json_expr}, 'title'), ' ', "
+        f"JSONExtractString({raw_json_expr}, 'slug'), ' ', "
+        f"JSONExtractString({raw_json_expr}, 'eventSlug')"
+        ")"
+    )
+    return "(" + " or ".join(
+        f"positionCaseInsensitive({haystack}, {ch_string(term)}) > 0"
+        for term in terms
+    ) + ")"
 
 
 def int_param(query: dict[str, list[str]], key: str, default: int, *, maximum: int) -> int:
