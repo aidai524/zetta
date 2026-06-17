@@ -1,23 +1,38 @@
+@font-face {
+  font-family: "Polymarket Inter";
+  src: url("https://polymarket.com/_next/static/media/InterVariable-s.p.0r27kd5h06n72.woff2") format("woff2");
+  font-display: swap;
+  font-style: normal;
+  font-weight: 100 900;
+}
+
 :root {
-  color-scheme: dark;
-  --bg: #050505;
-  --panel: #101010;
-  --panel-2: #151515;
-  --panel-3: #1e1e1e;
-  --line: #222;
-  --line-soft: #1a1a1a;
-  --text: #e7e7e7;
-  --muted: #8b8b8b;
-  --muted-2: #5f5f5f;
-  --green: #20b99d;
-  --pink: #df3567;
-  --orange: #fb970f;
-  --purple: #853ce6;
-  --blue: #83b1e8;
-  --amber: #e59b24;
-  --chip: #181818;
-  --shadow: 0 22px 70px rgba(0, 0, 0, 0.58);
-  font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, "Helvetica Neue", Arial, "Noto Sans", sans-serif;
+  color-scheme: light;
+  --bg: #ffffff;
+  --panel: #ffffff;
+  --panel-2: #f4f5f6;
+  --panel-3: #e6e8ea;
+  --line: #e6e8ea;
+  --line-soft: #f4f5f6;
+  --text: #18181b;
+  --muted: #77808d;
+  --muted-2: #5f6772;
+  --green: #30a159;
+  --pink: #e23939;
+  --orange: #1452f0;
+  --purple: #1452f0;
+  --blue: #1452f0;
+  --amber: #b75000;
+  --chip: #f4f5f6;
+  --brand: #1452f0;
+  --brand-hover: #1249d8;
+  --brand-soft: rgba(20, 82, 240, 0.1);
+  --brand-line: rgba(20, 82, 240, 0.25);
+  --success-soft: #ecf9f1;
+  --danger-soft: #fcebeb;
+  --warning-soft: #fef3c6;
+  --shadow: 0 12px 32px rgba(16, 24, 40, 0.1);
+  font-family: "Polymarket Inter", Inter, -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, "Helvetica Neue", Arial, "Noto Sans", sans-serif;
   background: var(--bg);
   color: var(--text);
 }
@@ -1260,33 +1275,33 @@ tbody tr:hover td {
   transform-origin: top center;
 }
 
-.trade-row-new {
-  animation: liveTradePush 2.8s cubic-bezier(0.16, 1, 0.3, 1);
+.trade-row-new td {
+  animation: liveTradeInsert 1.2s cubic-bezier(0.16, 1, 0.3, 1);
 }
 
-@keyframes liveTradePush {
+@keyframes liveTradeInsert {
   0% {
     opacity: 0;
-    transform: translateY(-18px);
-    background: rgba(32, 185, 157, 0.22);
-    box-shadow: inset 3px 0 0 rgba(32, 185, 157, 0.9);
+    transform: translateY(-22px);
+    background: var(--brand-soft);
+    box-shadow: inset 3px 0 0 var(--brand);
   }
-  18% {
+  28% {
     opacity: 1;
     transform: translateY(0);
-    background: rgba(32, 185, 157, 0.18);
-    box-shadow: inset 3px 0 0 rgba(32, 185, 157, 0.85);
+    background: var(--brand-soft);
+    box-shadow: inset 3px 0 0 var(--brand);
   }
   100% {
     opacity: 1;
     transform: translateY(0);
     background: transparent;
-    box-shadow: inset 0 0 0 rgba(32, 185, 157, 0);
+    box-shadow: inset 0 0 0 rgba(20, 82, 240, 0);
   }
 }
 
 @media (prefers-reduced-motion: reduce) {
-  .trade-row-new {
+  .trade-row-new td {
     animation: none;
   }
 }
@@ -1913,5 +1928,384 @@ tbody tr:hover td {
 
   .status-pill {
     display: none;
+  }
+}
+
+/* Polymarket-inspired light theme pass for discovery. */
+body,
+.page,
+.track-main {
+  background: var(--bg);
+  color: var(--text);
+}
+
+body {
+  font-family: inherit;
+}
+
+::selection {
+  background: var(--brand-line);
+  color: #ffffff;
+}
+
+.app-header {
+  background: rgba(255, 255, 255, 0.96);
+  border-bottom-color: var(--line);
+  backdrop-filter: blur(10px);
+}
+
+.zetta-mark,
+.profile-btn,
+.avatar,
+.rank-avatar {
+  background: var(--brand);
+  color: #ffffff;
+  box-shadow: inset 0 0 0 1px rgba(255, 255, 255, 0.1);
+}
+
+.logo-title,
+.nav-item.active,
+.value-main,
+.asset-value,
+.kpi-value,
+.metric-row strong,
+.panel-title,
+.deal-title,
+.leader-market strong,
+.analysis-title-row h1,
+.analysis-summary p,
+.metric-tile strong,
+.analysis-card-head h2,
+.evidence-label strong,
+.evidence-value,
+.modal-title {
+  color: var(--text);
+}
+
+.nav,
+.nav-item,
+.search,
+.mini,
+.icon-btn,
+.sub-toolbar,
+.section-title span + span,
+.wallet-meta,
+.profile-meta,
+.small-muted,
+.muted,
+.empty-state,
+.loading-panel,
+.bottom-nav,
+.status-pill,
+.kpi-label,
+.reward-note,
+.calendar-head,
+.metric-row,
+.metric-tile span,
+.deal-label,
+.detail-filters,
+.filter-label,
+.tag-icons,
+.category-muted,
+.analysis-card-head span,
+.evidence-label span,
+.modal-head .close-btn,
+.muted-icon {
+  color: var(--muted-2);
+}
+
+.search,
+.mini,
+.icon-btn,
+.recharge,
+.slash-key,
+.segmented,
+.list-search,
+.leader-search,
+.action-button,
+.filter-button,
+.followed,
+.external,
+.status-pill,
+.back-btn,
+.focus-chip,
+.category-chip,
+.select,
+.tab-search,
+.square-tool,
+.deal-card,
+.leader-tabs,
+.filter-select,
+.range-row,
+.leader-dropdown,
+.view-btn,
+.category-nav button,
+.severity-pill,
+.metric-tile,
+.analysis-card,
+.analysis-summary,
+.analysis-empty button,
+.modal,
+.modal-input,
+.scan-button,
+.range-row input {
+  border-color: var(--line);
+  background: var(--panel-2);
+  color: var(--text);
+}
+
+.bell-dot::after {
+  background: var(--pink);
+}
+
+.sub-toolbar .divider,
+.empty-space {
+  border-color: var(--line-soft);
+}
+
+.sub-toolbar .divider,
+.panel-sep {
+  background: var(--line-soft);
+}
+
+.sub-toolbar,
+.bottom-ticker {
+  background: var(--panel);
+  border-color: var(--line-soft);
+}
+
+.list-title-row,
+.leaderboard-title-row,
+.trade-filters,
+.analysis-title-row,
+.tabs,
+.panel-title,
+.calendar-head,
+.modal-head,
+.modal-foot,
+.evidence-row,
+.panel-sep {
+  border-color: var(--line-soft);
+}
+
+.segmented,
+.leader-tabs {
+  background: var(--panel);
+}
+
+.segmented button,
+.leader-tabs button,
+.tab,
+.category-nav button {
+  color: var(--muted-2);
+}
+
+.segmented button.active,
+.leader-tabs button.active,
+.tab.active,
+.category-nav button.active {
+  background: var(--panel-3);
+  color: var(--text);
+}
+
+.list-search input::placeholder,
+.leader-search input::placeholder,
+.modal-input::placeholder,
+.range-row input::placeholder {
+  color: var(--muted-2);
+}
+
+.action-button:hover,
+.filter-button:hover,
+.followed:hover,
+.external:hover,
+.back-btn:hover,
+.view-btn:hover,
+.category-nav button:hover,
+.analysis-empty button:hover,
+.scan-button:hover,
+.close-btn:hover,
+.square-tool:hover {
+  background: var(--panel-3);
+  border-color: var(--line);
+  color: var(--text);
+}
+
+.action-button.disabled,
+.followed.muted {
+  color: var(--muted-2);
+}
+
+th {
+  background: var(--panel-2);
+  border-bottom-color: var(--line);
+  color: var(--muted-2);
+}
+
+td {
+  border-bottom-color: var(--line-soft);
+}
+
+tbody tr {
+  background: var(--panel);
+}
+
+tbody tr:hover td {
+  background: var(--panel-3);
+}
+
+.panel,
+.positions {
+  background: var(--panel);
+  border-color: var(--line);
+}
+
+.heat-cell,
+.rank-number,
+.bar-track {
+  background: var(--panel-3);
+  color: var(--muted-2);
+}
+
+.wallet-name,
+.smart-name,
+.profile-name,
+.analysis-kicker,
+.plain-link,
+.orange,
+.metric-row strong.orange,
+.sub-toolbar .star {
+  color: var(--brand);
+}
+
+.live-pill {
+  border-color: var(--brand-line);
+  background: var(--brand-soft);
+  color: var(--brand);
+}
+
+.positive,
+.money-icon,
+.heat-cell.green,
+.trade-type.buy,
+.result-pill,
+.severity-pill.none {
+  color: var(--green);
+}
+
+.money-icon,
+.money-icon::after {
+  border-color: var(--green);
+}
+
+.negative,
+.heart,
+.external.danger:hover,
+.heat-cell.red,
+.trade-type.sell,
+.result-pill.no,
+.bar-fill.cold,
+.severity-pill.medium,
+.severity-pill.high,
+.severity-pill.critical {
+  color: var(--pink);
+}
+
+.trade-type.buy,
+.result-pill,
+.severity-pill.none,
+.heat-cell.green {
+  background: var(--success-soft);
+}
+
+.trade-type.sell,
+.result-pill.no,
+.severity-pill.medium,
+.severity-pill.high,
+.severity-pill.critical,
+.heat-cell.red,
+.notice {
+  background: var(--danger-soft);
+  border-color: rgba(226, 57, 57, 0.34);
+}
+
+.notice {
+  color: #951616;
+}
+
+.severity-pill.low {
+  border-color: rgba(248, 215, 67, 0.36);
+  background: var(--warning-soft);
+  color: var(--amber);
+}
+
+.bar-fill,
+.dot {
+  background: var(--green);
+}
+
+.primary-wide,
+.fake-check.checked {
+  border-color: var(--brand);
+  background: var(--brand);
+  color: #ffffff;
+}
+
+.filter-select.open {
+  border-color: var(--brand-line);
+}
+
+.check-item {
+  color: var(--text);
+}
+
+.check-item:hover {
+  background: var(--panel-3);
+}
+
+.fake-check {
+  border-color: var(--line);
+  color: #ffffff;
+}
+
+.medal.gold {
+  background: #f8d743;
+}
+
+.medal.silver {
+  background: #bbc4cd;
+}
+
+.medal.bronze {
+  background: #8c6b4f;
+}
+
+.leader-dropdown,
+.overlay .modal {
+  box-shadow: var(--shadow);
+}
+
+.overlay {
+  background: rgba(14, 15, 17, 0.28);
+}
+
+@keyframes liveTradeInsert {
+  0% {
+    opacity: 0;
+    transform: translateY(-22px);
+    background: var(--brand-soft);
+    box-shadow: inset 3px 0 0 var(--brand);
+  }
+  28% {
+    opacity: 1;
+    transform: translateY(0);
+    background: var(--brand-soft);
+    box-shadow: inset 3px 0 0 var(--brand);
+  }
+  100% {
+    opacity: 1;
+    transform: translateY(0);
+    background: transparent;
+    box-shadow: inset 0 0 0 rgba(20, 82, 240, 0);
   }
 }

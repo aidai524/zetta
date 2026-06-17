@@ -516,22 +516,30 @@ function App() {
   }, [smartCategory, smartRange]);
 
   const mergeLiveTrades = useCallback((rows: RecentTrade[]) => {
+    const previousNewestTime = tradeTimestamp(liveTradeCacheRef.current[0]);
+    const incomingByKey = new Map(rows.map((row) => [tradeCacheKey(row), row]));
     const incomingKeys = rows.map(tradeCacheKey);
     const newKeys = [...new Set(incomingKeys.filter((key) => !seenTradeKeysRef.current.has(key)))];
+    const insertKeys = newKeys
+      .filter((key) => {
+        const row = incomingByKey.get(key);
+        return row && previousNewestTime > 0 && tradeTimestamp(row) >= previousNewestTime;
+      })
+      .slice(0, 25);
     const merged = mergeTradeRows(liveTradeCacheRef.current, rows, LIVE_TRADES_CACHE_LIMIT);
     seenTradeKeysRef.current = new Set(merged.map(tradeCacheKey));
     liveTradeCacheRef.current = merged;
     setLiveTradeCache(merged);
     saveLiveTradesCache(merged);
-    if (newKeys.length && liveTradesInitializedRef.current) {
-      setNewTradeKeys((current) => new Set([...current, ...newKeys]));
+    if (insertKeys.length && liveTradesInitializedRef.current) {
+      setNewTradeKeys((current) => new Set([...current, ...insertKeys]));
       window.setTimeout(() => {
         setNewTradeKeys((current) => {
           const next = new Set(current);
-          for (const key of newKeys) next.delete(key);
+          for (const key of insertKeys) next.delete(key);
           return next;
         });
-      }, 2800);
+      }, 1200);
     }
     liveTradesInitializedRef.current = true;
     return merged;
@@ -1416,7 +1424,7 @@ function TradeTable({ rows, newTradeKeys }: { rows: RecentTrade[]; newTradeKeys:
             const address = normalizeAddress(trade.user_address || "");
             const rowKey = tradeCacheKey(trade);
             return (
-              <tr key={rowKey} className={newTradeKeys.has(rowKey) ? "trade-row trade-row-new" : "trade-row"}>
+              <tr key={rowKey} data-row-key={rowKey} className={newTradeKeys.has(rowKey) ? "trade-row trade-row-new" : "trade-row"}>
                 <td className="muted">{formatRelativeTime(trade.timestamp)}</td>
                 <td><span className={`trade-type ${side === "SELL" ? "sell" : "buy"}`}>{side === "SELL" ? "卖出" : "买入"}</span></td>
                 <td><button className="trader-cell" type="button" onClick={() => navigateAddress(address)}>{walletBadgeColor(index)}<strong>{displayTraderName(trade)}</strong><span className="tag-icons">{trade.is_whale ? "💰" : ""}{trade.is_smart ? " ✽" : ""}</span></button></td>
