@@ -1,0 +1,34 @@
+[Unit]
+Description=Zetta unusual betting signal refresh worker
+After=network-online.target docker.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+EnvironmentFile=/etc/zetta/zetta.env
+ExecStart=/opt/zetta/.venv/bin/python -m zetta.cli \
+  --postgres-dsn ${ZETTA_POSTGRES_DSN} \
+  --clickhouse-host ${ZETTA_CLICKHOUSE_HOST} \
+  --clickhouse-port ${ZETTA_CLICKHOUSE_PORT} \
+  --clickhouse-user ${ZETTA_CLICKHOUSE_USER} \
+  --clickhouse-password ${ZETTA_CLICKHOUSE_PASSWORD} \
+  --clickhouse-database ${ZETTA_CLICKHOUSE_DATABASE} \
+  --polygon-rpc-url ${ZETTA_POLYGON_RPC_URL} \
+  --raw-data-dir ${ZETTA_RAW_DIR} \
+  --state-dir ${ZETTA_STATE_DIR} \
+  --raw-chunk-records ${ZETTA_RAW_CHUNK_RECORDS} \
+  --raw-chunk-seconds ${ZETTA_RAW_CHUNK_SECONDS} \
+  --task-store postgres \
+  --node-id ${ZETTA_NODE_ID}-unusual-betting \
+  --lease-seconds 900 \
+  tasks run-loop \
+    --task-kind unusual-betting-refresh \
+    --idle-sleep-seconds ${ZETTA_UNUSUAL_BETTING_WORKER_IDLE_SECONDS}
+Restart=always
+RestartSec=10
+MemoryAccounting=true
+MemoryMax=2G
+TasksMax=64
+
+[Install]
+WantedBy=multi-user.target

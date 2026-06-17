@@ -2,7 +2,15 @@ import json
 import re
 from types import SimpleNamespace
 
-from zetta.api import ProductApi, ch_string, collect_system_stats, int_param, rows_json
+from zetta.api import (
+    ProductApi,
+    ch_string,
+    collect_system_stats,
+    int_param,
+    rows_json,
+    unusual_betting_summary_response,
+    unusual_betting_cache_key,
+)
 from zetta.config import Settings
 
 
@@ -38,6 +46,147 @@ def test_product_api_market_search_returns_rows() -> None:
     assert response.status == 200
     assert response.body["markets"][0]["market_id"] == "m1"
     assert "positionCaseInsensitive" in fake.queries[0]
+
+
+def test_unusual_betting_cache_key_ignores_display_limits() -> None:
+    first = unusual_betting_cache_key(
+        event_ids=["2", "1"],
+        cold_price_threshold=0.25,
+        large_threshold=500_000,
+        very_large_threshold=1_000_000,
+        extreme_threshold=5_000_000,
+        include_related_markets=True,
+    )
+    second = unusual_betting_cache_key(
+        event_ids=["1", "2"],
+        cold_price_threshold=0.25,
+        large_threshold=500_000,
+        very_large_threshold=1_000_000,
+        extreme_threshold=5_000_000,
+        include_related_markets=True,
+    )
+
+    assert first == second
+
+
+def test_unusual_betting_summary_uses_persisted_cache() -> None:
+    class FakeCacheStore:
+        def get(self, _cache_key, *, max_age_seconds=None):
+            return {
+                "cache_key": "cache-1",
+                "refreshed_at": "2026-06-17T00:00:00+00:00",
+                "generated_at": "2026-06-17T00:00:00+00:00",
+                "age_seconds": 12.0,
+                "trigger_reason": "scheduled",
+                "error": None,
+                "detail": {
+                    "status": "ok",
+                    "event": {
+                        "event_id": "event-1",
+                        "slug": "fifwc-esp-cvi-2026-06-15",
+                        "title": "Spain vs. Cabo Verde",
+                    },
+                    "parameters": {
+                        "wallet_limit": 100,
+                        "trade_limit": 50,
+                        "large_threshold": 500000.0,
+                        "cold_price_threshold": 0.25,
+                    },
+                    "analysis": {
+                        "severity": "medium",
+                        "large_signal_wallet_count": 1,
+                        "very_large_signal_wallet_count": 0,
+                        "extreme_signal_wallet_count": 0,
+                        "signal_total_notional": 600000.0,
+                        "signal_outcome_count": 1,
+                        "thresholds": {"large_threshold": 500000.0},
+                    },
+                    "signal_wallet_summary": {
+                        "signal_wallet_count": 1,
+                        "abnormal_wallet_count": 1,
+                        "max_abnormal_wallet_notional": 600000.0,
+                    },
+                    "signal_wallets": [
+                        {
+                            "user_address": "0xabc",
+                            "total_notional": 600000.0,
+                            "max_notional": 300000.0,
+                            "fills": 2,
+                        }
+                    ],
+                    "signal_trades": [],
+                    "signal_outcomes": [],
+                    "generated_at": "2026-06-17T00:00:00+00:00",
+                },
+            }
+
+    event_row = (
+        '{"event_id":"event-1","slug":"fifwc-esp-cvi-2026-06-15",'
+        '"title":"Spain vs. Cabo Verde"}\n'
+    )
+    fake = FakeClickHouse(outputs=[event_row, event_row])
+    api = ProductApi(clickhouse=fake, settings=Settings(postgres_dsn="postgresql://example"))
+    api._unusual_betting_cache_store = FakeCacheStore()
+
+    response = api.handle(
+        "/events/unusual-betting/summary",
+        {"slug": ["fifwc-esp-cvi-2026-06-15"]},
+    )
+
+    assert response.status == 200
+    assert response.body["cache"]["source"] == "postgres_cache"
+    assert response.body["abnormal_wallet_count"] == 1
+    assert response.body["max_abnormal_wallet_notional"] == 600000.0
+    assert "from fact_exchange_fill" not in "\n".join(fake.queries)
+
+
+def test_unusual_betting_summary_filters_after_wallet_aggregation() -> None:
+    detail = {
+        "event": {"event_id": "event-1", "slug": "fifwc-test", "title": "Test Match"},
+        "parameters": {"large_threshold": 500000.0, "cold_price_threshold": 0.25},
+        "analysis": {
+            "severity": "medium",
+            "large_signal_wallet_count": 1,
+            "very_large_signal_wallet_count": 0,
+            "extreme_signal_wallet_count": 0,
+            "signal_total_notional": 600000.0,
+            "signal_outcome_count": 2,
+            "thresholds": {"large_threshold": 500000.0},
+        },
+        "signal_wallet_summary": {
+            "signal_wallet_count": 1,
+            "abnormal_wallet_count": 1,
+            "max_abnormal_wallet_notional": 600000.0,
+        },
+        "signal_wallets": [
+            {
+                "user_address": "0xabc",
+                "market_slug": "m1",
+                "question": "Q1",
+                "outcome": "Senegal",
+                "total_notional": 300000.0,
+                "max_notional": 300000.0,
+                "fills": 1,
+            },
+            {
+                "user_address": "0xabc",
+                "market_slug": "m2",
+                "question": "Q2",
+                "outcome": "No",
+                "total_notional": 300000.0,
+                "max_notional": 300000.0,
+                "fills": 1,
+            },
+        ],
+        "signal_trades": [],
+        "signal_outcomes": [],
+    }
+
+    summary = unusual_betting_summary_response(detail)
+
+    assert summary["abnormal_wallet_count"] == 1
+    assert summary["abnormal_wallets"][0]["user_address"] == "0xabc"
+    assert summary["abnormal_wallets"][0]["total_notional"] == 600000.0
 
 
 def test_product_api_market_search_worldcup_scope_adds_filter() -> None:

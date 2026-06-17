@@ -43,6 +43,10 @@ create index if not exists idx_collector_tasks_kind_status
 create unique index if not exists idx_collector_tasks_unique_work
   on collector_tasks (task_type, source, entity, md5(params::text));
 
+create unique index if not exists idx_collector_tasks_unique_dedupe_key
+  on collector_tasks (task_type, source, entity, (params->>'_dedupe_key'))
+  where params ? '_dedupe_key';
+
 create table if not exists collector_runs (
   id bigserial primary key,
   task_id bigint references collector_tasks(id),
@@ -116,3 +120,31 @@ create table if not exists tracked_wallets (
 
 create index if not exists idx_tracked_wallets_updated
   on tracked_wallets (updated_at desc);
+
+create table if not exists unusual_betting_cache (
+  cache_key text primary key,
+  event_id text not null default '',
+  event_slug text not null default '',
+  event_title text not null default '',
+  status text not null default '',
+  severity text not null default 'none',
+  abnormal_wallet_count integer not null default 0,
+  max_abnormal_wallet_notional double precision not null default 0,
+  signal_total_notional double precision not null default 0,
+  parameters jsonb not null default '{}'::jsonb,
+  summary jsonb not null default '{}'::jsonb,
+  detail jsonb not null default '{}'::jsonb,
+  trigger_reason text not null default '',
+  generated_at timestamptz,
+  refreshed_at timestamptz not null default now(),
+  error text
+);
+
+create index if not exists idx_unusual_betting_cache_refreshed
+  on unusual_betting_cache (refreshed_at desc);
+
+create index if not exists idx_unusual_betting_cache_event
+  on unusual_betting_cache (event_slug, refreshed_at desc);
+
+create index if not exists idx_unusual_betting_cache_severity
+  on unusual_betting_cache (severity, refreshed_at desc);

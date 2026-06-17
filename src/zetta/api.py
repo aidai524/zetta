@@ -24,6 +24,7 @@ from zetta.polymarket import PolymarketClient
 from zetta.scheduler.tasks import PostgresTaskStore, Task
 from zetta.storage.clickhouse import ClickHouseWriter
 from zetta.tracked_wallets import TrackedWalletStore, normalize_wallet_address
+from zetta.unusual_betting_cache import UnusualBettingCacheStore
 from zetta.worldcup_wallets import (
     RANKING_LIST_NAMES,
     base_match_slug,
@@ -53,6 +54,9 @@ class ProductApi:
         self._live_trades_cache: dict[tuple[Any, ...], tuple[float, dict[str, Any]]] = {}
         self._unusual_betting_cache: dict[tuple[Any, ...], tuple[float, dict[str, Any]]] = {}
         self._live_trades_lock = Lock()
+        self._unusual_betting_cache_store: UnusualBettingCacheStore | None = (
+            UnusualBettingCacheStore(dsn=settings.postgres_dsn) if settings is not None else None
+        )
 
     def handle(self, path: str, query: dict[str, list[str]]) -> ApiResponse:
         return self.handle_request("GET", path, query, None)
@@ -1718,6 +1722,16 @@ class ProductApi:
             minimum=0,
             maximum=900,
         )
+        persisted_cache_ttl_seconds = bounded_int_param(
+            query,
+            "persisted_cache_ttl_seconds",
+            3600,
+            minimum=0,
+            maximum=86_400,
+        )
+        use_persisted_cache = bool_param(query, "use_persisted_cache", True)
+        refresh = bool_param(query, "refresh", False)
+        trigger_reason = param(query, "trigger_reason", "api")
         cache_key = (
             tuple(event_ids),
             cold_price_threshold,
@@ -1728,8 +1742,82 @@ class ProductApi:
             trade_limit,
             include_related_markets,
         )
+        persisted_cache_key = unusual_betting_cache_key(
+            event_ids=event_ids,
+            cold_price_threshold=cold_price_threshold,
+            large_threshold=large_threshold,
+            very_large_threshold=very_large_threshold,
+            extreme_threshold=extreme_threshold,
+            include_related_markets=include_related_markets,
+        )
+        cached_row = None
+        if (
+            use_persisted_cache
+            and not refresh
+            and self._unusual_betting_cache_store is not None
+        ):
+            try:
+                cached_row = self._unusual_betting_cache_store.get(
+                    persisted_cache_key,
+                    max_age_seconds=persisted_cache_ttl_seconds
+                    if persisted_cache_ttl_seconds > 0
+                    else None,
+                )
+            except Exception:
+                cached_row = None
+            if cached_row is not None:
+                detail = dict(cached_row.get("detail") or {})
+                if detail and unusual_betting_cached_detail_satisfies(
+                    detail,
+                    wallet_limit=wallet_limit,
+                    trade_limit=trade_limit,
+                ):
+                    detail = unusual_betting_trim_cached_detail(
+                        detail,
+                        wallet_limit=wallet_limit,
+                        trade_limit=trade_limit,
+                    )
+                    detail["cache"] = unusual_betting_cache_metadata(
+                        cached_row,
+                        source="postgres_cache",
+                    )
+                    return detail
+            if cache_ttl_seconds > 0 and persisted_cache_ttl_seconds > 0:
+                try:
+                    cached_row = self._unusual_betting_cache_store.get(
+                        persisted_cache_key,
+                        max_age_seconds=None,
+                    )
+                except Exception:
+                    cached_row = None
+                if cached_row is not None:
+                    detail = dict(cached_row.get("detail") or {})
+                    if detail and unusual_betting_cached_detail_satisfies(
+                        detail,
+                        wallet_limit=wallet_limit,
+                        trade_limit=trade_limit,
+                    ):
+                        detail = unusual_betting_trim_cached_detail(
+                            detail,
+                            wallet_limit=wallet_limit,
+                            trade_limit=trade_limit,
+                        )
+                        detail["cache"] = unusual_betting_cache_metadata(
+                            cached_row,
+                            source="stale_postgres_cache",
+                        )
+                        return detail
+        stale_fallback_row = None
+        if (
+            use_persisted_cache
+            and self._unusual_betting_cache_store is not None
+            and cached_row is not None
+        ):
+            stale_fallback_row = cached_row
         cached = self._unusual_betting_cache.get(cache_key)
         if (
+            not refresh
+            and
             cache_ttl_seconds > 0
             and cached is not None
             and time.time() - cached[0] <= cache_ttl_seconds
@@ -1744,9 +1832,10 @@ class ProductApi:
             if str(row.get("slug") or "")
         ]
 
-        markets = rows_json(
-            self.clickhouse.query_text(
-                f"""
+        try:
+            markets = rows_json(
+                self.clickhouse.query_text(
+                    f"""
                     select
                       market_id,
                       condition_id,
@@ -1764,11 +1853,11 @@ class ProductApi:
                     order by volume desc
                     format JSONEachRow
                 """
+                )
             )
-        )
-        tokens = rows_json(
-            self.clickhouse.query_text(
-                f"""
+            tokens = rows_json(
+                self.clickhouse.query_text(
+                    f"""
                     select
                       tokens.market_id,
                       markets.question,
@@ -1782,11 +1871,19 @@ class ProductApi:
                     order by markets.volume desc, tokens.outcome_index
                     format JSONEachRow
                 """
+                )
             )
-        )
-        fill_summary = rows_json(
-            self.clickhouse.query_text(
-                f"""
+            token_ids = [
+                str(row.get("token_id") or "")
+                for row in tokens
+                if str(row.get("token_id") or "")
+            ]
+            token_ids_sql = "(" + ",".join(ch_string(token_id) for token_id in token_ids) + ")"
+            if not token_ids:
+                token_ids_sql = "('')"
+            fill_summary = rows_json(
+                self.clickhouse.query_text(
+                    f"""
                     select
                       count() as fill_rows,
                       round(sum(toFloat64(notional)), 2) as total_fill_notional,
@@ -1794,22 +1891,14 @@ class ProductApi:
                       min(ingested_at) as first_ts,
                       max(ingested_at) as last_ts
                     from fact_exchange_fill final
-                    where token_id in (
-                      select token_id
-                      from dim_outcome_token final
-                      where market_id in (
-                        select market_id
-                        from dim_market final
-                        where event_id in {event_ids_sql}
-                      )
-                    )
+                    where token_id in {token_ids_sql}
                     format JSONEachRow
                 """
+                )
             )
-        )
-        outcome_summary = rows_json(
-            self.clickhouse.query_text(
-                f"""
+            outcome_summary = rows_json(
+                self.clickhouse.query_text(
+                    f"""
                     select
                       markets.slug as market_slug,
                       markets.question as question,
@@ -1833,13 +1922,34 @@ class ProductApi:
                       [fills.side, if(fills.side = 'BUY', 'SELL', 'BUY')] as user_side
                     inner join dim_outcome_token as tokens final on fills.token_id = tokens.token_id
                     inner join dim_market as markets final on tokens.market_id = markets.market_id
-                    where markets.event_id in {event_ids_sql}
+                    where fills.token_id in {token_ids_sql}
+                      and markets.event_id in {event_ids_sql}
                     group by market_slug, question, outcome, user_side
                     order by total_notional desc
                     format JSONEachRow
                 """
+                )
             )
-        )
+        except Exception as exc:
+            if stale_fallback_row is not None:
+                detail = dict(stale_fallback_row.get("detail") or {})
+                if detail and unusual_betting_cached_detail_satisfies(
+                    detail,
+                    wallet_limit=wallet_limit,
+                    trade_limit=trade_limit,
+                ):
+                    detail = unusual_betting_trim_cached_detail(
+                        detail,
+                        wallet_limit=wallet_limit,
+                        trade_limit=trade_limit,
+                    )
+                    detail["cache"] = unusual_betting_cache_metadata(
+                        stale_fallback_row,
+                        source="stale_postgres_cache_after_error",
+                    )
+                    detail["cache"]["refresh_error"] = str(exc)
+                    return detail
+            raise
         signal_filters = unusual_betting_signal_filters(
             outcome_summary,
             cold_price_threshold,
@@ -1853,6 +1963,8 @@ class ProductApi:
                         select
                           count() as signal_wallet_count,
                           countIf(total_notional >= {large_threshold}) as abnormal_wallet_count,
+                          countIf(total_notional >= {very_large_threshold}) as very_large_wallet_count,
+                          countIf(total_notional >= {extreme_threshold}) as extreme_wallet_count,
                           round(maxIf(total_notional, total_notional >= {large_threshold}), 2) as max_abnormal_wallet_notional,
                           round(max(total_notional), 2) as max_watch_wallet_notional,
                           round(max(max_notional), 2) as max_watch_trade_notional
@@ -1869,7 +1981,8 @@ class ProductApi:
                             [fills.side, if(fills.side = 'BUY', 'SELL', 'BUY')] as user_side
                           inner join dim_outcome_token as tokens final on fills.token_id = tokens.token_id
                           inner join dim_market as markets final on tokens.market_id = markets.market_id
-                          where markets.event_id in {event_ids_sql}
+                          where fills.token_id in {token_ids_sql}
+                            and markets.event_id in {event_ids_sql}
                             and user_address not in {excluded_sql}
                             and ({signal_condition_sql})
                           group by user_address
@@ -1900,7 +2013,8 @@ class ProductApi:
                           [fills.side, if(fills.side = 'BUY', 'SELL', 'BUY')] as user_side
                         inner join dim_outcome_token as tokens final on fills.token_id = tokens.token_id
                         inner join dim_market as markets final on tokens.market_id = markets.market_id
-                        where markets.event_id in {event_ids_sql}
+                        where fills.token_id in {token_ids_sql}
+                          and markets.event_id in {event_ids_sql}
                           and user_address not in {excluded_sql}
                           and ({signal_condition_sql})
                         group by market_slug, question, outcome, user_side, user_address
@@ -1931,7 +2045,8 @@ class ProductApi:
                           [fills.side, if(fills.side = 'BUY', 'SELL', 'BUY')] as user_side
                         inner join dim_outcome_token as tokens final on fills.token_id = tokens.token_id
                         inner join dim_market as markets final on tokens.market_id = markets.market_id
-                        where markets.event_id in {event_ids_sql}
+                        where fills.token_id in {token_ids_sql}
+                          and markets.event_id in {event_ids_sql}
                           and user_address not in {excluded_sql}
                           and ({signal_condition_sql})
                         order by toFloat64(fills.notional) desc
@@ -1968,6 +2083,9 @@ class ProductApi:
                 "wallet_limit": wallet_limit,
                 "trade_limit": trade_limit,
                 "cache_ttl_seconds": cache_ttl_seconds,
+                "persisted_cache_ttl_seconds": persisted_cache_ttl_seconds,
+                "use_persisted_cache": use_persisted_cache,
+                "refresh": refresh,
                 "include_related_markets": include_related_markets,
                 "event_ids": event_ids,
                 "event_slugs": scope_event_slugs,
@@ -1986,9 +2104,31 @@ class ProductApi:
             "cold_trades": signal_trades,
             "analysis": analysis,
             "generated_at": api_datetime(datetime.now(UTC)),
+            "cache": {
+                "source": "computed",
+                "cache_key": persisted_cache_key,
+                "refreshed_at": None,
+                "age_seconds": None,
+                "trigger_reason": trigger_reason,
+            },
         }
         if cache_ttl_seconds > 0:
             self._unusual_betting_cache[cache_key] = (time.time(), output)
+        if self._unusual_betting_cache_store is not None:
+            summary = unusual_betting_summary_response(output)
+            try:
+                cached_row = self.write_unusual_betting_cache(
+                    cache_key=persisted_cache_key,
+                    detail=output,
+                    summary=summary,
+                    trigger_reason=trigger_reason,
+                )
+                output["cache"] = unusual_betting_cache_metadata(
+                    cached_row,
+                    source="computed_and_stored",
+                )
+            except Exception as exc:
+                output["cache"]["store_error"] = str(exc)
         return output
 
     def event_unusual_betting_scope(
@@ -2032,7 +2172,39 @@ class ProductApi:
         detail = self.event_unusual_betting(summary_query)
         if detail.get("status") != "ok":
             return detail
-        return unusual_betting_summary_response(detail)
+        summary = unusual_betting_summary_response(detail)
+        cache = detail.get("cache")
+        if isinstance(cache, dict):
+            summary["cache"] = cache
+        return summary
+
+    def write_unusual_betting_cache(
+        self,
+        *,
+        cache_key: str,
+        detail: dict[str, Any],
+        summary: dict[str, Any],
+        trigger_reason: str,
+    ) -> dict[str, Any] | None:
+        if self._unusual_betting_cache_store is None:
+            return None
+        event = detail.get("event") if isinstance(detail.get("event"), dict) else {}
+        return self._unusual_betting_cache_store.upsert(
+            cache_key=cache_key,
+            event_id=str(event.get("event_id") or ""),
+            event_slug=str(event.get("slug") or ""),
+            event_title=str(event.get("title") or ""),
+            status=str(detail.get("status") or summary.get("status") or ""),
+            severity=str(summary.get("severity") or "none"),
+            abnormal_wallet_count=int_value(summary.get("abnormal_wallet_count")),
+            max_abnormal_wallet_notional=float_value(summary.get("max_abnormal_wallet_notional")),
+            signal_total_notional=float_value(summary.get("signal_total_notional")),
+            parameters=detail.get("parameters") if isinstance(detail.get("parameters"), dict) else {},
+            summary=summary,
+            detail=detail,
+            trigger_reason=trigger_reason,
+            generated_at=detail.get("generated_at"),
+        )
 
     def event_lookup(self, event_ref: str) -> dict[str, Any] | None:
         value = event_ref.strip()
@@ -4313,21 +4485,25 @@ def summarize_unusual_betting(
         cold_price_threshold,
         large_threshold,
     )
+    signal_wallet_groups = unusual_betting_aggregate_wallets(signal_wallets)
     large_signal_count = sum(
-        1 for row in signal_wallets if float_value(row.get("total_notional")) >= large_threshold
+        1 for row in signal_wallet_groups if float_value(row.get("total_notional")) >= large_threshold
     )
     very_large_signal_count = sum(
-        1 for row in signal_wallets if float_value(row.get("total_notional")) >= very_large_threshold
+        1
+        for row in signal_wallet_groups
+        if float_value(row.get("total_notional")) >= very_large_threshold
     )
     extreme_signal_count = sum(
-        1 for row in signal_wallets if float_value(row.get("total_notional")) >= extreme_threshold
+        1
+        for row in signal_wallet_groups
+        if float_value(row.get("total_notional")) >= extreme_threshold
     )
     max_signal_trade = max(
         [float_value(row.get("max_user_notional")) for row in signal_rows]
         + [float_value(row.get("notional")) for row in signal_trades]
         or [0.0]
     )
-    signal_wallet_groups = unusual_betting_aggregate_wallets(signal_wallets)
     max_signal_wallet = max(
         [float_value(row.get("total_notional")) for row in signal_wallet_groups] or [0.0]
     )
@@ -4445,13 +4621,13 @@ def unusual_betting_summary_response(detail: dict[str, Any]) -> dict[str, Any]:
         else {}
     )
     large_threshold = float_value(parameters.get("large_threshold"))
-    abnormal_rows = [
+    signal_wallet_groups = unusual_betting_aggregate_wallets(signal_wallets)
+    abnormal_wallets = [
         row
-        for row in signal_wallets
+        for row in signal_wallet_groups
         if float_value(row.get("total_notional")) >= large_threshold
     ]
-    abnormal_wallets = unusual_betting_aggregate_wallets(abnormal_rows)
-    watch_wallets = unusual_betting_aggregate_wallets(signal_wallets)[:5]
+    watch_wallets = signal_wallet_groups[:5]
     abnormal_wallet_count = int_value(signal_wallet_summary.get("abnormal_wallet_count"))
     if abnormal_wallet_count <= 0:
         abnormal_wallet_count = len(abnormal_wallets)
@@ -4475,13 +4651,19 @@ def unusual_betting_summary_response(detail: dict[str, Any]) -> dict[str, Any]:
         or [0.0]
     )
     large_wallet_count = int_value(
-        analysis.get("large_signal_wallet_count", signal_wallet_summary.get("abnormal_wallet_count"))
+        signal_wallet_summary.get("abnormal_wallet_count", analysis.get("large_signal_wallet_count"))
     )
     very_large_wallet_count = int_value(
-        analysis.get("very_large_signal_wallet_count")
+        signal_wallet_summary.get(
+            "very_large_wallet_count",
+            analysis.get("very_large_signal_wallet_count"),
+        )
     )
     extreme_wallet_count = int_value(
-        analysis.get("extreme_signal_wallet_count")
+        signal_wallet_summary.get(
+            "extreme_wallet_count",
+            analysis.get("extreme_signal_wallet_count"),
+        )
     )
     severity = str(analysis.get("severity") or "none")
     slug = str(event.get("slug") or "")
@@ -4539,6 +4721,75 @@ def unusual_betting_summary_response(detail: dict[str, Any]) -> dict[str, Any]:
         "chart_url": f"/#/unusual-betting?slug={slug}" if slug else "",
         "generated_at": detail.get("generated_at"),
     }
+
+
+def unusual_betting_cache_key(
+    *,
+    event_ids: list[str],
+    cold_price_threshold: float,
+    large_threshold: float,
+    very_large_threshold: float,
+    extreme_threshold: float,
+    include_related_markets: bool,
+) -> str:
+    payload = {
+        "version": "large_direction_signal_v1",
+        "event_ids": sorted(str(event_id) for event_id in event_ids if event_id),
+        "cold_price_threshold": cold_price_threshold,
+        "large_threshold": large_threshold,
+        "very_large_threshold": very_large_threshold,
+        "extreme_threshold": extreme_threshold,
+        "include_related_markets": include_related_markets,
+    }
+    encoded = json.dumps(payload, sort_keys=True, separators=(",", ":"))
+    return hashlib.sha256(encoded.encode("utf-8")).hexdigest()
+
+
+def unusual_betting_cache_metadata(row: dict[str, Any] | None, *, source: str) -> dict[str, Any]:
+    row = row or {}
+    return {
+        "source": source,
+        "cache_key": str(row.get("cache_key") or ""),
+        "refreshed_at": row.get("refreshed_at"),
+        "generated_at": row.get("generated_at"),
+        "age_seconds": row.get("age_seconds"),
+        "trigger_reason": row.get("trigger_reason"),
+        "error": row.get("error"),
+    }
+
+
+def unusual_betting_cached_detail_satisfies(
+    detail: dict[str, Any],
+    *,
+    wallet_limit: int,
+    trade_limit: int,
+) -> bool:
+    parameters = detail.get("parameters") if isinstance(detail.get("parameters"), dict) else {}
+    cached_wallet_limit = int_value(parameters.get("wallet_limit"))
+    cached_trade_limit = int_value(parameters.get("trade_limit"))
+    return cached_wallet_limit >= wallet_limit and cached_trade_limit >= trade_limit
+
+
+def unusual_betting_trim_cached_detail(
+    detail: dict[str, Any],
+    *,
+    wallet_limit: int,
+    trade_limit: int,
+) -> dict[str, Any]:
+    trimmed = dict(detail)
+    if isinstance(trimmed.get("signal_wallets"), list):
+        trimmed["signal_wallets"] = trimmed["signal_wallets"][:wallet_limit]
+    if isinstance(trimmed.get("cold_wallets"), list):
+        trimmed["cold_wallets"] = trimmed["cold_wallets"][:wallet_limit]
+    if isinstance(trimmed.get("signal_trades"), list):
+        trimmed["signal_trades"] = trimmed["signal_trades"][:trade_limit]
+    if isinstance(trimmed.get("cold_trades"), list):
+        trimmed["cold_trades"] = trimmed["cold_trades"][:trade_limit]
+    parameters = dict(trimmed.get("parameters") or {})
+    parameters["wallet_limit"] = wallet_limit
+    parameters["trade_limit"] = trade_limit
+    trimmed["parameters"] = parameters
+    return trimmed
 
 
 def unusual_betting_aggregate_wallets(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:

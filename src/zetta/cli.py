@@ -42,6 +42,7 @@ from zetta.storage.raw import RawJsonlWriter
 from zetta.storage.redpanda import RpkPublisher
 from zetta.storage.state import LocalStateStore
 from zetta.tracked_wallets import TrackedWalletStore
+from zetta.worldcup_wallets import base_match_slug
 
 
 FRONTIER_GAMMA_PRIORITY = 1
@@ -54,6 +55,7 @@ WALLET_EXPLICIT_REFRESH_PRIORITY = -2
 ACTIVE_EVENT_WALLET_PRIORITY = -1
 WALLET_PORTFOLIO_PRIORITY = 0
 WALLET_PNL_PRIORITY = -1
+UNUSUAL_BETTING_REFRESH_PRIORITY = -1
 DISCOVERY_PRIORITY = 50
 HISTORY_BACKFILL_PRIORITY = 100
 CHAIN_BACKFILL_PRIORITY = 150
@@ -424,6 +426,19 @@ def build_parser() -> argparse.ArgumentParser:
         "--include-wallet-pnl", action=argparse.BooleanOptionalAction, default=True
     )
     seed_active_event_wallets.add_argument(
+        "--include-unusual-betting-refresh",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="Also seed large-direction signal refresh tasks for monitored active events.",
+    )
+    seed_active_event_wallets.add_argument("--unusual-betting-event-limit", type=int, default=20)
+    seed_active_event_wallets.add_argument(
+        "--unusual-betting-min-notional",
+        type=float,
+        default=500_000.0,
+        help="Recent per-wallet event notional required before linking active-event wallet monitoring to large-direction analysis.",
+    )
+    seed_active_event_wallets.add_argument(
         "--include-tracked-wallets",
         action=argparse.BooleanOptionalAction,
         default=True,
@@ -437,6 +452,33 @@ def build_parser() -> argparse.ArgumentParser:
         help=argparse.SUPPRESS,
     )
     seed_active_event_wallets.set_defaults(func=cmd_tasks_seed_active_event_wallets)
+
+    seed_unusual_betting = task_subparsers.add_parser(
+        "seed-unusual-betting",
+        help="Seed large-direction signal refresh tasks for active or recently updated events.",
+    )
+    seed_unusual_betting.add_argument("--event", action="append", dest="events", default=[])
+    seed_unusual_betting.add_argument("--event-limit", type=int, default=20)
+    seed_unusual_betting.add_argument("--recent-limit", type=int, default=20)
+    seed_unusual_betting.add_argument("--since-minutes", type=int, default=30)
+    seed_unusual_betting.add_argument("--wallet-limit", type=int, default=100)
+    seed_unusual_betting.add_argument("--trade-limit", type=int, default=100)
+    seed_unusual_betting.add_argument("--large-threshold", type=float, default=500_000.0)
+    seed_unusual_betting.add_argument("--very-large-threshold", type=float, default=1_000_000.0)
+    seed_unusual_betting.add_argument("--extreme-threshold", type=float, default=5_000_000.0)
+    seed_unusual_betting.add_argument("--cold-price-threshold", type=float, default=0.25)
+    seed_unusual_betting.add_argument(
+        "--include-related-markets", action=argparse.BooleanOptionalAction, default=True
+    )
+    seed_unusual_betting.add_argument("--refresh-run", default="unusual-betting")
+    seed_unusual_betting.add_argument("--trigger-reason", default="scheduled")
+    seed_unusual_betting.add_argument(
+        "--requeue-done",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help=argparse.SUPPRESS,
+    )
+    seed_unusual_betting.set_defaults(func=cmd_tasks_seed_unusual_betting)
 
     seed_history = task_subparsers.add_parser(
         "seed-history", help="Seed deep historical backfill tasks from ClickHouse."
@@ -1548,6 +1590,138 @@ def discover_active_event_wallets(
     ]
 
 
+def discover_unusual_betting_event_slugs(
+    clickhouse: ClickHouseWriter,
+    *,
+    event_limit: int,
+    recent_limit: int,
+    since_minutes: int,
+) -> list[str]:
+    if event_limit < 0:
+        raise ValueError("event_limit must not be negative")
+    if recent_limit < 0:
+        raise ValueError("recent_limit must not be negative")
+    if since_minutes <= 0:
+        raise ValueError("since_minutes must be positive")
+
+    event_slugs: list[str] = []
+    if recent_limit > 0:
+        query = f"""
+            select
+              events.slug as event_slug,
+              max(fills.ingested_at) as latest_fill_at,
+              sum(toFloat64(fills.notional)) as recent_notional
+            from fact_exchange_fill as fills final
+            inner join dim_outcome_token as tokens final on fills.token_id = tokens.token_id
+            inner join dim_market as markets final on tokens.market_id = markets.market_id
+            inner join dim_event as events final on markets.event_id = events.event_id
+            where events.slug like 'fifwc-%'
+              and fills.ingested_at >= now64(3) - interval {since_minutes} minute
+            group by events.slug
+            order by latest_fill_at desc, recent_notional desc
+            limit {recent_limit}
+            format JSONEachRow
+        """
+        event_slugs.extend(
+            str(json.loads(line).get("event_slug") or "")
+            for line in clickhouse.query_text(query).splitlines()
+            if line.strip()
+        )
+
+    if event_limit > 0:
+        query = f"""
+            select slug as event_slug
+            from dim_event final
+            where slug like 'fifwc-%'
+              and active = true
+              and closed = false
+              and archived = false
+            order by coalesce(start_time, updated_at) asc, slug
+            limit {event_limit}
+            format JSONEachRow
+        """
+        event_slugs.extend(
+            str(json.loads(line).get("event_slug") or "")
+            for line in clickhouse.query_text(query).splitlines()
+            if line.strip()
+        )
+
+    normalized: list[str] = []
+    seen: set[str] = set()
+    for slug in event_slugs:
+        base_slug = base_match_slug(str(slug or "").strip())
+        if not base_slug or base_slug in seen:
+            continue
+            seen.add(base_slug)
+            normalized.append(base_slug)
+    return normalized
+
+
+def discover_unusual_betting_event_slugs_from_active_wallets(
+    clickhouse: ClickHouseWriter,
+    *,
+    event_limit: int,
+    condition_limit: int,
+    since_minutes: int,
+    min_notional: float,
+) -> list[str]:
+    if event_limit < 0:
+        raise ValueError("event_limit must not be negative")
+    if event_limit == 0:
+        return []
+    if condition_limit <= 0:
+        raise ValueError("condition_limit must be positive")
+    if since_minutes <= 0:
+        raise ValueError("since_minutes must be positive")
+    if min_notional < 0:
+        raise ValueError("min_notional must be non-negative")
+
+    condition_query = active_event_condition_query(
+        event_limit=0,
+        condition_limit=condition_limit,
+    ).replace("format JSONEachRow", "")
+    query = f"""
+        with active_conditions as
+        (
+          {condition_query}
+        ),
+        wallet_event_notional as
+        (
+          select
+            events.slug as event_slug,
+            trades.user_address as user_address,
+            sum(abs(toFloat64(trades.notional))) as total_notional,
+            max(trades.timestamp) as latest_trade_at
+          from fact_trade_by_time as trades
+          inner join dim_market as markets final on trades.condition_id = markets.condition_id
+          inner join dim_event as events final on markets.event_id = events.event_id
+          where trades.user_address != ''
+            and trades.condition_id in active_conditions
+            and events.slug like 'fifwc-%'
+            and trades.timestamp >= now64(3) - interval {since_minutes} minute
+          group by event_slug, user_address
+          having total_notional >= {min_notional}
+        )
+        select
+          event_slug,
+          count() as signal_wallets,
+          round(max(total_notional), 2) as max_wallet_notional,
+          round(sum(total_notional), 2) as total_wallet_notional,
+          max(latest_trade_at) as latest_trade_at
+        from wallet_event_notional
+        group by event_slug
+        order by latest_trade_at desc, max_wallet_notional desc
+        limit {event_limit}
+        format JSONEachRow
+    """
+    event_slugs = [
+        str(json.loads(line).get("event_slug") or "")
+        for line in clickhouse.query_text(query).splitlines()
+        if line.strip()
+    ]
+    return normalize_event_slug_list(event_slugs)
+
+
 def discover_wallet_candidates(
     clickhouse: ClickHouseWriter,
     *,
@@ -1632,6 +1806,57 @@ def merge_wallet_lists(primary: list[str], extra: list[str]) -> list[str]:
 
 def normalize_wallet_list(wallets: list[str]) -> list[str]:
     return merge_wallet_lists([], wallets)
+
+
+def normalize_event_slug_list(values: list[str]) -> list[str]:
+    slugs: list[str] = []
+    seen: set[str] = set()
+    for value in values:
+        for item in str(value or "").split(","):
+            slug = base_match_slug(item.strip())
+            if not slug or slug in seen:
+                continue
+            seen.add(slug)
+            slugs.append(slug)
+    return slugs
+
+
+def merge_event_slug_lists(primary: list[str], extra: list[str]) -> list[str]:
+    slugs: list[str] = []
+    seen: set[str] = set()
+    for slug in [*extra, *primary]:
+        normalized = base_match_slug(str(slug or "").strip())
+        if not normalized or normalized in seen:
+            continue
+        seen.add(normalized)
+        slugs.append(normalized)
+    return slugs
+
+
+def unusual_betting_task_dedupe_key(
+    *,
+    slug: str,
+    wallet_limit: int,
+    trade_limit: int,
+    cold_price_threshold: float,
+    large_threshold: float,
+    very_large_threshold: float,
+    extreme_threshold: float,
+    include_related_markets: bool,
+) -> str:
+    return "|".join(
+        [
+            "unusual-betting",
+            base_match_slug(slug),
+            str(int(wallet_limit)),
+            str(int(trade_limit)),
+            f"{float(cold_price_threshold):.6f}",
+            f"{float(large_threshold):.2f}",
+            f"{float(very_large_threshold):.2f}",
+            f"{float(extreme_threshold):.2f}",
+            "related" if include_related_markets else "base",
+        ]
+    )
 
 
 def tracked_wallet_addresses(app_settings: Settings) -> list[str]:
@@ -1789,6 +2014,7 @@ def cmd_tasks_seed_active_event_wallets(args: argparse.Namespace, app_settings: 
         and not args.include_wallet_activity
         and not args.include_wallet_portfolio
         and not args.include_wallet_pnl
+        and not getattr(args, "include_unusual_betting_refresh", False)
     ):
         raise ValueError("at least one active-event refresh target must be enabled")
 
@@ -1903,6 +2129,50 @@ def cmd_tasks_seed_active_event_wallets(args: argparse.Namespace, app_settings: 
                 )
             )
 
+    unusual_betting_slugs: list[str] = []
+    if getattr(args, "include_unusual_betting_refresh", False):
+        unusual_betting_slugs = discover_unusual_betting_event_slugs_from_active_wallets(
+            clickhouse,
+            event_limit=getattr(args, "unusual_betting_event_limit", 20),
+            condition_limit=args.condition_limit,
+            since_minutes=args.since_minutes,
+            min_notional=getattr(args, "unusual_betting_min_notional", 500_000.0),
+        )
+        for slug in unusual_betting_slugs:
+            params = {
+                "slug": slug,
+                "wallet_limit": 100,
+                "trade_limit": 100,
+                "cold_price_threshold": 0.25,
+                "large_threshold": 500_000.0,
+                "very_large_threshold": 1_000_000.0,
+                "extreme_threshold": 5_000_000.0,
+                "include_related_markets": True,
+                "refresh": True,
+                "cache_ttl_seconds": 0,
+                "trigger_reason": "active-event-wallets",
+                "_refresh_run": refresh_run,
+                "_dedupe_key": unusual_betting_task_dedupe_key(
+                    slug=slug,
+                    wallet_limit=100,
+                    trade_limit=100,
+                    cold_price_threshold=0.25,
+                    large_threshold=500_000.0,
+                    very_large_threshold=1_000_000.0,
+                    extreme_threshold=5_000_000.0,
+                    include_related_markets=True,
+                ),
+            }
+            if args.requeue_done:
+                params["_requeue_done"] = True
+            tasks.append(
+                Task(
+                    kind="unusual-betting-refresh",
+                    params=params,
+                    priority=UNUSUAL_BETTING_REFRESH_PRIORITY,
+                )
+            )
+
     added = store.add_many(tasks)
     return {
         "added": added,
@@ -1918,6 +2188,80 @@ def cmd_tasks_seed_active_event_wallets(args: argparse.Namespace, app_settings: 
         "include_wallet_activity": args.include_wallet_activity,
         "include_wallet_portfolio": args.include_wallet_portfolio,
         "include_wallet_pnl": args.include_wallet_pnl,
+        "include_unusual_betting_refresh": getattr(
+            args,
+            "include_unusual_betting_refresh",
+            False,
+        ),
+        "unusual_betting_min_notional": getattr(
+            args,
+            "unusual_betting_min_notional",
+            500_000.0,
+        ),
+        "unusual_betting_events": len(unusual_betting_slugs),
+        "summary": store.summary(),
+        "task_store": args.task_store,
+    }
+
+
+def cmd_tasks_seed_unusual_betting(args: argparse.Namespace, app_settings: Settings) -> Any:
+    store = task_store_for_args(args, app_settings)
+    clickhouse = ClickHouseWriter(app_settings)
+    refresh_run = args.refresh_run or "unusual-betting"
+    explicit_slugs = normalize_event_slug_list(args.events)
+    discovered_slugs = discover_unusual_betting_event_slugs(
+        clickhouse,
+        event_limit=args.event_limit,
+        recent_limit=args.recent_limit,
+        since_minutes=args.since_minutes,
+    )
+    slugs = merge_event_slug_lists(discovered_slugs, explicit_slugs)
+    tasks: list[Task] = []
+    for slug in slugs:
+        params = {
+            "slug": slug,
+            "wallet_limit": args.wallet_limit,
+            "trade_limit": args.trade_limit,
+            "cold_price_threshold": args.cold_price_threshold,
+            "large_threshold": args.large_threshold,
+            "very_large_threshold": args.very_large_threshold,
+            "extreme_threshold": args.extreme_threshold,
+            "include_related_markets": args.include_related_markets,
+            "refresh": True,
+            "cache_ttl_seconds": 0,
+            "trigger_reason": args.trigger_reason,
+            "_refresh_run": refresh_run,
+            "_dedupe_key": unusual_betting_task_dedupe_key(
+                slug=slug,
+                wallet_limit=args.wallet_limit,
+                trade_limit=args.trade_limit,
+                cold_price_threshold=args.cold_price_threshold,
+                large_threshold=args.large_threshold,
+                very_large_threshold=args.very_large_threshold,
+                extreme_threshold=args.extreme_threshold,
+                include_related_markets=args.include_related_markets,
+            ),
+        }
+        if args.requeue_done:
+            params["_requeue_done"] = True
+        tasks.append(
+            Task(
+                kind="unusual-betting-refresh",
+                params=params,
+                priority=UNUSUAL_BETTING_REFRESH_PRIORITY,
+            )
+        )
+
+    added = store.add_many(tasks)
+    return {
+        "added": added,
+        "candidate_tasks": len(tasks),
+        "events": len(slugs),
+        "discovered_events": len(discovered_slugs),
+        "explicit_events": len(explicit_slugs),
+        "since_minutes": args.since_minutes,
+        "refresh_run": refresh_run,
+        "trigger_reason": args.trigger_reason,
         "summary": store.summary(),
         "task_store": args.task_store,
     }

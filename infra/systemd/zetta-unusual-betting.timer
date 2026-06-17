@@ -1,0 +1,11 @@
+[Unit]
+Description=Seed Zetta unusual betting signal refresh tasks every two minutes
+
+[Timer]
+OnBootSec=5min
+OnUnitInactiveSec=2min
+AccuracySec=20s
+Unit=zetta-unusual-betting.service
+
+[Install]
+WantedBy=timers.target

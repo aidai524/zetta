@@ -48,6 +48,10 @@ wallet-only profile:
 Do not run local Postgres, ClickHouse, Redpanda, MinIO, API, WebSocket, chain, marts, or
 full-site frontier jobs on helper nodes.
 
+Do not add `unusual-betting-refresh` to helper `ZETTA_WORKER_TASK_KINDS`. Those
+tasks query the master ClickHouse heavily and are intentionally handled by the
+single-process `zetta-unusual-betting-worker.service` on the master.
+
 Keep on helper nodes:
 
 - `/opt/zetta/.venv`

@@ -163,6 +163,8 @@ class TaskRunner:
             ).collect_logs(**params)
         elif task.kind == "event-refresh":
             result = self.refresh_event(task, **params)
+        elif task.kind == "unusual-betting-refresh":
+            result = self.refresh_unusual_betting(**params)
         else:
             raise ValueError(f"Unknown task kind: {task.kind}")
 
@@ -327,6 +329,56 @@ class TaskRunner:
         if failures:
             raise RuntimeError(json.dumps(result, sort_keys=True))
         return result
+
+    def refresh_unusual_betting(
+        self,
+        *,
+        slug: str,
+        wallet_limit: int = 100,
+        trade_limit: int = 100,
+        cold_price_threshold: float = 0.25,
+        large_threshold: float = 500_000.0,
+        very_large_threshold: float = 1_000_000.0,
+        extreme_threshold: float = 5_000_000.0,
+        include_related_markets: bool = True,
+        refresh: bool = True,
+        cache_ttl_seconds: int = 0,
+        trigger_reason: str = "task",
+    ) -> dict[str, Any]:
+        query = {
+            "slug": [slug],
+            "wallet_limit": [str(wallet_limit)],
+            "trade_limit": [str(trade_limit)],
+            "cold_price_threshold": [str(cold_price_threshold)],
+            "large_threshold": [str(large_threshold)],
+            "very_large_threshold": [str(very_large_threshold)],
+            "extreme_threshold": [str(extreme_threshold)],
+            "include_related_markets": ["1" if include_related_markets else "0"],
+            "refresh": ["1" if refresh else "0"],
+            "cache_ttl_seconds": [str(cache_ttl_seconds)],
+            "use_persisted_cache": ["0"],
+            "trigger_reason": [trigger_reason],
+        }
+        from zetta.api import ProductApi
+
+        detail = ProductApi(
+            clickhouse=ClickHouseWriter(self.settings),
+            settings=self.settings,
+        ).event_unusual_betting(query)
+        summary = detail.get("analysis") if isinstance(detail.get("analysis"), dict) else {}
+        event = detail.get("event") if isinstance(detail.get("event"), dict) else {}
+        cache = detail.get("cache") if isinstance(detail.get("cache"), dict) else {}
+        return {
+            "items": 1 if detail.get("status") == "ok" else 0,
+            "slug": slug,
+            "event_id": str(event.get("event_id") or ""),
+            "event_slug": str(event.get("slug") or slug),
+            "status": str(detail.get("status") or ""),
+            "severity": str(summary.get("severity") or ""),
+            "signal_wallets": len(detail.get("signal_wallets") or []),
+            "signal_trades": len(detail.get("signal_trades") or []),
+            "cache": cache,
+        }
 
     def record_event_sync(
         self,

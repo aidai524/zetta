@@ -12,10 +12,12 @@ from zetta.cli import (
     FRONTIER_TRADES_PRIORITY,
     WALLET_EXPLICIT_REFRESH_PRIORITY,
     WALLET_REFRESH_PRIORITY,
+    UNUSUAL_BETTING_REFRESH_PRIORITY,
     cmd_tasks_seed_basic,
     cmd_tasks_seed_active_event_wallets,
     cmd_tasks_seed_frontier,
     cmd_tasks_seed_history,
+    cmd_tasks_seed_unusual_betting,
     cmd_tasks_seed_wallets,
     parse_task_kinds,
 )
@@ -27,6 +29,7 @@ from zetta.scheduler.tasks import (
     Task,
     requeue_done_task,
     row_to_task,
+    task_dedupe_value,
     task_source_entity,
 )
 
@@ -68,6 +71,13 @@ def test_local_task_store_claims_lowest_priority_first(tmp_path) -> None:
 
     assert task is not None
     assert task.kind == "gamma-events"
+
+
+def test_unusual_betting_task_source_entity() -> None:
+    assert task_source_entity("unusual-betting-refresh") == (
+        "event",
+        "unusual_betting_refresh",
+    )
 
 
 def test_local_task_store_filters_allowed_kinds(tmp_path) -> None:
@@ -353,8 +363,48 @@ def test_task_execution_params_drop_scheduler_metadata() -> None:
         {
             "page_limit": 100,
             "_refresh_run": "2026-06-08T00:00:00+00:00",
+            "_dedupe_key": "wallet-refresh:abc",
         }
     ) == {"page_limit": 100}
+
+
+def test_local_task_store_can_dedupe_by_stable_key(tmp_path) -> None:
+    store = LocalTaskStore(tmp_path / "tasks.json")
+    store.add_many(
+        [
+            Task(
+                kind="unusual-betting-refresh",
+                params={
+                    "slug": "fifwc-esp-cvi-2026-06-15",
+                    "trigger_reason": "scheduled",
+                    "_dedupe_key": "unusual-betting|fifwc-esp-cvi-2026-06-15",
+                },
+            )
+        ]
+    )
+    store.complete(store.load()[0].id)
+
+    added = store.add_many(
+        [
+            Task(
+                kind="unusual-betting-refresh",
+                params={
+                    "slug": "fifwc-esp-cvi-2026-06-15",
+                    "trigger_reason": "active-event-wallets",
+                    "_dedupe_key": "unusual-betting|fifwc-esp-cvi-2026-06-15",
+                    "_requeue_done": True,
+                },
+                priority=UNUSUAL_BETTING_REFRESH_PRIORITY,
+            )
+        ]
+    )
+
+    tasks = store.load()
+    assert added == 1
+    assert len(tasks) == 1
+    assert tasks[0].status == "pending"
+    assert tasks[0].params["trigger_reason"] == "active-event-wallets"
+    assert task_dedupe_value(tasks[0].params) == "unusual-betting|fifwc-esp-cvi-2026-06-15"
 
 
 def test_seed_basic_keeps_global_trade_sample_finite_when_gamma_is_unbounded(tmp_path) -> None:
@@ -627,6 +677,9 @@ def test_seed_active_event_wallets_adds_market_and_wallet_tasks(monkeypatch, tmp
             "include_wallet_activity": True,
             "include_wallet_portfolio": True,
             "include_wallet_pnl": True,
+            "include_unusual_betting_refresh": False,
+            "unusual_betting_event_limit": 20,
+            "unusual_betting_min_notional": 500000.0,
             "include_tracked_wallets": False,
             "refresh_run": "active-event-wallets",
             "requeue_done": True,
@@ -699,6 +752,9 @@ def test_seed_active_event_wallets_treats_tracked_wallets_as_explicit(
             "include_wallet_activity": False,
             "include_wallet_portfolio": True,
             "include_wallet_pnl": True,
+            "include_unusual_betting_refresh": False,
+            "unusual_betting_event_limit": 20,
+            "unusual_betting_min_notional": 500000.0,
             "include_tracked_wallets": True,
             "refresh_run": "active-event-wallets",
             "requeue_done": True,
@@ -716,6 +772,133 @@ def test_seed_active_event_wallets_treats_tracked_wallets_as_explicit(
         for task in tasks
         if task.params["user"] == "0xdef"
     } == {WALLET_EXPLICIT_REFRESH_PRIORITY}
+
+
+def test_seed_active_event_wallets_can_link_unusual_betting_refresh(
+    monkeypatch, tmp_path
+) -> None:
+    class FakeClickHouse:
+        def __init__(self, _settings):
+            pass
+
+        def query_text(self, query):
+            assert "from fact_trade_by_time as trades" in query
+            assert "having total_notional >= 500000.0" in query
+            assert "limit 20" in query
+            return (
+                '{"event_slug":"fifwc-esp-cvi-2026-06-15-more-markets"}\n'
+                '{"event_slug":"fifwc-fra-sen-2026-06-16"}\n'
+            )
+            return ""
+
+    monkeypatch.setattr("zetta.cli.ClickHouseWriter", FakeClickHouse)
+    args = type(
+        "Args",
+        (),
+        {
+            "task_store": "local",
+            "task_file": str(tmp_path / "tasks.json"),
+            "node_id": "node-1",
+            "lease_seconds": 300,
+            "wallets": [],
+            "event_limit": 10,
+            "condition_limit": 25,
+            "wallet_limit": 0,
+            "since_minutes": 90,
+            "min_notional": 0.0,
+            "trade_page_limit": 500,
+            "trade_max_pages": 1,
+            "wallet_page_limit": 500,
+            "wallet_max_pages": 1,
+            "include_market_trades": False,
+            "include_wallet_trades": False,
+            "include_wallet_activity": False,
+            "include_wallet_portfolio": False,
+            "include_wallet_pnl": False,
+            "include_unusual_betting_refresh": True,
+            "unusual_betting_event_limit": 20,
+            "unusual_betting_min_notional": 500000.0,
+            "include_tracked_wallets": False,
+            "refresh_run": "active-event-wallets",
+            "requeue_done": True,
+        },
+    )()
+
+    result = cmd_tasks_seed_active_event_wallets(args, Settings())
+    tasks = LocalTaskStore(tmp_path / "tasks.json").load()
+
+    assert result["unusual_betting_events"] == 2
+    assert [task.kind for task in tasks] == ["unusual-betting-refresh"] * 2
+    assert {task.params["slug"] for task in tasks} == {
+        "fifwc-esp-cvi-2026-06-15",
+        "fifwc-fra-sen-2026-06-16",
+    }
+    assert all(task.params["trigger_reason"] == "active-event-wallets" for task in tasks)
+
+
+def test_seed_unusual_betting_adds_refresh_tasks(monkeypatch, tmp_path) -> None:
+    queries = []
+
+    class FakeClickHouse:
+        def __init__(self, _settings):
+            pass
+
+        def query_text(self, query):
+            queries.append(query)
+            if "from fact_exchange_fill" in query:
+                return (
+                    '{"event_slug":"fifwc-esp-cvi-2026-06-15-more-markets"}\n'
+                    '{"event_slug":"fifwc-fra-sen-2026-06-16"}\n'
+                )
+            if "from dim_event final" in query:
+                return (
+                    '{"event_slug":"fifwc-esp-cvi-2026-06-15"}\n'
+                    '{"event_slug":"fifwc-arg-alg-2026-06-16"}\n'
+                )
+            return ""
+
+    monkeypatch.setattr("zetta.cli.ClickHouseWriter", FakeClickHouse)
+    args = type(
+        "Args",
+        (),
+        {
+            "task_store": "local",
+            "task_file": str(tmp_path / "tasks.json"),
+            "node_id": "node-1",
+            "lease_seconds": 300,
+            "events": ["fifwc-fra-sen-2026-06-16-exact-score"],
+            "event_limit": 10,
+            "recent_limit": 10,
+            "since_minutes": 30,
+            "wallet_limit": 100,
+            "trade_limit": 100,
+            "cold_price_threshold": 0.25,
+            "large_threshold": 500000.0,
+            "very_large_threshold": 1000000.0,
+            "extreme_threshold": 5000000.0,
+            "include_related_markets": True,
+            "refresh_run": "unusual-betting",
+            "trigger_reason": "scheduled",
+            "requeue_done": True,
+        },
+    )()
+
+    result = cmd_tasks_seed_unusual_betting(args, Settings())
+    tasks = LocalTaskStore(tmp_path / "tasks.json").load()
+
+    assert len(queries) == 2
+    assert result["events"] == 3
+    assert result["candidate_tasks"] == 3
+    assert result["added"] == 3
+    assert [task.kind for task in tasks] == ["unusual-betting-refresh"] * 3
+    assert {task.priority for task in tasks} == {UNUSUAL_BETTING_REFRESH_PRIORITY}
+    assert {task.params["slug"] for task in tasks} == {
+        "fifwc-esp-cvi-2026-06-15",
+        "fifwc-fra-sen-2026-06-16",
+        "fifwc-arg-alg-2026-06-16",
+    }
+    assert all(task.params["refresh"] is True for task in tasks)
+    assert all(requeue_done_task(task.params) for task in tasks)
 
 
 def test_local_task_store_retries_then_dead_letters(tmp_path) -> None:

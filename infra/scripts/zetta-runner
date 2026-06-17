@@ -183,7 +183,41 @@ case "$MODE" in
         "--${ZETTA_ACTIVE_EVENT_INCLUDE_WALLET_ACTIVITY:-include-wallet-activity}" \
         "--${ZETTA_ACTIVE_EVENT_INCLUDE_WALLET_PORTFOLIO:-include-wallet-portfolio}" \
         "--${ZETTA_ACTIVE_EVENT_INCLUDE_WALLET_PNL:-include-wallet-pnl}" \
+        "--${ZETTA_ACTIVE_EVENT_INCLUDE_UNUSUAL_BETTING_REFRESH:-no-include-unusual-betting-refresh}" \
+        --unusual-betting-event-limit "${ZETTA_ACTIVE_EVENT_UNUSUAL_BETTING_EVENT_LIMIT:-20}" \
+        --unusual-betting-min-notional "${ZETTA_ACTIVE_EVENT_UNUSUAL_BETTING_MIN_NOTIONAL:-500000}" \
         --refresh-run "${ZETTA_ACTIVE_EVENT_WALLET_REFRESH_RUN:-active-event-wallets}" \
+        --requeue-done
+    ;;
+  unusual-betting)
+    EVENT_ARGS=()
+    if [[ -n "${ZETTA_UNUSUAL_BETTING_EVENT_SLUGS:-}" ]]; then
+      IFS=',' read -r -a UNUSUAL_BETTING_EVENTS <<< "$ZETTA_UNUSUAL_BETTING_EVENT_SLUGS"
+      for event_slug in "${UNUSUAL_BETTING_EVENTS[@]}"; do
+        event_slug="${event_slug//[[:space:]]/}"
+        if [[ -n "$event_slug" ]]; then
+          EVENT_ARGS+=(--event "$event_slug")
+        fi
+      done
+    fi
+    "$ZETTA_PYTHON" -m zetta.cli \
+      "${COMMON_ARGS[@]}" \
+      --task-store postgres \
+      --node-id "$ZETTA_NODE_ID" \
+      tasks seed-unusual-betting \
+        "${EVENT_ARGS[@]}" \
+        --event-limit "${ZETTA_UNUSUAL_BETTING_EVENT_LIMIT:-20}" \
+        --recent-limit "${ZETTA_UNUSUAL_BETTING_RECENT_LIMIT:-20}" \
+        --since-minutes "${ZETTA_UNUSUAL_BETTING_SINCE_MINUTES:-30}" \
+        --wallet-limit "${ZETTA_UNUSUAL_BETTING_WALLET_LIMIT:-100}" \
+        --trade-limit "${ZETTA_UNUSUAL_BETTING_TRADE_LIMIT:-100}" \
+        --large-threshold "${ZETTA_UNUSUAL_BETTING_LARGE_THRESHOLD:-500000}" \
+        --very-large-threshold "${ZETTA_UNUSUAL_BETTING_VERY_LARGE_THRESHOLD:-1000000}" \
+        --extreme-threshold "${ZETTA_UNUSUAL_BETTING_EXTREME_THRESHOLD:-5000000}" \
+        --cold-price-threshold "${ZETTA_UNUSUAL_BETTING_COLD_PRICE_THRESHOLD:-0.25}" \
+        "--${ZETTA_UNUSUAL_BETTING_INCLUDE_RELATED:-include-related-markets}" \
+        --refresh-run "${ZETTA_UNUSUAL_BETTING_REFRESH_RUN:-unusual-betting}" \
+        --trigger-reason "${ZETTA_UNUSUAL_BETTING_TRIGGER_REASON:-scheduled}" \
         --requeue-done
     ;;
   wallet-candidates)

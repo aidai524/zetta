@@ -23,6 +23,8 @@ The current production rule is intentionally wallet-aggregate based:
 
 - A wallet is counted as a signal wallet only when its total matched notional on
   signal directions for the match is at least `large_threshold`.
+- Wallet totals are aggregated across the base match and related market variants
+  before threshold filtering.
 - The default `large_threshold` is `500000` USDC.
 - Single fill size is not used to decide whether a wallet is a signal wallet.
 - Single fill rows are still returned by the detail API as evidence, because
@@ -49,6 +51,76 @@ Polymarket fills are expanded to the user's side:
 
 For `SELL` rows, the API's signal logic converts token price into user-side
 price using `1 - token_price`.
+
+## Refresh And Caching
+
+Production now uses a persistent refresh cache:
+
+- A scheduler seeds `unusual-betting-refresh` tasks for active World Cup events
+  and events with recent matched fills.
+- A dedicated single-process `zetta-unusual-betting-worker.service` claims those
+  tasks and recomputes the full analysis.
+- Results are stored in Postgres `unusual_betting_cache`.
+- API requests prefer this persistent cache when it is fresh enough.
+- The API still supports forced live recomputation for debugging or urgent
+  manual checks.
+
+The active-event wallet monitor can also seed the same refresh task. This is
+controlled by `ZETTA_ACTIVE_EVENT_INCLUDE_UNUSUAL_BETTING_REFRESH`; it is off by
+default to avoid increasing task volume unexpectedly. When enabled, the monitor
+looks at active World Cup matches with recent wallet trading and only links a
+match when at least one wallet reaches
+`ZETTA_ACTIVE_EVENT_UNUSUAL_BETTING_MIN_NOTIONAL`, default `500000`, in the
+lookback window. Wallet monitoring and large-direction signal refresh share the
+same `collector_tasks` queue, but the refresh tasks should be claimed only by
+the dedicated `zetta-unusual-betting-worker.service`. Do not add
+`unusual-betting-refresh` to the normal multi-process worker or helper worker
+allowlist; parallel refreshes can overload ClickHouse.
+
+Default API behavior:
+
+- `/events/unusual-betting/summary` reads Postgres cache first.
+- `/events/unusual-betting` reads Postgres cache first if the cached detail has
+  enough `wallet_limit` and `trade_limit` rows for the request.
+- If persistent cache is stale, the API may still serve that stale row rather
+  than run an expensive live query; the scheduled worker is responsible for
+  keeping rows fresh.
+- If persistent cache is missing, the API recomputes from ClickHouse fills and
+  stores the new result.
+- The API also keeps a short in-process cache to avoid duplicate recomputes.
+
+Useful cache parameters:
+
+| Parameter | Default | Description |
+|---|---:|---|
+| `use_persisted_cache` | `true` | Read Postgres cache before recomputing. |
+| `persisted_cache_ttl_seconds` | `3600` | Maximum accepted age for a fresh persistent-cache hit. Set `0` to accept any persisted row age. |
+| `cache_ttl_seconds` | `60` | In-process API cache TTL and stale-persistent fallback switch. Set `0` to skip stale fallback and in-process cache, but fresh persistent cache is still used. |
+| `use_persisted_cache=0` | `false` | Skip persistent-cache reads. Use with care; this can trigger ClickHouse queries. |
+| `refresh` | `false` | Force recompute and write a fresh persistent cache row. |
+| `trigger_reason` | `api` | Recorded in cache metadata when recomputed. |
+
+Manual forced refresh example:
+
+```text
+https://discovery.prophet.zone/api/events/unusual-betting/summary?slug=fifwc-esp-cvi-2026-06-15&refresh=1&cache_ttl_seconds=0
+```
+
+Responses include cache metadata:
+
+```json
+{
+  "cache": {
+    "source": "postgres_cache",
+    "cache_key": "9f7...",
+    "refreshed_at": "2026-06-17T10:20:30.123456+00:00",
+    "generated_at": "2026-06-17T10:20:29.998000+00:00",
+    "age_seconds": 42.15,
+    "trigger_reason": "scheduled",
+    "error": null
+  }
+}
+```
 
 ## Endpoints
 
@@ -77,7 +149,8 @@ Recommended query parameters:
 | `very_large_threshold` | `1000000` | Wallet aggregate threshold for stronger severity. |
 | `extreme_threshold` | `5000000` | Wallet aggregate threshold for extreme severity. |
 | `cold_price_threshold` | `0.25` | Low user-side price threshold. |
-| `cache_ttl_seconds` | `60` | Server-side cache TTL. Use `0` only when debugging. |
+| `persisted_cache_ttl_seconds` | `3600` | Freshness window for cached scheduled results. |
+| `cache_ttl_seconds` | `60` | In-process cache TTL and stale fallback switch. Use `0` only when debugging. |
 
 Response fields:
 

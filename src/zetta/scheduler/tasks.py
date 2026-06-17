@@ -52,16 +52,16 @@ class LocalTaskStore:
 
     def add_many(self, new_tasks: list[Task]) -> int:
         tasks = self.load()
-        existing = {(task.kind, _stable_json(task.params)) for task in tasks}
+        existing = {(task.kind, task_dedupe_value(task.params)) for task in tasks}
         added = 0
         for task in new_tasks:
-            key = (task.kind, _stable_json(task.params))
+            key = (task.kind, task_dedupe_value(task.params))
             if key in existing:
                 existing_task = next(
                     (
                         item
                         for item in tasks
-                        if item.kind == task.kind and _stable_json(item.params) == key[1]
+                        if item.kind == task.kind and task_dedupe_value(item.params) == key[1]
                     ),
                     None,
                 )
@@ -74,6 +74,10 @@ class LocalTaskStore:
                     existing_task.priority = task.priority
                     existing_task.attempts = 0
                     existing_task.last_error = None
+                    existing_task.params = merge_requeued_task_params(
+                        existing_task.params,
+                        task.params,
+                    )
                     existing_task.updated_at = datetime.now(UTC).isoformat()
                     added += 1
                 continue
@@ -205,10 +209,17 @@ class PostgresTaskStore:
                     )
                     changed = cursor.rowcount
                     if changed == 0 and requeue_done_task(task.params):
+                        if "_dedupe_key" in task.params:
+                            where_sql = "and params->>'_dedupe_key' = %s"
+                            where_value = task.params.get("_dedupe_key")
+                        else:
+                            where_sql = "and md5(params::text) = md5(%s::jsonb::text)"
+                            where_value = Jsonb(task.params)
                         cursor.execute(
-                            """
+                            f"""
                             update collector_tasks
-                            set status = 'pending',
+                            set params = %s,
+                                status = 'pending',
                                 priority = %s,
                                 attempts = 0,
                                 max_attempts = %s,
@@ -219,16 +230,17 @@ class PostgresTaskStore:
                             where task_type = %s
                               and source = %s
                               and entity = %s
-                              and md5(params::text) = md5(%s::jsonb::text)
+                              {where_sql}
                               and status = 'done'
                             """,
                             (
+                                Jsonb(task.params),
                                 task.priority,
                                 task.max_attempts,
                                 task.kind,
                                 source,
                                 entity,
-                                Jsonb(task.params),
+                                where_value,
                             ),
                         )
                         changed = cursor.rowcount
@@ -802,6 +814,8 @@ def task_progress_from_rows(
 def task_source_entity(kind: str) -> tuple[str, str]:
     if kind == "event-refresh":
         return "event", "refresh"
+    if kind == "unusual-betting-refresh":
+        return "event", "unusual_betting_refresh"
     if kind.startswith("gamma-"):
         return "gamma", kind.removeprefix("gamma-").replace("-", "_")
     if kind == "wallet-trades":
@@ -828,6 +842,19 @@ def task_source_entity(kind: str) -> tuple[str, str]:
 
 def requeue_done_task(params: dict[str, Any]) -> bool:
     return bool(params.get("_requeue_done"))
+
+
+def task_dedupe_value(params: dict[str, Any]) -> str:
+    dedupe_key = params.get("_dedupe_key")
+    if dedupe_key is not None:
+        return str(dedupe_key)
+    return _stable_json(params)
+
+
+def merge_requeued_task_params(existing: dict[str, Any], incoming: dict[str, Any]) -> dict[str, Any]:
+    if "_dedupe_key" not in incoming:
+        return dict(existing)
+    return dict(incoming)
 
 
 def row_to_task(row: Any) -> Task:
