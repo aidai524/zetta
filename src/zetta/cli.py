@@ -311,6 +311,18 @@ def build_parser() -> argparse.ArgumentParser:
     live_token_metadata.add_argument("--load-batch-size", type=int, default=1000)
     live_token_metadata.set_defaults(func=cmd_refresh_live_token_metadata)
 
+    polycop_wallet_signals = refresh_subparsers.add_parser(
+        "polycop-wallet-signals",
+        help="Refresh cached Polycop smart wallet signal rankings.",
+    )
+    polycop_wallet_signals.add_argument("--page-size", type=int, default=50)
+    polycop_wallet_signals.add_argument("--max-pages", type=int, default=25)
+    polycop_wallet_signals.add_argument("--sleep-seconds", type=float, default=0.1)
+    polycop_wallet_signals.add_argument("--timeout-seconds", type=float, default=20.0)
+    polycop_wallet_signals.add_argument("--limit", type=int, default=500)
+    polycop_wallet_signals.add_argument("--trigger-reason", default="scheduled")
+    polycop_wallet_signals.set_defaults(func=cmd_refresh_polycop_wallet_signals)
+
     tasks = subparsers.add_parser("tasks", help="Manage local collection tasks.")
     task_subparsers = tasks.add_subparsers(required=True)
 
@@ -1253,6 +1265,33 @@ def cmd_refresh_live_token_metadata(args: argparse.Namespace, app_settings: Sett
         "raw_paths": raw_paths,
         "markets_by_token": markets_by_token,
         "load": asdict(load_result),
+    }
+
+
+def cmd_refresh_polycop_wallet_signals(
+    args: argparse.Namespace, app_settings: Settings
+) -> Any:
+    from zetta.polycop_wallets import refresh_polycop_wallet_signals
+
+    row = refresh_polycop_wallet_signals(
+        dsn=app_settings.postgres_dsn,
+        page_size=args.page_size,
+        max_pages=args.max_pages,
+        sleep_seconds=args.sleep_seconds,
+        timeout_seconds=args.timeout_seconds,
+        limit=args.limit,
+        trigger_reason=args.trigger_reason,
+    )
+    return {
+        "status": row.get("status"),
+        "cache_key": row.get("cache_key"),
+        "wallet_count": row.get("wallet_count"),
+        "stable_count": row.get("stable_count"),
+        "flow_count": row.get("flow_count"),
+        "burst_count": row.get("burst_count"),
+        "refreshed_at": row.get("refreshed_at"),
+        "age_seconds": row.get("age_seconds"),
+        "error": row.get("error"),
     }
 
 

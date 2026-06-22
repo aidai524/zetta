@@ -1,0 +1,13 @@
+[Unit]
+Description=Zetta Polycop smart wallet signal cache refresh
+After=network-online.target docker.service
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+EnvironmentFile=/etc/zetta/zetta.env
+ExecStart=/usr/local/bin/zetta-runner polycop-wallet-signals
+MemoryAccounting=true
+MemoryMax=512M
+TasksMax=32
+TimeoutStartSec=5min

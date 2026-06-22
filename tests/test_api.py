@@ -406,6 +406,59 @@ def test_product_api_wallet_screener_filters_by_category_and_range() -> None:
     assert "category_traded_notional" in query
 
 
+def test_product_api_polycop_wallet_signals_reads_cache_and_filters() -> None:
+    class FakePolycopCacheStore:
+        def get(self, *, max_age_seconds=None):
+            return {
+                "cache_key": "latest",
+                "status": "ok",
+                "source": "polycop",
+                "refreshed_at": "2026-06-22T00:00:00+00:00",
+                "generated_at": "2026-06-22T00:00:00+00:00",
+                "age_seconds": 3.0,
+                "trigger_reason": "scheduled",
+                "error": None,
+                "parameters": {"page_size": 50},
+                "summary": {"wallet_count": 2, "stable_count": 1},
+                "detail": {
+                    "wallets": [],
+                    "segments": {
+                        "stable": [
+                            {
+                                "address": "0x1111111111111111111111111111111111111111",
+                                "user_name": "steady",
+                                "x_name": "",
+                                "ai_score": 88.5,
+                                "segments": ["stable"],
+                            },
+                            {
+                                "address": "0x2222222222222222222222222222222222222222",
+                                "user_name": "low",
+                                "x_name": "",
+                                "ai_score": 42.0,
+                                "segments": ["stable"],
+                            },
+                        ],
+                        "ai_top": [],
+                    },
+                },
+            }
+
+    api = ProductApi(clickhouse=FakeClickHouse(""))
+    api._polycop_wallet_signal_cache_store = FakePolycopCacheStore()
+
+    response = api.handle(
+        "/wallets/polycop-signals",
+        {"segment": ["stable"], "min_ai_score": ["80"], "q": ["steady"], "limit": ["5"]},
+    )
+
+    assert response.status == 200
+    assert response.body["status"] == "ok"
+    assert response.body["total"] == 1
+    assert response.body["wallets"][0]["user_name"] == "steady"
+    assert response.body["cache"]["hit"] is True
+
+
 def test_product_api_wallet_detail_returns_portfolio_pnl_and_activity() -> None:
     portfolio_raw = {
         "positions": [

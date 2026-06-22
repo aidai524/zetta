@@ -1,0 +1,12 @@
+[Unit]
+Description=Refresh Zetta Polycop smart wallet signal cache every 10 minutes
+
+[Timer]
+OnBootSec=2min
+OnCalendar=*-*-* *:0/10:00
+AccuracySec=30s
+Persistent=true
+Unit=zetta-polycop-wallet-signals.service
+
+[Install]
+WantedBy=timers.target

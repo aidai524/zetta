@@ -299,6 +299,15 @@ case "$MODE" in
       --sleep-seconds "${ZETTA_LIVE_TOKEN_METADATA_SLEEP_SECONDS:-0.05}" \
       --load-batch-size "${ZETTA_LIVE_TOKEN_METADATA_LOAD_BATCH_SIZE:-1000}"
     ;;
+  polycop-wallet-signals)
+    "$ZETTA_PYTHON" -m zetta.cli "${COMMON_ARGS[@]}" refresh polycop-wallet-signals \
+      --page-size "${ZETTA_POLYCOP_WALLET_SIGNAL_PAGE_SIZE:-50}" \
+      --max-pages "${ZETTA_POLYCOP_WALLET_SIGNAL_MAX_PAGES:-25}" \
+      --sleep-seconds "${ZETTA_POLYCOP_WALLET_SIGNAL_SLEEP_SECONDS:-0.1}" \
+      --timeout-seconds "${ZETTA_POLYCOP_WALLET_SIGNAL_TIMEOUT_SECONDS:-20}" \
+      --limit "${ZETTA_POLYCOP_WALLET_SIGNAL_LIMIT:-500}" \
+      --trigger-reason "${ZETTA_POLYCOP_WALLET_SIGNAL_TRIGGER_REASON:-scheduled}"
+    ;;
   wallet-rollup)
     "$ZETTA_PYTHON" -m zetta.cli "${COMMON_ARGS[@]}" build wallet-trade-rollup \
       --since-hours "${ZETTA_WALLET_ROLLUP_SINCE_HOURS:-48}"

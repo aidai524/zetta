@@ -21,6 +21,7 @@ from zetta.config import Settings
 from zetta.collectors.data import PUSD_ADDRESS, PUSD_DECIMALS, erc20_balance_of_data
 from zetta.loaders.data import activity_rows, wallet_pnl_snapshot_rows, wallet_portfolio_rows
 from zetta.polymarket import PolymarketClient
+from zetta.polycop_wallets import PolycopWalletSignalCacheStore
 from zetta.scheduler.tasks import PostgresTaskStore, Task
 from zetta.storage.clickhouse import ClickHouseWriter
 from zetta.tracked_wallets import TrackedWalletStore, normalize_wallet_address
@@ -56,6 +57,11 @@ class ProductApi:
         self._live_trades_lock = Lock()
         self._unusual_betting_cache_store: UnusualBettingCacheStore | None = (
             UnusualBettingCacheStore(dsn=settings.postgres_dsn) if settings is not None else None
+        )
+        self._polycop_wallet_signal_cache_store: PolycopWalletSignalCacheStore | None = (
+            PolycopWalletSignalCacheStore(dsn=settings.postgres_dsn)
+            if settings is not None
+            else None
         )
 
     def handle(self, path: str, query: dict[str, list[str]]) -> ApiResponse:
@@ -137,6 +143,22 @@ class ProductApi:
             return ApiResponse(HTTPStatus.OK, {"summary": self.wallet_summary(query)})
         if path == "/wallets/screener":
             return ApiResponse(HTTPStatus.OK, {"wallets": self.wallet_screener(query)})
+        if path == "/wallets/polycop-signals/summary":
+            output = self.polycop_wallet_signals(query, include_wallets=False)
+            status = (
+                HTTPStatus.SERVICE_UNAVAILABLE
+                if output.get("status") == "store_unavailable"
+                else HTTPStatus.OK
+            )
+            return ApiResponse(status, output)
+        if path == "/wallets/polycop-signals":
+            output = self.polycop_wallet_signals(query)
+            status = (
+                HTTPStatus.SERVICE_UNAVAILABLE
+                if output.get("status") == "store_unavailable"
+                else HTTPStatus.OK
+            )
+            return ApiResponse(status, output)
         if path == "/wallets/detail":
             detail = self.wallet_detail(query)
             if detail is None:
@@ -3229,6 +3251,84 @@ class ProductApi:
         """
         return rows_json(self.clickhouse.query_text(sql))
 
+    def polycop_wallet_signals(
+        self,
+        query: dict[str, list[str]],
+        *,
+        include_wallets: bool = True,
+    ) -> dict[str, Any]:
+        if self._polycop_wallet_signal_cache_store is None:
+            return {"status": "store_unavailable", "wallets": [] if include_wallets else None}
+        max_age_seconds = bounded_int_param(
+            query,
+            "max_age_seconds",
+            0,
+            minimum=0,
+            maximum=7 * 24 * 3600,
+        )
+        row = self._polycop_wallet_signal_cache_store.get(
+            max_age_seconds=max_age_seconds if max_age_seconds > 0 else None
+        )
+        if row is None:
+            output: dict[str, Any] = {
+                "status": "missing_cache",
+                "cache": {"source": "postgres", "hit": False},
+                "summary": {},
+                "parameters": {},
+            }
+            if include_wallets:
+                output.update({"wallets": [], "total": 0, "limit": 0, "offset": 0})
+            return output
+
+        detail = row.get("detail") if isinstance(row.get("detail"), dict) else {}
+        summary = dict(row.get("summary") or {})
+        output = {
+            "status": row.get("status") or "unknown",
+            "source": row.get("source") or "polycop",
+            "cache": {
+                "source": "postgres",
+                "hit": True,
+                "cache_key": row.get("cache_key"),
+                "refreshed_at": row.get("refreshed_at"),
+                "generated_at": row.get("generated_at"),
+                "age_seconds": row.get("age_seconds"),
+                "trigger_reason": row.get("trigger_reason"),
+                "error": row.get("error"),
+            },
+            "summary": summary,
+            "parameters": row.get("parameters") or {},
+        }
+        if not include_wallets:
+            return output
+
+        segment = normalize_polycop_segment(param(query, "segment", "ai_top"))
+        limit = bounded_int_param(query, "limit", 50, minimum=1, maximum=500)
+        offset = bounded_int_param(query, "offset", 0, minimum=0, maximum=100_000)
+        min_ai_score = float_param(query, "min_ai_score", 0.0, minimum=0.0, maximum=100.0)
+        search = param(query, "q").strip().lower()
+        wallets = polycop_wallet_segment(detail, segment)
+        if min_ai_score > 0:
+            wallets = [
+                wallet
+                for wallet in wallets
+                if float(wallet.get("ai_score") or 0.0) >= min_ai_score
+            ]
+        if search:
+            wallets = [
+                wallet for wallet in wallets if polycop_wallet_matches_search(wallet, search)
+            ]
+        total = len(wallets)
+        output.update(
+            {
+                "segment": segment,
+                "total": total,
+                "limit": limit,
+                "offset": offset,
+                "wallets": wallets[offset : offset + limit],
+            }
+        )
+        return output
+
     def wallet_detail(self, query: dict[str, list[str]]) -> dict[str, Any] | None:
         user = param(query, "user").lower()
         if not user:
@@ -6310,6 +6410,37 @@ def float_param(
     if maximum is not None:
         value = min(maximum, value)
     return value
+
+
+def normalize_polycop_segment(value: str) -> str:
+    segment = str(value or "").strip().lower().replace("-", "_")
+    if segment in ("stable", "flow", "burst", "watch", "all", "ai_top"):
+        return segment
+    return "ai_top"
+
+
+def polycop_wallet_segment(detail: dict[str, Any], segment: str) -> list[dict[str, Any]]:
+    if segment == "all":
+        wallets = detail.get("wallets", [])
+    elif segment == "watch":
+        wallets = [
+            wallet
+            for wallet in detail.get("wallets", [])
+            if "watch" in list(wallet.get("segments") or [])
+        ]
+    else:
+        wallets = (detail.get("segments") or {}).get(segment, [])
+    return [wallet for wallet in wallets if isinstance(wallet, dict)]
+
+
+def polycop_wallet_matches_search(wallet: dict[str, Any], search: str) -> bool:
+    fields = (
+        wallet.get("address"),
+        wallet.get("user_name"),
+        wallet.get("x_name"),
+        wallet.get("primary_segment"),
+    )
+    return any(search in str(field or "").lower() for field in fields)
 
 
 def ch_string(value: str) -> str:
