@@ -20,6 +20,7 @@ from zetta.chain.rpc import PolygonRpcClient
 from zetta.config import Settings
 from zetta.collectors.data import PUSD_ADDRESS, PUSD_DECIMALS, erc20_balance_of_data
 from zetta.loaders.data import activity_rows, wallet_pnl_snapshot_rows, wallet_portfolio_rows
+from zetta.official_trade_feed import load_recent_trade_messages, load_recent_wallet_trade_messages
 from zetta.polymarket import PolymarketClient
 from zetta.polycop_wallets import PolycopWalletSignalCacheStore
 from zetta.scheduler.tasks import PostgresTaskStore, Task
@@ -3341,6 +3342,16 @@ class ProductApi:
         position_scope = param(query, "position_scope", "all").lower()
         position_sort = param(query, "position_sort", "current_value").lower()
 
+        if truthy_param(query, "realtime"):
+            return self.wallet_detail_realtime(
+                user,
+                position_limit=position_limit,
+                activity_limit=activity_limit,
+                pnl_points_limit=pnl_points_limit,
+                position_scope=position_scope,
+                position_sort=position_sort,
+            )
+
         if truthy_param(query, "live"):
             live_detail = self.wallet_detail_live(
                 user,
@@ -3442,6 +3453,10 @@ class ProductApi:
             {**row, "user_address": str(row.get("user_address") or user).lower()}
             for row in live_activity_rows
         ]
+        live_activity_rows = merge_wallet_rtds_activity_rows(
+            live_activity_rows,
+            self.wallet_rtds_activity_rows(user, captured_at),
+        )
         live_activity_rows = dedupe_wallet_activity_rows(live_activity_rows)
 
         portfolio = json_ready_row(portfolio_rows[0]) if portfolio_rows else None
@@ -3481,6 +3496,62 @@ class ProductApi:
             data_source="live",
         )
 
+    def wallet_detail_realtime(
+        self,
+        user: str,
+        *,
+        position_limit: int,
+        activity_limit: int,
+        pnl_points_limit: int,
+        position_scope: str,
+        position_sort: str,
+    ) -> dict[str, Any]:
+        captured_at = datetime.now(UTC)
+        realtime_rows = dedupe_wallet_activity_rows(
+            self.wallet_rtds_activity_rows(user, captured_at, limit=max(activity_limit, 100))
+        )
+        activity_summary = summarize_activity_rows(user, realtime_rows)
+        activity_by_type = summarize_activity_rows_by_type(realtime_rows)
+        activity_positions = wallet_closed_positions_from_activity(
+            realtime_rows,
+            include_open=True,
+        )
+        closed_positions = [
+            position for position in activity_positions if position.get("is_settled_or_redeemable")
+        ]
+        recent_activity = recent_activity_from_rows(realtime_rows, activity_limit)
+        detail = self.wallet_detail_response(
+            user,
+            portfolio=None,
+            pnl=None,
+            activity_summary=activity_summary,
+            activity_by_type=activity_by_type,
+            recent_activity=recent_activity,
+            reputation=None,
+            closed_positions=closed_positions,
+            activity_positions=activity_positions,
+            position_limit=position_limit,
+            activity_limit=activity_limit,
+            pnl_points_limit=pnl_points_limit,
+            position_scope=position_scope,
+            position_sort=position_sort,
+            data_source="realtime",
+        )
+        detail["wallet"]["data_status"] = "ok" if realtime_rows else "no_realtime_activity"
+        detail["wallet"]["data_freshness_status"] = "ok" if realtime_rows else "missing"
+        detail["wallet"]["realtime_activity_count"] = len(realtime_rows)
+        detail["wallet"]["realtime_last_activity_at"] = activity_summary.get("last_activity_at")
+        detail["realtime"] = {
+            "enabled": True,
+            "source": "polymarket-rtds",
+            "cache_status": "hit" if realtime_rows else "miss",
+            "activity_count": len(realtime_rows),
+            "activity_limit": activity_limit,
+            "captured_at": api_datetime(captured_at),
+            "last_activity_at": activity_summary.get("last_activity_at"),
+        }
+        return detail
+
     def live_pusd_balance(self, user: str) -> float:
         if self.settings is None or not self.settings.polygon_rpc_url:
             return 0.0
@@ -3492,6 +3563,44 @@ class ProductApi:
         except Exception:
             return 0.0
         return int(raw, 16) / PUSD_DECIMALS if raw and raw != "0x" else 0.0
+
+    def wallet_rtds_activity_rows(
+        self,
+        user: str,
+        captured_at: datetime,
+        *,
+        limit: int = 500,
+    ) -> list[dict[str, Any]]:
+        if self.settings is None:
+            return []
+        messages = load_recent_wallet_trade_messages(
+            self.settings.state_dir,
+            user,
+            limit=limit,
+        )
+        if len(messages) < limit:
+            seen_keys = {rtds_message_key(message) for message in messages}
+            for message in load_recent_trade_messages(
+                self.settings.state_dir,
+                limit=max(limit, 1_000),
+            ):
+                key = rtds_message_key(message)
+                if key in seen_keys:
+                    continue
+                trade = message.get("trade")
+                if not isinstance(trade, dict):
+                    continue
+                if str(trade.get("user_address") or "").lower() != user.lower():
+                    continue
+                messages.append(message)
+                seen_keys.add(key)
+                if len(messages) >= limit:
+                    break
+        return wallet_rtds_activity_rows(
+            user,
+            messages,
+            captured_at,
+        )
 
     def wallet_detail_response(
         self,
@@ -5060,6 +5169,92 @@ def wallet_activity_row_key(row: dict[str, Any]) -> tuple[Any, ...]:
     return ("activity_id", str(row.get("activity_id") or ""))
 
 
+def rtds_message_key(message: dict[str, Any]) -> str:
+    trade = message.get("trade")
+    if isinstance(trade, dict):
+        trade_id = str(trade.get("trade_id") or "")
+        if trade_id:
+            return trade_id
+        return "|".join(
+            [
+                str(trade.get("transaction_hash") or ""),
+                str(trade.get("token_id") or ""),
+                str(trade.get("user_address") or "").lower(),
+                str(trade.get("side") or ""),
+                str(trade.get("price") or ""),
+                str(trade.get("size") or ""),
+                str(trade.get("timestamp") or ""),
+            ]
+        )
+    return json.dumps(message, sort_keys=True, default=str, separators=(",", ":"))
+
+
+def merge_wallet_rtds_activity_rows(
+    activity_rows_payload: list[dict[str, Any]],
+    rtds_rows: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    if not rtds_rows:
+        return activity_rows_payload
+    return [*rtds_rows, *activity_rows_payload]
+
+
+def wallet_rtds_activity_rows(
+    user: str,
+    messages: list[dict[str, Any]],
+    captured_at: datetime,
+) -> list[dict[str, Any]]:
+    normalized_user = str(user or "").lower()
+    rows: list[dict[str, Any]] = []
+    for message in messages:
+        trade = message.get("trade")
+        raw = message.get("raw")
+        payload = raw.get("payload") if isinstance(raw, dict) else None
+        if not isinstance(trade, dict):
+            continue
+        if str(trade.get("user_address") or "").lower() != normalized_user:
+            continue
+        timestamp = parse_clickhouse_datetime(trade.get("timestamp"))
+        if timestamp is None:
+            continue
+        raw_payload = payload if isinstance(payload, dict) else rtds_trade_raw_payload(trade)
+        rows.append(
+            {
+                "activity_id": str(trade.get("trade_id") or ""),
+                "user_address": normalized_user,
+                "timestamp": timestamp,
+                "activity_type": "TRADE",
+                "condition_id": str(trade.get("condition_id") or ""),
+                "token_id": str(trade.get("token_id") or ""),
+                "transaction_hash": str(trade.get("transaction_hash") or ""),
+                "side": str(trade.get("side") or ""),
+                "price": float_value(trade.get("price")),
+                "size": float_value(trade.get("size")),
+                "notional": float_value(trade.get("notional")),
+                "raw_json": json.dumps(raw_payload, ensure_ascii=False, separators=(",", ":")),
+                "ingested_at": captured_at,
+                "source": "polymarket-rtds",
+            }
+        )
+    return rows
+
+
+def rtds_trade_raw_payload(trade: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "title": str(trade.get("question") or ""),
+        "slug": str(trade.get("market_slug") or ""),
+        "eventSlug": str(trade.get("event_slug") or ""),
+        "outcome": str(trade.get("outcome") or ""),
+        "transactionHash": str(trade.get("transaction_hash") or ""),
+        "asset": str(trade.get("token_id") or ""),
+        "conditionId": str(trade.get("condition_id") or ""),
+        "proxyWallet": str(trade.get("user_address") or ""),
+        "side": str(trade.get("side") or ""),
+        "price": float_value(trade.get("price")),
+        "size": float_value(trade.get("size")),
+        "usdcSize": float_value(trade.get("notional")),
+    }
+
+
 def summarize_activity_rows(user: str, rows: list[dict[str, Any]]) -> dict[str, Any]:
     if not rows:
         return empty_wallet_activity_summary(user)
@@ -5152,6 +5347,7 @@ def recent_activity_from_rows(rows: list[dict[str, Any]], limit: int) -> list[di
                 "slug": str(raw.get("slug") or ""),
                 "event_slug": str(raw.get("eventSlug") or raw.get("event_slug") or ""),
                 "outcome": str(raw.get("outcome") or ""),
+                "source": str(row.get("source") or ""),
             }
         )
     return output

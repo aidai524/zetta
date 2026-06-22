@@ -28,9 +28,13 @@ import {
 import "./styles.css";
 
 const API_BASE = import.meta.env.VITE_ZETTA_API_BASE || "/api";
+const TRADE_STREAM_PATH = import.meta.env.VITE_ZETTA_TRADE_STREAM_PATH || "/stream/trades";
+const OFFICIAL_TRADE_FEED_PATH = import.meta.env.VITE_ZETTA_OFFICIAL_TRADE_FEED_PATH || "/stream/official-trades";
 const SUMMARY_CACHE_KEY = "zetta.discovery.walletSummaries.v1";
 const LIVE_TRADES_CACHE_KEY = "zetta.discovery.liveTrades.v1";
 const LIVE_TRADES_CACHE_LIMIT = 1000;
+const OFFICIAL_TRADES_LIMIT = 500;
+const OFFICIAL_TRADE_SETTINGS_KEY = "zetta.discovery.officialTradeSettings.v1";
 const DETAIL_QUERY = "live=1&position_limit=100&activity_limit=80&pnl_points_limit=240";
 const SHANGHAI_TIME_ZONE = "Asia/Shanghai";
 const SMART_CATEGORIES = ["全部", "政治", "体育", "加密货币", "电竞", "伊朗", "金融", "地缘政治", "科技", "文化", "经济", "天气", "选举", "提及"];
@@ -39,7 +43,8 @@ type Route =
   | { name: "track"; modal?: "add" }
   | { name: "address"; wallet: string }
   | { name: "leaderboard"; tab: "trades" | "smart"; open?: "wallet" | "type" | "category" }
-  | { name: "unusual-betting"; slug: string };
+  | { name: "unusual-betting"; slug: string }
+  | { name: "official-trades"; open?: "wallet" | "type" | "category" };
 
 type ApiTrackedWallet = {
   address?: string;
@@ -281,6 +286,65 @@ type LiveTradesMeta = {
   captured_at?: string;
   latency_seconds?: number | null;
   metadata_missing_count?: number;
+  stream_connected?: boolean;
+  stream_status?: string;
+  stream_last_at?: string;
+};
+
+type TradeStreamMessage = {
+  type?: string;
+  status?: string;
+  source?: string;
+  captured_at?: string;
+  latency_seconds?: number | null;
+  server_time?: string;
+  upstream_connected?: boolean;
+  last_trade_at?: string | null;
+  replay?: boolean;
+  trade?: RecentTrade;
+  trade_id?: string;
+  hash?: string;
+  transaction_hash?: string;
+  timestamp?: string;
+  market_id?: string;
+  condition_id?: string;
+  asset_id?: string;
+  token_id?: string;
+  maker_address?: string;
+  user_address?: string;
+  side?: string;
+  price?: number | string;
+  size?: number | string;
+  notional?: number | string;
+  question?: string;
+  market?: string;
+  slug?: string;
+  event_slug?: string;
+  event_title?: string;
+  category?: string;
+  outcome?: string;
+};
+
+type OfficialTradeFeedMeta = {
+  connected?: boolean;
+  upstream_connected?: boolean;
+  status?: string;
+  last_trade_at?: string | null;
+  latency_seconds?: number | null;
+};
+
+type OfficialTradeFeedSettings = {
+  soundEnabled?: boolean;
+  volume?: number;
+  soundMinNotional?: string;
+  gifMinNotional?: string;
+};
+
+const DEFAULT_OFFICIAL_TRADE_SETTINGS: OfficialTradeFeedSettings = {
+  soundEnabled: false,
+  volume: 50,
+  soundMinNotional: "1000",
+  gifMinNotional: "5000",
 };
 
 type UnusualBettingEvent = {
@@ -410,6 +474,11 @@ const DEFAULT_LEADER_FILTERS: LeaderFilters = {
   search: "",
 };
 
+const DEFAULT_OFFICIAL_FILTERS: LeaderFilters = {
+  ...DEFAULT_LEADER_FILTERS,
+  minNotional: "0",
+};
+
 type DetailTab = "positions" | "history" | "activity";
 
 function App() {
@@ -439,12 +508,36 @@ function App() {
   const [liveTradesMeta, setLiveTradesMeta] = useState<LiveTradesMeta>({});
   const [tradesLoading, setTradesLoading] = useState(false);
   const [leaderFilters, setLeaderFilters] = useState<LeaderFilters>(DEFAULT_LEADER_FILTERS);
+  const [officialFilters, setOfficialFilters] = useState<LeaderFilters>(DEFAULT_OFFICIAL_FILTERS);
   const [newTradeKeys, setNewTradeKeys] = useState<Set<string>>(() => new Set());
+  const [officialTrades, setOfficialTrades] = useState<RecentTrade[]>([]);
+  const [officialTradeKeys, setOfficialTradeKeys] = useState<Set<string>>(() => new Set());
+  const [officialMeta, setOfficialMeta] = useState<OfficialTradeFeedMeta>({});
+  const [officialSettings, setOfficialSettings] = useState<OfficialTradeFeedSettings>(() => loadOfficialTradeSettings());
   const [unusualData, setUnusualData] = useState<UnusualBettingDetail | null>(null);
   const [unusualLoading, setUnusualLoading] = useState(false);
   const [unusualError, setUnusualError] = useState("");
   const seenTradeKeysRef = useRef<Set<string>>(new Set(initialLiveTrades.map(tradeCacheKey)));
+  const seenOfficialTradeKeysRef = useRef<Set<string>>(new Set());
   const liveTradesInitializedRef = useRef(initialLiveTrades.length > 0);
+  const leaderFiltersRef = useRef<LeaderFilters>(leaderFilters);
+  const officialFiltersRef = useRef<LeaderFilters>(officialFilters);
+  const officialSettingsRef = useRef<OfficialTradeFeedSettings>(officialSettings);
+  const streamReconnectTimerRef = useRef<number | null>(null);
+  const officialReconnectTimerRef = useRef<number | null>(null);
+
+  useEffect(() => {
+    leaderFiltersRef.current = leaderFilters;
+  }, [leaderFilters]);
+
+  useEffect(() => {
+    officialFiltersRef.current = officialFilters;
+  }, [officialFilters]);
+
+  useEffect(() => {
+    officialSettingsRef.current = officialSettings;
+    saveOfficialTradeSettings(officialSettings);
+  }, [officialSettings]);
 
   useEffect(() => {
     const onHashChange = () => setRoute(parseRoute());
@@ -603,6 +696,8 @@ function App() {
     }
   }, []);
 
+  const trackedWalletSet = useMemo(() => new Set(trackedWallets.map(walletAddress).filter(Boolean)), [trackedWallets]);
+
   useEffect(() => {
     void fetchTrackedWallets();
   }, [fetchTrackedWallets]);
@@ -636,10 +731,188 @@ function App() {
   }, [fetchUnusualBetting, route]);
 
   useEffect(() => {
+    const useLive = leaderFilters.walletType === "all";
+    if (route.name !== "leaderboard" || route.tab !== "trades" || !useLive) return;
+    let websocket: WebSocket | null = null;
+    let stopped = false;
+    let reconnectDelay = 1500;
+
+    const clearReconnectTimer = () => {
+      if (streamReconnectTimerRef.current !== null) {
+        window.clearTimeout(streamReconnectTimerRef.current);
+        streamReconnectTimerRef.current = null;
+      }
+    };
+
+    const connect = () => {
+      clearReconnectTimer();
+      websocket = new WebSocket(tradeStreamUrl());
+      websocket.onopen = () => {
+        reconnectDelay = 1500;
+        setLiveTradesMeta((current) => ({
+          ...current,
+          stream_connected: true,
+          stream_status: "connected",
+          stream_last_at: new Date().toISOString(),
+        }));
+      };
+      websocket.onmessage = (event) => {
+        const message = parseTradeStreamMessage(event.data);
+        if (!message) return;
+        if (message.type === "trade") {
+          const trade = tradeFromStreamMessage(message);
+          if (!trade) return;
+          const merged = mergeLiveTrades([trade]);
+          setRecentTrades(filterTradesClientSide(merged, leaderFiltersRef.current));
+          setLiveTradesMeta((current) => ({
+            ...current,
+            source: message.source || current.source || "stream",
+            captured_at: message.captured_at || current.captured_at,
+            stream_connected: true,
+            stream_status: "connected",
+            stream_last_at: new Date().toISOString(),
+          }));
+          return;
+        }
+        if (message.type === "status" || message.type === "heartbeat" || message.type === "connected") {
+          setLiveTradesMeta((current) => ({
+            ...current,
+            source: message.source || current.source,
+            status: message.status || current.status,
+            captured_at: message.captured_at || current.captured_at,
+            latency_seconds: message.latency_seconds ?? current.latency_seconds,
+            stream_connected: true,
+            stream_status: message.type === "connected" ? "connected" : message.status || "ok",
+            stream_last_at: message.server_time || new Date().toISOString(),
+          }));
+        }
+      };
+      websocket.onerror = () => {
+        setLiveTradesMeta((current) => ({
+          ...current,
+          stream_connected: false,
+          stream_status: "error",
+          stream_last_at: new Date().toISOString(),
+        }));
+      };
+      websocket.onclose = () => {
+        websocket = null;
+        if (stopped) return;
+        setLiveTradesMeta((current) => ({
+          ...current,
+          stream_connected: false,
+          stream_status: "reconnecting",
+          stream_last_at: new Date().toISOString(),
+        }));
+        streamReconnectTimerRef.current = window.setTimeout(connect, reconnectDelay);
+        reconnectDelay = Math.min(reconnectDelay * 1.6, 12_000);
+      };
+    };
+
+    connect();
+    return () => {
+      stopped = true;
+      clearReconnectTimer();
+      if (websocket) {
+        websocket.close();
+      }
+      setLiveTradesMeta((current) => ({ ...current, stream_connected: false, stream_status: "closed" }));
+    };
+  }, [leaderFilters.walletType, mergeLiveTrades, route]);
+
+  useEffect(() => {
     if (route.name !== "leaderboard" || route.tab !== "trades") return;
-    const timer = window.setInterval(() => void fetchRecentTrades(), 3_000);
+    const intervalMs = leaderFilters.walletType === "all" ? 30_000 : 3_000;
+    const timer = window.setInterval(() => void fetchRecentTrades(), intervalMs);
     return () => window.clearInterval(timer);
-  }, [fetchRecentTrades, route]);
+  }, [fetchRecentTrades, leaderFilters.walletType, route]);
+
+  useEffect(() => {
+    if (route.name !== "official-trades") return;
+    let websocket: WebSocket | null = null;
+    let stopped = false;
+    let reconnectDelay = 1000;
+
+    const clearReconnectTimer = () => {
+      if (officialReconnectTimerRef.current !== null) {
+        window.clearTimeout(officialReconnectTimerRef.current);
+        officialReconnectTimerRef.current = null;
+      }
+    };
+
+    const connect = () => {
+      clearReconnectTimer();
+      websocket = new WebSocket(officialTradeFeedUrl());
+      websocket.onopen = () => {
+        reconnectDelay = 1000;
+        setOfficialMeta((current) => ({ ...current, connected: true, status: "connected" }));
+      };
+      websocket.onmessage = (event) => {
+        const message = parseTradeStreamMessage(event.data);
+        if (!message) return;
+        if (message.type === "trade") {
+          const trade = tradeFromStreamMessage(message);
+          if (!trade) return;
+          const key = tradeCacheKey(trade);
+          if (seenOfficialTradeKeysRef.current.has(key)) return;
+          seenOfficialTradeKeysRef.current.add(key);
+          setOfficialTrades((current) => [trade, ...current].slice(0, OFFICIAL_TRADES_LIMIT));
+          const settings = officialSettingsRef.current;
+          const notional = Number(trade.notional || 0);
+          const visible = officialTradeMatchesFilters(trade, officialFiltersRef.current, trackedWalletSet);
+          if (visible && notional >= officialGifMinNotional(settings)) {
+            setOfficialTradeKeys((current) => new Set([...current, key]));
+            window.setTimeout(() => {
+              setOfficialTradeKeys((current) => {
+                const next = new Set(current);
+                next.delete(key);
+                return next;
+              });
+            }, 900);
+          }
+          if (!message.replay && visible && settings.soundEnabled && notional >= numberSetting(settings.soundMinNotional || "", 0)) {
+            playTradeSound(settings.volume || 50, trade.side);
+          }
+          setOfficialMeta((current) => ({
+            ...current,
+            connected: true,
+            upstream_connected: true,
+            status: "live",
+            last_trade_at: trade.timestamp || current.last_trade_at,
+            latency_seconds: message.latency_seconds ?? current.latency_seconds,
+          }));
+          return;
+        }
+        if (message.type === "status" || message.type === "connected" || message.type === "heartbeat") {
+          setOfficialMeta((current) => ({
+            ...current,
+            connected: true,
+            upstream_connected: message.upstream_connected ?? current.upstream_connected,
+            status: message.status || current.status,
+            last_trade_at: message.last_trade_at || current.last_trade_at,
+          }));
+        }
+      };
+      websocket.onerror = () => {
+        setOfficialMeta((current) => ({ ...current, connected: false, status: "error" }));
+      };
+      websocket.onclose = () => {
+        websocket = null;
+        if (stopped) return;
+        setOfficialMeta((current) => ({ ...current, connected: false, status: "reconnecting" }));
+        officialReconnectTimerRef.current = window.setTimeout(connect, reconnectDelay);
+        reconnectDelay = Math.min(reconnectDelay * 1.6, 10_000);
+      };
+    };
+
+    connect();
+    return () => {
+      stopped = true;
+      clearReconnectTimer();
+      if (websocket) websocket.close();
+      setOfficialMeta((current) => ({ ...current, connected: false, status: "closed" }));
+    };
+  }, [route, trackedWalletSet]);
 
   async function addTrackedWallet(event: React.FormEvent) {
     event.preventDefault();
@@ -686,12 +959,17 @@ function App() {
     }
   }
 
+  const filteredOfficialTrades = useMemo(
+    () => filterOfficialTrades(officialTrades, officialFilters, trackedWalletSet),
+    [officialTrades, officialFilters, trackedWalletSet],
+  );
   const activeWallet = route.name === "address" ? walletByAddress(trackedWallets, route.wallet) : null;
   const activeTab = route.name === "leaderboard" ? route.tab : undefined;
+  const activeHeader = route.name === "leaderboard" ? "排行榜" : route.name === "unusual-betting" ? "异常分析" : route.name === "official-trades" ? "官方实时" : "追踪";
 
   return (
     <div className="page">
-      <Header active={route.name === "leaderboard" ? "排行榜" : route.name === "unusual-betting" ? "异常分析" : "追踪"} />
+      <Header active={activeHeader} />
       <SubToolbar />
       {trackedError ? <Notice message={trackedError} /> : null}
 
@@ -747,6 +1025,19 @@ function App() {
         />
       ) : null}
 
+      {route.name === "official-trades" ? (
+        <OfficialTradesPage
+          rows={filteredOfficialTrades}
+          totalRows={officialTrades.length}
+          meta={officialMeta}
+          filters={officialFilters}
+          open={route.open}
+          trackedWalletCount={trackedWalletSet.size}
+          newTradeKeys={officialTradeKeys}
+          onFilterChange={setOfficialFilters}
+        />
+      ) : null}
+
       {route.name === "unusual-betting" ? (
         <UnusualBettingPage
           slug={route.slug}
@@ -773,7 +1064,7 @@ function App() {
   );
 }
 
-function Header({ active }: { active: "追踪" | "排行榜" | "异常分析" }) {
+function Header({ active }: { active: "追踪" | "排行榜" | "异常分析" | "官方实时" }) {
   return (
     <header className="app-header">
       <button className="logo" onClick={() => navigate("#/track")} aria-label="Zetta">
@@ -786,6 +1077,7 @@ function Header({ active }: { active: "追踪" | "排行榜" | "异常分析" })
         <button className="nav-item trophy" type="button">世界杯</button>
         <button className={active === "追踪" ? "nav-item active" : "nav-item"} type="button" onClick={() => navigate("#/track")}>追踪</button>
         <button className={active === "排行榜" ? "nav-item active" : "nav-item"} type="button" onClick={() => navigate("#/leaderboard")}>排行榜</button>
+        <button className={active === "官方实时" ? "nav-item active" : "nav-item"} type="button" onClick={() => navigate("#/official-trades")}>官方实时</button>
         <button className={active === "异常分析" ? "nav-item active" : "nav-item"} type="button" onClick={() => navigate("#/unusual-betting")}>异常分析</button>
       </nav>
       <div className="header-actions">
@@ -1279,7 +1571,7 @@ function LeaderboardPage({
             </label>
             <button className="filter-button" type="button" onClick={() => toggleLeaderboardFilter("wallet", open)}><Filter size={15} />过滤</button>
             <button className="filter-button" type="button" onClick={onRefreshTrades}>{tradesLoading ? <Loader2 className="spin" size={15} /> : <RefreshCw size={15} />}刷新</button>
-            <span className="live-pill">{formatLatency(liveTradesMeta.latency_seconds) || "Live"}</span>
+            <span className={liveTradesMeta.stream_connected ? "live-pill" : "live-pill stale"}>{tradeStreamStatusLabel(liveTradesMeta)}</span>
           </div>
         )}
       </div>
@@ -1438,6 +1730,85 @@ function TradeTable({ rows, newTradeKeys }: { rows: RecentTrade[]; newTradeKeys:
             );
           })}
           {!rows.length ? <tr><td colSpan={9}><div className="empty-state">暂无实时交易。</div></td></tr> : null}
+        </tbody>
+      </table>
+    </div>
+  );
+}
+
+function OfficialTradesPage({
+  rows,
+  totalRows,
+  meta,
+  filters,
+  open,
+  trackedWalletCount,
+  newTradeKeys,
+  onFilterChange,
+}: {
+  rows: RecentTrade[];
+  totalRows: number;
+  meta: OfficialTradeFeedMeta;
+  filters: LeaderFilters;
+  open?: "wallet" | "type" | "category";
+  trackedWalletCount: number;
+  newTradeKeys: Set<string>;
+  onFilterChange: React.Dispatch<React.SetStateAction<LeaderFilters>>;
+}) {
+  return (
+    <main className="leader-main official-feed-main">
+      <div className="leaderboard-title-row">
+        <div className="official-feed-title">
+          <h1>Polymarket Trade Feed</h1>
+          <span>activity / trades</span>
+        </div>
+        <div className="leader-actions">
+          <label className="leader-search">
+            <Search size={15} />
+            <input value={filters.search} onChange={(event) => onFilterChange((current) => ({ ...current, search: event.target.value }))} placeholder="在列表中搜索钱包/市场" />
+          </label>
+          <button className="filter-button" type="button" onClick={() => toggleLeaderboardFilter("wallet", open)}><Filter size={15} />过滤</button>
+          <span className={meta.connected && meta.upstream_connected ? "live-pill" : "live-pill stale"}>{officialFeedStatusLabel(meta)}</span>
+          <span className="small-muted">最新 {formatRelativeTime(meta.last_trade_at)}</span>
+          <span className="small-muted">{rows.length}/{totalRows} 条</span>
+          {filters.walletType !== "all" ? <span className="small-muted">追踪 {trackedWalletCount}</span> : null}
+        </div>
+      </div>
+      <TradeFilters filters={filters} open={open} onChange={onFilterChange} />
+      <OfficialTradeTable rows={rows} newTradeKeys={newTradeKeys} />
+    </main>
+  );
+}
+
+function OfficialTradeTable({ rows, newTradeKeys }: { rows: RecentTrade[]; newTradeKeys: Set<string> }) {
+  return (
+    <div className="table-wrap">
+      <table className="leader-table official-trade-table">
+        <colgroup>
+          <col style={{ width: "7%" }} /><col style={{ width: "8%" }} /><col style={{ width: "8%" }} /><col style={{ width: "12%" }} /><col style={{ width: "8.5%" }} /><col style={{ width: "8.5%" }} /><col style={{ width: "28%" }} /><col style={{ width: "8%" }} /><col style={{ width: "7%" }} /><col style={{ width: "13%" }} />
+        </colgroup>
+        <thead><tr><th>到达</th><th>成交</th><th>类型</th><th>交易员</th><th>金额</th><th>份额</th><th>市场</th><th>结果</th><th>价格</th><th>交易</th></tr></thead>
+        <tbody>
+          {rows.map((trade, index) => {
+            const side = String(trade.side || "").toUpperCase();
+            const address = normalizeAddress(trade.user_address || "");
+            const rowKey = tradeCacheKey(trade);
+            return (
+              <tr key={rowKey} className={newTradeKeys.has(rowKey) ? "trade-row trade-row-new" : "trade-row"}>
+                <td className="muted">now</td>
+                <td className="muted">{formatRelativeTime(trade.timestamp)}</td>
+                <td><span className={`trade-type ${side === "SELL" ? "sell" : "buy"}`}>{side === "SELL" ? "卖出" : "买入"}</span></td>
+                <td><button className="trader-cell" type="button" onClick={() => navigateAddress(address)}>{walletBadgeColor(index)}<strong>{displayTraderName(trade)}</strong></button></td>
+                <td className={side === "SELL" ? "negative" : "positive"}>{formatCurrency(trade.notional)}</td>
+                <td>{formatCompactNumber(trade.size)}</td>
+                <td><div className="market leader-market"><strong>{trade.question || "--"}</strong><span className="muted">{trade.market_slug || trade.event_slug || "--"}</span></div></td>
+                <td>{resultPill(trade.outcome)}</td>
+                <td className="positive">{formatPrice(trade.price)}</td>
+                <td><span className="small-muted">{shortAddress(trade.transaction_hash)}</span></td>
+              </tr>
+            );
+          })}
+          {!rows.length ? <tr><td colSpan={10}><div className="empty-state">等待 Polymarket 官方实时成交。</div></td></tr> : null}
         </tbody>
       </table>
     </div>
@@ -1791,6 +2162,13 @@ function parseRoute(): Route {
       open: open === "wallet" || open === "type" || open === "category" ? open : undefined,
     };
   }
+  if (path.startsWith("/official-trades")) {
+    const open = params.get("open");
+    return {
+      name: "official-trades",
+      open: open === "wallet" || open === "type" || open === "category" ? open : undefined,
+    };
+  }
   if (path.startsWith("/unusual-betting")) {
     return { name: "unusual-betting", slug: params.get("slug") || "" };
   }
@@ -1802,6 +2180,11 @@ function navigate(hash: string) {
 }
 
 function toggleLeaderboardFilter(target: "wallet" | "type" | "category", open?: "wallet" | "type" | "category") {
+  const route = parseRoute();
+  if (route.name === "official-trades") {
+    navigate(open === target ? "#/official-trades" : `#/official-trades?open=${target}`);
+    return;
+  }
   navigate(open === target ? "#/leaderboard" : `#/leaderboard?open=${target}`);
 }
 
@@ -1809,6 +2192,8 @@ function closeLeaderboardFilters() {
   const route = parseRoute();
   if (route.name === "leaderboard") {
     navigate(route.tab === "smart" ? "#/leaderboard?tab=SmartMoney" : "#/leaderboard");
+  } else if (route.name === "official-trades") {
+    navigate("#/official-trades");
   }
 }
 
@@ -1885,6 +2270,76 @@ function saveLiveTradesCache(rows: RecentTrade[]) {
   } catch {
     // localStorage can be unavailable or full.
   }
+}
+
+function loadOfficialTradeSettings() {
+  try {
+    const saved = JSON.parse(window.localStorage.getItem(OFFICIAL_TRADE_SETTINGS_KEY) || "{}") as Partial<OfficialTradeFeedSettings>;
+    return { ...DEFAULT_OFFICIAL_TRADE_SETTINGS, ...saved };
+  } catch {
+    return DEFAULT_OFFICIAL_TRADE_SETTINGS;
+  }
+}
+
+function saveOfficialTradeSettings(settings: OfficialTradeFeedSettings) {
+  try {
+    window.localStorage.setItem(OFFICIAL_TRADE_SETTINGS_KEY, JSON.stringify(settings));
+  } catch {
+    // localStorage can be unavailable or full.
+  }
+}
+
+function tradeStreamUrl() {
+  if (/^wss?:\/\//i.test(TRADE_STREAM_PATH)) return TRADE_STREAM_PATH;
+  const protocol = window.location.protocol === "https:" ? "wss:" : "ws:";
+  const path = TRADE_STREAM_PATH.startsWith("/") ? TRADE_STREAM_PATH : `/${TRADE_STREAM_PATH}`;
+  return `${protocol}//${window.location.host}${path}`;
+}
+
+function officialTradeFeedUrl() {
+  if (/^wss?:\/\//i.test(OFFICIAL_TRADE_FEED_PATH)) return OFFICIAL_TRADE_FEED_PATH;
+  const protocol = window.location.protocol === "https:" ? "wss:" : "ws:";
+  const path = OFFICIAL_TRADE_FEED_PATH.startsWith("/") ? OFFICIAL_TRADE_FEED_PATH : `/${OFFICIAL_TRADE_FEED_PATH}`;
+  return `${protocol}//${window.location.host}${path}`;
+}
+
+function parseTradeStreamMessage(value: string) {
+  try {
+    const message = JSON.parse(value) as TradeStreamMessage;
+    return message && typeof message === "object" ? message : null;
+  } catch {
+    return null;
+  }
+}
+
+function tradeFromStreamMessage(message: TradeStreamMessage) {
+  if (message.trade && typeof message.trade === "object") {
+    return message.trade;
+  }
+  const price = numberOrUndefined(message.price);
+  const size = numberOrUndefined(message.size);
+  const notional = numberOrUndefined(message.notional) ?? (Number.isFinite(price || NaN) && Number.isFinite(size || NaN) ? Number(price) * Number(size) : undefined);
+  const userAddress = normalizeAddress(String(message.user_address || message.maker_address || ""));
+  if (!message.timestamp || !userAddress) return null;
+  return {
+    trade_id: message.trade_id,
+    transaction_hash: message.transaction_hash || message.hash,
+    timestamp: message.timestamp,
+    market_id: message.market_id,
+    condition_id: message.condition_id,
+    token_id: message.token_id || message.asset_id,
+    user_address: userAddress,
+    side: String(message.side || "").toUpperCase(),
+    price,
+    size,
+    notional,
+    question: message.question,
+    market_slug: message.slug || message.market,
+    event_title: message.event_title,
+    event_slug: message.event_slug,
+    category: message.category,
+    outcome: message.outcome,
+  } satisfies RecentTrade;
 }
 
 function mergeTradeRows(existing: RecentTrade[], incoming: RecentTrade[], limit: number) {
@@ -2101,6 +2556,48 @@ function filterTradesClientSide(rows: RecentTrade[], filters: LeaderFilters) {
   });
 }
 
+function filterOfficialTrades(rows: RecentTrade[], filters: LeaderFilters, trackedWallets: Set<string>) {
+  return rows.filter((row) => officialTradeMatchesFilters(row, filters, trackedWallets));
+}
+
+function officialTradeMatchesFilters(row: RecentTrade, filters: LeaderFilters, trackedWallets: Set<string>) {
+  const side = String(row.side || "").toUpperCase();
+  if (filters.side !== "all" && side !== filters.side) return false;
+  const notional = Number(row.notional || 0);
+  const minNotional = Number(filters.minNotional);
+  const maxNotional = Number(filters.maxNotional);
+  if (Number.isFinite(minNotional) && minNotional > 0 && notional < minNotional) return false;
+  if (Number.isFinite(maxNotional) && maxNotional > 0 && notional > maxNotional) return false;
+  if (filters.walletType === "smart" && !row.is_smart) return false;
+  if (filters.walletType === "whale" && !row.is_whale) return false;
+  if (filters.walletType === "new" && trackedWallets.has(normalizeAddress(row.user_address || ""))) return false;
+  if (!tradeMatchesCategory(row, filters.category)) return false;
+  const search = filters.search.trim().toLowerCase();
+  if (search) {
+    const haystack = [
+      row.user_address,
+      row.trader_name,
+      row.trader_pseudonym,
+      row.question,
+      row.event_title,
+      row.market_slug,
+      row.event_slug,
+      row.outcome,
+    ].join(" ").toLowerCase();
+    if (!haystack.includes(search)) return false;
+  }
+  return true;
+}
+
+function officialGifMinNotional(settings: OfficialTradeFeedSettings) {
+  return numberSetting(settings.gifMinNotional || "", Number.POSITIVE_INFINITY);
+}
+
+function numberSetting(value: string, fallback: number) {
+  const number = Number(String(value || "").replace(/[$,\s]/g, ""));
+  return Number.isFinite(number) && number >= 0 ? number : fallback;
+}
+
 function tradeMatchesCategory(row: RecentTrade, category: string) {
   const normalized = String(category || "").trim().toLowerCase();
   if (!normalized || normalized === "all" || normalized === "全部") return true;
@@ -2148,6 +2645,21 @@ function formatLatency(value: unknown) {
   const minutes = Math.floor(seconds / 60);
   const rest = Math.round(seconds % 60);
   return `${minutes}m ${rest}s`;
+}
+
+function tradeStreamStatusLabel(meta: LiveTradesMeta) {
+  if (meta.stream_connected) return "WS";
+  if (meta.stream_status === "reconnecting") return "重连中";
+  if (meta.stream_status === "error") return "断开";
+  return formatLatency(meta.latency_seconds) || "Live";
+}
+
+function officialFeedStatusLabel(meta: OfficialTradeFeedMeta) {
+  if (meta.connected && meta.upstream_connected) return "RTDS";
+  if (meta.status === "reconnecting") return "重连中";
+  if (meta.status === "error") return "断开";
+  if (meta.connected) return "已连接";
+  return "连接中";
 }
 
 function formatDuration(value: unknown) {
@@ -2247,6 +2759,34 @@ function firstNumber(...values: unknown[]) {
 function numberOrNull(value: unknown) {
   const number = Number(value);
   return Number.isFinite(number) ? number : null;
+}
+
+function numberOrUndefined(value: unknown) {
+  const number = Number(value);
+  return Number.isFinite(number) ? number : undefined;
+}
+
+function playTradeSound(volume: number, side: string | undefined) {
+  try {
+    const AudioContextClass = window.AudioContext || (window as typeof window & { webkitAudioContext?: typeof AudioContext }).webkitAudioContext;
+    if (!AudioContextClass) return;
+    const context = new AudioContextClass();
+    const oscillator = context.createOscillator();
+    const gain = context.createGain();
+    const now = context.currentTime;
+    oscillator.type = "sine";
+    oscillator.frequency.value = String(side || "").toUpperCase() === "SELL" ? 380 : 620;
+    gain.gain.setValueAtTime(0, now);
+    gain.gain.linearRampToValueAtTime(Math.max(0, Math.min(1, volume / 100)) * 0.18, now + 0.015);
+    gain.gain.exponentialRampToValueAtTime(0.001, now + 0.18);
+    oscillator.connect(gain);
+    gain.connect(context.destination);
+    oscillator.start(now);
+    oscillator.stop(now + 0.2);
+    window.setTimeout(() => void context.close(), 300);
+  } catch {
+    // Browsers can block audio until the user interacts with the page.
+  }
 }
 
 function isMissing(value: unknown) {

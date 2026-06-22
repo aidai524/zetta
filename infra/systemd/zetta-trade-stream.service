@@ -1,0 +1,14 @@
+[Unit]
+Description=Zetta live trade WebSocket stream
+After=network-online.target docker.service zetta-api.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+EnvironmentFile=/etc/zetta/zetta.env
+ExecStart=/usr/local/bin/zetta-runner trade-stream
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target

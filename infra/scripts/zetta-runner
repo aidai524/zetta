@@ -75,6 +75,24 @@ case "$MODE" in
       "${COMMON_ARGS[@]}" \
       api serve --host 0.0.0.0 --port 8088
     ;;
+  trade-stream)
+    exec "$ZETTA_PYTHON" -m zetta.cli \
+      "${COMMON_ARGS[@]}" \
+      realtime trade-stream \
+        --host 0.0.0.0 \
+        --port "${ZETTA_TRADE_STREAM_PORT:-8090}" \
+        --poll-seconds "${ZETTA_TRADE_STREAM_POLL_SECONDS:-2}" \
+        --limit "${ZETTA_TRADE_STREAM_LIMIT:-150}" \
+        --heartbeat-seconds "${ZETTA_TRADE_STREAM_HEARTBEAT_SECONDS:-20}"
+    ;;
+  official-trade-feed)
+    exec "$ZETTA_PYTHON" -m zetta.cli \
+      "${COMMON_ARGS[@]}" \
+      realtime official-trade-feed \
+        --host 0.0.0.0 \
+        --port "${ZETTA_OFFICIAL_TRADE_FEED_PORT:-8091}" \
+        --upstream-url "${ZETTA_POLYMARKET_RTDS_URL:-wss://ws-live-data.polymarket.com}"
+    ;;
   ws-market)
     exec "$ZETTA_PYTHON" -m zetta.cli \
       "${COMMON_ARGS[@]}" \

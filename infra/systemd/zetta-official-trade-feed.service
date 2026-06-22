@@ -1,0 +1,14 @@
+[Unit]
+Description=Zetta Polymarket official RTDS trade feed
+After=network-online.target docker.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+EnvironmentFile=/etc/zetta/zetta.env
+ExecStart=/usr/local/bin/zetta-runner official-trade-feed
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target

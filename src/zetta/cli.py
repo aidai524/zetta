@@ -33,7 +33,9 @@ from zetta.loaders.data import DataRawLoader
 from zetta.loaders.gamma import GammaRawLoader
 from zetta.loaders.marts import MartBuilder
 from zetta.polymarket import PolymarketClient
+from zetta.official_trade_feed import POLYMARKET_RTDS_URL, serve_official_trade_feed
 from zetta.realtime.orderbook import reconciliation_diff, reconstruct_ws_market_raw, rest_book_summary
+from zetta.realtime_trades import serve_trade_stream
 from zetta.scheduler.runner import TaskRunner
 from zetta.scheduler.tasks import LocalRunStore, LocalTaskStore, PostgresTaskStore, Task
 from zetta.streams import publish_ws_market_raw
@@ -778,6 +780,24 @@ def build_parser() -> argparse.ArgumentParser:
     reconcile_book.add_argument("--token-id", required=True)
     reconcile_book.add_argument("--max-records", type=int)
     reconcile_book.set_defaults(func=cmd_realtime_reconcile_book)
+
+    trade_stream = realtime_subparsers.add_parser(
+        "trade-stream", help="Serve live trade deltas over WebSocket."
+    )
+    trade_stream.add_argument("--host", default="127.0.0.1")
+    trade_stream.add_argument("--port", type=int, default=8090)
+    trade_stream.add_argument("--poll-seconds", type=float, default=2.0)
+    trade_stream.add_argument("--limit", type=int, default=150)
+    trade_stream.add_argument("--heartbeat-seconds", type=float, default=20.0)
+    trade_stream.set_defaults(func=cmd_realtime_trade_stream)
+
+    official_trade_feed = realtime_subparsers.add_parser(
+        "official-trade-feed", help="Proxy Polymarket RTDS activity/trades over WebSocket."
+    )
+    official_trade_feed.add_argument("--host", default="127.0.0.1")
+    official_trade_feed.add_argument("--port", type=int, default=8091)
+    official_trade_feed.add_argument("--upstream-url", default=POLYMARKET_RTDS_URL)
+    official_trade_feed.set_defaults(func=cmd_realtime_official_trade_feed)
 
     api = subparsers.add_parser("api", help="Serve product API endpoints.")
     api_subparsers = api.add_subparsers(required=True)
@@ -2858,6 +2878,29 @@ def cmd_realtime_reconcile_book(args: argparse.Namespace, app_settings: Settings
         reconstructed=reconstructed.summary(),
         rest=rest_book_summary(rest_book, token_id=args.token_id),
     )
+
+
+def cmd_realtime_trade_stream(args: argparse.Namespace, app_settings: Settings) -> Any:
+    serve_trade_stream(
+        settings=app_settings,
+        clickhouse=ClickHouseWriter(app_settings),
+        host=args.host,
+        port=args.port,
+        poll_seconds=args.poll_seconds,
+        limit=args.limit,
+        heartbeat_seconds=args.heartbeat_seconds,
+    )
+    return None
+
+
+def cmd_realtime_official_trade_feed(args: argparse.Namespace, app_settings: Settings) -> Any:
+    serve_official_trade_feed(
+        host=args.host,
+        port=args.port,
+        upstream_url=args.upstream_url,
+        state_dir=app_settings.state_dir,
+    )
+    return None
 
 
 def cmd_api_serve(args: argparse.Namespace, app_settings: Settings) -> Any:

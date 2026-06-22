@@ -656,6 +656,7 @@ def test_product_api_wallet_detail_live_uses_polymarket_wallet_apis(monkeypatch)
 
     monkeypatch.setattr("zetta.api.PolymarketClient", FakePolymarketClient)
     monkeypatch.setattr(ProductApi, "live_pusd_balance", lambda _self, _user: 12.5)
+    monkeypatch.setattr(ProductApi, "wallet_rtds_activity_rows", lambda *_args, **_kwargs: [])
     fake = FakeClickHouse(outputs=[""])
     api = ProductApi(clickhouse=fake, settings=Settings())
 
@@ -672,6 +673,68 @@ def test_product_api_wallet_detail_live_uses_polymarket_wallet_apis(monkeypatch)
     assert body["activity_summary"]["traded_notional"] == 23.0
     assert body["recent_activity"][0]["title"] == "Newest trade"
     assert "mart_wallet_reputation" in fake.queries[0]
+
+
+def test_product_api_wallet_detail_realtime_uses_rtds_wallet_cache(tmp_path) -> None:
+    user = "0xabc"
+    cache_path = tmp_path / "official_trade_feed" / "wallets" / f"{user}.json"
+    cache_path.parent.mkdir(parents=True)
+    cache_path.write_text(
+        json.dumps(
+            {
+                "messages": [
+                    {
+                        "type": "trade",
+                        "source": "polymarket-rtds",
+                        "trade": {
+                            "trade_id": "rtds-1",
+                            "transaction_hash": "0xrtds",
+                            "timestamp": "2026-06-16 08:48:42.000",
+                            "condition_id": "cond-1",
+                            "token_id": "token-1",
+                            "user_address": user,
+                            "side": "BUY",
+                            "price": 0.42,
+                            "size": 100,
+                            "notional": 42,
+                            "question": "RTDS trade",
+                            "market_slug": "rtds-trade",
+                            "event_slug": "rtds-event",
+                            "outcome": "Yes",
+                        },
+                        "raw": {
+                            "payload": {
+                                "title": "RTDS trade",
+                                "slug": "rtds-trade",
+                                "eventSlug": "rtds-event",
+                                "outcome": "Yes",
+                            }
+                        },
+                    }
+                ]
+            }
+        ),
+        encoding="utf-8",
+    )
+    fake = FakeClickHouse("")
+    api = ProductApi(clickhouse=fake, settings=Settings(state_dir=tmp_path))
+
+    response = api.handle(
+        "/wallets/detail",
+        {"user": ["0xABC"], "realtime": ["1"], "activity_limit": ["5"]},
+    )
+
+    assert response.status == 200
+    body = response.body
+    assert fake.queries == []
+    assert body["wallet"]["data_source"] == "realtime"
+    assert body["wallet"]["data_status"] == "ok"
+    assert body["wallet"]["realtime_activity_count"] == 1
+    assert body["realtime"]["cache_status"] == "hit"
+    assert body["activity_summary"]["trade_activity_count"] == 1
+    assert body["activity_summary"]["traded_notional"] == 42.0
+    assert body["recent_activity"][0]["title"] == "RTDS trade"
+    assert body["recent_activity"][0]["source"] == "polymarket-rtds"
 
 
 def test_product_api_live_trades_uses_polymarket_data_api(monkeypatch) -> None:

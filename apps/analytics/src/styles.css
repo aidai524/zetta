@@ -1164,6 +1164,30 @@ tbody tr:hover td {
   justify-content: flex-end;
 }
 
+.official-feed-main {
+  padding-top: 0;
+}
+
+.official-feed-title {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+
+.official-feed-title h1 {
+  margin: 0;
+  color: #eeeeee;
+  font-size: 19px;
+  line-height: 1.15;
+  font-weight: 900;
+}
+
+.official-feed-title span {
+  color: #747474;
+  font-size: 12px;
+  font-weight: 700;
+}
+
 .trade-filters {
   position: relative;
   min-height: 86px;
@@ -1267,6 +1291,10 @@ tbody tr:hover td {
   margin-top: 0;
 }
 
+.official-trade-table {
+  min-width: 1240px;
+}
+
 .leader-table tbody tr {
   height: 66px;
 }
@@ -1275,33 +1303,34 @@ tbody tr:hover td {
   transform-origin: top center;
 }
 
+.trade-row-new {
+  animation: liveTradeInsert 0.72s cubic-bezier(0.16, 1, 0.3, 1);
+}
+
 .trade-row-new td {
-  animation: liveTradeInsert 1.2s cubic-bezier(0.16, 1, 0.3, 1);
+  background: var(--brand-soft);
 }
 
 @keyframes liveTradeInsert {
   0% {
     opacity: 0;
-    transform: translateY(-22px);
-    background: var(--brand-soft);
+    transform: translateY(-18px);
     box-shadow: inset 3px 0 0 var(--brand);
   }
-  28% {
+  55% {
     opacity: 1;
     transform: translateY(0);
-    background: var(--brand-soft);
     box-shadow: inset 3px 0 0 var(--brand);
   }
   100% {
     opacity: 1;
     transform: translateY(0);
-    background: transparent;
     box-shadow: inset 0 0 0 rgba(20, 82, 240, 0);
   }
 }
 
 @media (prefers-reduced-motion: reduce) {
-  .trade-row-new td {
+  .trade-row-new {
     animation: none;
   }
 }
@@ -2184,6 +2213,12 @@ tbody tr:hover td {
   color: var(--brand);
 }
 
+.live-pill.stale {
+  border-color: var(--line);
+  background: var(--panel-2);
+  color: var(--muted);
+}
+
 .positive,
 .money-icon,
 .heat-cell.green,
@@ -2287,25 +2322,4 @@ tbody tr:hover td {
 
 .overlay {
   background: rgba(14, 15, 17, 0.28);
-}
-
-@keyframes liveTradeInsert {
-  0% {
-    opacity: 0;
-    transform: translateY(-22px);
-    background: var(--brand-soft);
-    box-shadow: inset 3px 0 0 var(--brand);
-  }
-  28% {
-    opacity: 1;
-    transform: translateY(0);
-    background: var(--brand-soft);
-    box-shadow: inset 3px 0 0 var(--brand);
-  }
-  100% {
-    opacity: 1;
-    transform: translateY(0);
-    background: transparent;
-    box-shadow: inset 0 0 0 rgba(20, 82, 240, 0);
-  }
 }
