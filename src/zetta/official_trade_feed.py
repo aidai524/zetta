@@ -6,15 +6,17 @@ import hashlib
 import json
 import signal
 import time
+import urllib.request
 from collections import deque
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
-from urllib.parse import parse_qs, urlsplit
+from urllib.parse import parse_qs, urlencode, urlsplit
 
 
 POLYMARKET_RTDS_URL = "wss://ws-live-data.polymarket.com"
+POLYMARKET_DATA_API_URL = "https://data-api.polymarket.com"
 POLYMARKET_TRADE_SUBSCRIPTION = {
     "action": "subscribe",
     "subscriptions": [{"topic": "activity", "type": "trades"}],
@@ -30,10 +32,27 @@ def normalize_rtds_trade_message(message: dict[str, Any]) -> dict[str, Any] | No
     payload = message.get("payload")
     if not isinstance(payload, dict):
         return None
-    timestamp = _payload_timestamp(payload.get("timestamp"), message.get("timestamp"))
+    return normalize_activity_trade_payload(
+        payload,
+        upstream_timestamp=message.get("timestamp"),
+        raw=message,
+        source="polymarket-rtds",
+    )
+
+
+def normalize_activity_trade_payload(
+    payload: dict[str, Any],
+    *,
+    upstream_timestamp: Any,
+    raw: dict[str, Any],
+    source: str,
+) -> dict[str, Any] | None:
+    timestamp = _payload_timestamp(payload.get("timestamp"), upstream_timestamp)
     price = _float_or_none(payload.get("price"))
     size = _float_or_none(payload.get("size"))
-    notional = price * size if price is not None and size is not None else None
+    notional = _float_or_none(payload.get("usdcSize"))
+    if notional is None and price is not None and size is not None:
+        notional = price * size
     transaction_hash = str(payload.get("transactionHash") or payload.get("transaction_hash") or "")
     token_id = str(payload.get("asset") or payload.get("token_id") or "")
     user_address = str(payload.get("proxyWallet") or payload.get("user") or "").lower()
@@ -66,18 +85,18 @@ def normalize_rtds_trade_message(message: dict[str, Any]) -> dict[str, Any] | No
         "icon": str(payload.get("icon") or ""),
         "profile_image": str(payload.get("profileImage") or ""),
         "fee": _float_or_none(payload.get("fee")),
-        "source": "polymarket-rtds",
+        "source": source,
     }
     return {
         "type": "trade",
-        "source": "polymarket-rtds",
+        "source": source,
         "topic": "activity",
         "feed_type": "trades",
         "received_at": api_datetime(datetime.now(UTC)),
-        "upstream_timestamp": message.get("timestamp"),
+        "upstream_timestamp": upstream_timestamp,
         "latency_seconds": _latency_seconds(timestamp),
         "trade": row,
-        "raw": message,
+        "raw": raw,
     }
 
 
@@ -90,9 +109,11 @@ class OfficialTradeFeedState:
     seen_order: deque[str] = field(default_factory=deque)
     seen_limit: int = 20_000
     recent_limit: int = 1_000
-    wallet_recent_limit: int = 100
-    wallet_cache_limit: int = 2_000
+    wallet_recent_limit: int = 50
+    wallet_cache_limit: int = 500
+    replay_backfill_wallet_limit: int = 25
     recent_save_interval_seconds: float = 1.0
+    upstream_idle_timeout_seconds: float = 90.0
     recent_messages: deque[dict[str, Any]] = field(default_factory=deque)
     wallet_recent_messages: dict[str, deque[dict[str, Any]]] = field(default_factory=dict)
     wallet_recent_order: deque[str] = field(default_factory=deque)
@@ -104,9 +125,14 @@ class OfficialTradeFeedState:
 
     def __post_init__(self) -> None:
         if self.state_dir is not None:
+            loaded_wallets: set[str] = set()
             for message in load_recent_trade_messages(self.state_dir, limit=self.recent_limit):
                 self.recent_messages.append(message)
                 self.remember(_message_key(message))
+                user_address = _message_user_address(message)
+                if user_address and user_address not in loaded_wallets:
+                    self.wallet_recent_order.append(user_address)
+                    loaded_wallets.add(user_address)
                 trade = message.get("trade")
                 if isinstance(trade, dict) and not self.last_trade_at:
                     self.last_trade_at = str(trade.get("timestamp") or "") or None
@@ -133,10 +159,12 @@ class OfficialTradeFeedState:
                     }
                 )
             )
-            for message in self.replay_messages(wallet_filter):
+            replay_messages = await asyncio.to_thread(self.replay_messages, wallet_filter)
+            for message in replay_messages:
                 await websocket.send(_json_dumps({**message, "replay": True}))
-            async for _message in websocket:
-                continue
+            with contextlib.suppress(Exception):
+                async for _message in websocket:
+                    continue
         finally:
             self.clients.discard(websocket)
             self.client_wallet_filters.pop(websocket, None)
@@ -156,7 +184,19 @@ class OfficialTradeFeedState:
                     reconnect_delay = 1.0
                     await websocket.send(_json_dumps(POLYMARKET_TRADE_SUBSCRIPTION))
                     await self.broadcast_status("upstream_connected")
-                    async for raw_message in websocket:
+                    last_trade_message_at = time.monotonic()
+                    while True:
+                        raw_message = await asyncio.wait_for(
+                            websocket.recv(),
+                            timeout=self.upstream_idle_timeout_seconds,
+                        )
+                        if (
+                            time.monotonic() - last_trade_message_at
+                            > self.upstream_idle_timeout_seconds
+                        ):
+                            raise TimeoutError(
+                                f"upstream trade idle for {self.upstream_idle_timeout_seconds:.0f}s"
+                            )
                         if not raw_message:
                             continue
                         message = _parse_json(raw_message)
@@ -165,6 +205,7 @@ class OfficialTradeFeedState:
                         normalized = normalize_rtds_trade_message(message)
                         if normalized is None:
                             continue
+                        last_trade_message_at = time.monotonic()
                         key = _message_key(normalized)
                         if key in self.seen:
                             continue
@@ -172,6 +213,14 @@ class OfficialTradeFeedState:
                         self.remember_recent(normalized)
                         self.last_trade_at = normalized["trade"].get("timestamp")
                         await self.broadcast(normalized)
+            except TimeoutError as exc:
+                self.upstream_connected = False
+                self.last_error = (
+                    f"upstream idle for {self.upstream_idle_timeout_seconds:.0f}s"
+                )
+                await self.broadcast_status("upstream_idle", error=self.last_error)
+                await asyncio.sleep(reconnect_delay)
+                reconnect_delay = min(reconnect_delay * 1.6, 15.0)
             except asyncio.CancelledError:
                 raise
             except Exception as exc:
@@ -292,6 +341,9 @@ class OfficialTradeFeedState:
                         limit=self.wallet_recent_limit,
                     )
                 )
+        if len(wallet_filter) <= self.replay_backfill_wallet_limit:
+            for user_address in sorted(wallet_filter):
+                messages.extend(self.backfill_wallet_recent_messages(user_address))
         messages.extend(
             message
             for message in self.recent_messages
@@ -300,11 +352,35 @@ class OfficialTradeFeedState:
         deduped: dict[str, dict[str, Any]] = {}
         for message in messages:
             deduped[_message_key(message)] = message
-        return sorted(
+        sorted_messages = sorted(
             deduped.values(),
             key=_message_timestamp_text,
             reverse=True,
-        )[: self.recent_limit]
+        )
+        if self.state_dir is not None:
+            for user_address in sorted(wallet_filter):
+                wallet_messages = [
+                    message
+                    for message in sorted_messages
+                    if _message_user_address(message) == user_address
+                ][: self.wallet_recent_limit]
+                if wallet_messages:
+                    save_recent_wallet_trade_messages(
+                        self.state_dir,
+                        user_address,
+                        wallet_messages,
+                    )
+        return sorted_messages[: self.recent_limit]
+
+    def backfill_wallet_recent_messages(self, user_address: str) -> list[dict[str, Any]]:
+        messages = fetch_wallet_activity_messages(
+            user_address,
+            limit=self.wallet_recent_limit,
+        )
+        if self.state_dir is not None:
+            for message in messages:
+                self.remember_wallet_recent(message)
+        return messages
 
 
 async def serve_official_trade_feed_async(
@@ -405,6 +481,58 @@ def load_recent_wallet_trade_messages(
     if not isinstance(messages, list):
         return []
     return [message for message in messages[:limit] if isinstance(message, dict)]
+
+
+def fetch_wallet_activity_messages(
+    user_address: str,
+    *,
+    limit: int = 50,
+    timeout_seconds: float = 5.0,
+) -> list[dict[str, Any]]:
+    normalized_user_address = normalize_wallet_filter_address(user_address)
+    if not normalized_user_address:
+        return []
+    query = urlencode(
+        {
+            "user": normalized_user_address,
+            "limit": max(1, min(limit, 100)),
+            "offset": 0,
+        }
+    )
+    request = urllib.request.Request(
+        f"{POLYMARKET_DATA_API_URL}/activity?{query}",
+        headers={
+            "Accept": "application/json",
+            "User-Agent": "ZettaPolymarketRealtime/0.1",
+        },
+    )
+    try:
+        with urllib.request.urlopen(request, timeout=timeout_seconds) as response:
+            payload = json.loads(response.read().decode("utf-8"))
+    except Exception:
+        return []
+    if not isinstance(payload, list):
+        return []
+    messages: list[dict[str, Any]] = []
+    for item in payload:
+        if not isinstance(item, dict):
+            continue
+        if str(item.get("type") or "").upper() != "TRADE":
+            continue
+        message = normalize_activity_trade_payload(
+            item,
+            upstream_timestamp=item.get("timestamp"),
+            raw={
+                "payload": item,
+                "topic": "activity",
+                "type": "trades",
+                "source": "polymarket-data-api",
+            },
+            source="polymarket-data-api",
+        )
+        if message is not None:
+            messages.append(message)
+    return messages
 
 
 def save_recent_trade_messages(state_dir: Path, messages: list[dict[str, Any]]) -> None:

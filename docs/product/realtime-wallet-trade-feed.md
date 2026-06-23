@@ -130,6 +130,9 @@ Limits and behavior:
 - Filtered connections still receive `connected`, `status`, and heartbeat
   messages.
 - Initial replay is also filtered to the requested wallets.
+- For filtered connections with up to 25 wallets, replay is augmented from
+  Polymarket Data API `/activity` so a reconnect can recover recent wallet
+  trades missed while the upstream RTDS connection was stale.
 
 ## WebSocket Message Shapes
 
@@ -186,6 +189,8 @@ Notes:
 
 - `replay: true` means the message came from the server's recent cache after
   connect, not from a new live push.
+- `trade.source` can be `polymarket-rtds` for official RTDS pushes or
+  `polymarket-data-api` for replay backfill.
 - Some official RTDS messages may have empty `question`, `slug`, or
   `condition_id`; the server preserves the official payload instead of guessing.
 
@@ -253,4 +258,3 @@ Response markers:
 | Show a single wallet's recent realtime cache on page load | HTTPS `realtime=1`. |
 | Show complete wallet positions, PnL, risk metrics, and history | HTTPS `live=1` or default wallet detail. |
 | Show all market-wide trades | WebSocket without wallet filters. |
-

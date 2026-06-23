@@ -3342,16 +3342,6 @@ class ProductApi:
         position_scope = param(query, "position_scope", "all").lower()
         position_sort = param(query, "position_sort", "current_value").lower()
 
-        if truthy_param(query, "realtime"):
-            return self.wallet_detail_realtime(
-                user,
-                position_limit=position_limit,
-                activity_limit=activity_limit,
-                pnl_points_limit=pnl_points_limit,
-                position_scope=position_scope,
-                position_sort=position_sort,
-            )
-
         if truthy_param(query, "live"):
             live_detail = self.wallet_detail_live(
                 user,
@@ -3363,6 +3353,16 @@ class ProductApi:
             )
             if live_detail is not None:
                 return live_detail
+
+        if truthy_param(query, "realtime"):
+            return self.wallet_detail_realtime(
+                user,
+                position_limit=position_limit,
+                activity_limit=activity_limit,
+                pnl_points_limit=pnl_points_limit,
+                position_scope=position_scope,
+                position_sort=position_sort,
+            )
 
         portfolio = self.wallet_latest_portfolio_snapshot(user)
         pnl = self.wallet_latest_pnl_snapshot(user)
@@ -5232,7 +5232,7 @@ def wallet_rtds_activity_rows(
                 "notional": float_value(trade.get("notional")),
                 "raw_json": json.dumps(raw_payload, ensure_ascii=False, separators=(",", ":")),
                 "ingested_at": captured_at,
-                "source": "polymarket-rtds",
+                "source": str(trade.get("source") or message.get("source") or "polymarket-rtds"),
             }
         )
     return rows
