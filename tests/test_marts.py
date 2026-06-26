@@ -95,6 +95,39 @@ def test_build_wallet_screener_uses_full_trade_history_and_portfolio_snapshot() 
     assert "pnl_roi >= 0.55" in joined_sql
 
 
+def test_build_wallet_fifa_24h_pnl_uses_equity_delta_scope() -> None:
+    fake = FakeClickHouse()
+
+    result = MartBuilder(clickhouse=fake).build_wallet_fifa_24h_pnl(window_hours=24)
+
+    assert result.mart == "wallet_fifa_24h_pnl"
+    joined_sql = "\n".join(fake.executed)
+    assert "insert into mart_fifa_trade" in joined_sql
+    assert "truncate table mart_wallet_fifa_24h_pnl_next" in joined_sql
+    assert "insert into mart_wallet_fifa_24h_pnl_next" in joined_sql
+    assert "startsWith(markets.slug, 'fifwc-')" in joined_sql
+    assert "equity_now - equity_24h_ago as pnl_24h" in joined_sql
+    assert "position_size_24h_ago" in joined_sql
+    assert "from mart_fifa_trade as trades final" in joined_sql
+    assert "exchange tables mart_wallet_fifa_24h_pnl and mart_wallet_fifa_24h_pnl_next" in joined_sql
+
+
+def test_build_fifa_trades_uses_time_indexed_fact_trade_cache() -> None:
+    fake = FakeClickHouse()
+
+    result = MartBuilder(clickhouse=fake).build_fifa_trades(window_hours=72)
+
+    assert result.mart == "fifa_trade"
+    joined_sql = "\n".join(fake.executed)
+    assert "insert into mart_fifa_trade" in joined_sql
+    assert "from fact_trade_by_time" in joined_sql
+    assert "startsWith(markets.slug, 'fifwc-')" in joined_sql
+    assert "existing_max" in joined_sql
+    assert "round(price, 12)" in joined_sql
+    assert "round(size, 6)" in joined_sql
+    assert "round(notional, 6)" in joined_sql
+
+
 def test_build_event_anomaly_signals_are_evidence_signals() -> None:
     fake = FakeClickHouse()
 

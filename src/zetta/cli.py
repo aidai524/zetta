@@ -710,6 +710,18 @@ def build_parser() -> argparse.ArgumentParser:
     )
     wallet_screener.set_defaults(func=cmd_build_wallet_screener)
 
+    wallet_fifa_24h_pnl = build_subparsers.add_parser(
+        "wallet-fifa-24h-pnl", help="Build all-wallet FIFA 24h PnL mart."
+    )
+    wallet_fifa_24h_pnl.add_argument("--window-hours", type=int, default=24)
+    wallet_fifa_24h_pnl.set_defaults(func=cmd_build_wallet_fifa_24h_pnl)
+
+    fifa_trades = build_subparsers.add_parser(
+        "fifa-trades", help="Build scoped FIFA trade cache mart."
+    )
+    fifa_trades.add_argument("--window-hours", type=int, default=72)
+    fifa_trades.set_defaults(func=cmd_build_fifa_trades)
+
     event_anomaly_signals = build_subparsers.add_parser(
         "event-anomaly-signals", help="Build event anomaly signal mart."
     )
@@ -2800,6 +2812,18 @@ def cmd_build_wallet_reputation(_args: argparse.Namespace, app_settings: Setting
 
 def cmd_build_wallet_screener(_args: argparse.Namespace, app_settings: Settings) -> Any:
     return MartBuilder(clickhouse=ClickHouseWriter(app_settings)).build_wallet_screener()
+
+
+def cmd_build_wallet_fifa_24h_pnl(args: argparse.Namespace, app_settings: Settings) -> Any:
+    return MartBuilder(clickhouse=ClickHouseWriter(app_settings)).build_wallet_fifa_24h_pnl(
+        window_hours=args.window_hours,
+    )
+
+
+def cmd_build_fifa_trades(args: argparse.Namespace, app_settings: Settings) -> Any:
+    return MartBuilder(clickhouse=ClickHouseWriter(app_settings)).build_fifa_trades(
+        window_hours=args.window_hours,
+    )
 
 
 def cmd_build_event_anomaly_signals(args: argparse.Namespace, app_settings: Settings) -> Any:

@@ -80,6 +80,13 @@ def test_unusual_betting_task_source_entity() -> None:
     )
 
 
+def test_wallet_fifa_24h_pnl_task_source_entity() -> None:
+    assert task_source_entity("wallet-fifa-24h-pnl") == (
+        "mart",
+        "wallet_fifa_24h_pnl",
+    )
+
+
 def test_local_task_store_filters_allowed_kinds(tmp_path) -> None:
     seed_store = LocalTaskStore(tmp_path / "tasks.json")
     seed_store.add_many(

@@ -336,6 +336,13 @@ case "$MODE" in
       --timeout "${ZETTA_WALLET_SCREENER_TIMEOUT_SECONDS:-1800}" \
       build wallet-screener
     ;;
+  wallet-fifa-24h-pnl)
+    "$ZETTA_PYTHON" -m zetta.cli \
+      "${COMMON_ARGS[@]}" \
+      --timeout "${ZETTA_WALLET_FIFA_24H_PNL_TIMEOUT_SECONDS:-1800}" \
+      build wallet-fifa-24h-pnl \
+      --window-hours "${ZETTA_WALLET_FIFA_24H_PNL_WINDOW_HOURS:-24}"
+    ;;
   chain-frontier)
     EXCHANGE_ARGS=()
     if [[ -n "${ZETTA_CHAIN_EXCHANGE_ADDRESSES:-}" ]]; then

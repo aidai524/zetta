@@ -816,6 +816,8 @@ def task_source_entity(kind: str) -> tuple[str, str]:
         return "event", "refresh"
     if kind == "unusual-betting-refresh":
         return "event", "unusual_betting_refresh"
+    if kind == "wallet-fifa-24h-pnl":
+        return "mart", "wallet_fifa_24h_pnl"
     if kind.startswith("gamma-"):
         return "gamma", kind.removeprefix("gamma-").replace("-", "_")
     if kind == "wallet-trades":

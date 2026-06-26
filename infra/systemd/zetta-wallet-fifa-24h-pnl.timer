@@ -1,0 +1,11 @@
+[Unit]
+Description=Refresh Zetta FIFA wallet 24h PnL every 5 minutes
+
+[Timer]
+OnBootSec=2min
+OnUnitInactiveSec=5min
+AccuracySec=30s
+Unit=zetta-wallet-fifa-24h-pnl.service
+
+[Install]
+WantedBy=timers.target

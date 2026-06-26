@@ -12,6 +12,7 @@ from zetta.collectors.data import DataCollector
 from zetta.collectors.gamma import GammaCollector
 from zetta.config import Settings
 from zetta.chain.rpc import PolygonRpcClient
+from zetta.loaders.marts import MartBuilder
 from zetta.polymarket import PolymarketClient
 from zetta.scheduler.tasks import EventSyncRecord, Task, TaskRunRecord
 from zetta.storage.clickhouse import ClickHouseWriter
@@ -165,6 +166,11 @@ class TaskRunner:
             result = self.refresh_event(task, **params)
         elif task.kind == "unusual-betting-refresh":
             result = self.refresh_unusual_betting(**params)
+        elif task.kind == "wallet-fifa-24h-pnl":
+            window_hours = int(params.get("window_hours") or 24)
+            result = MartBuilder(
+                clickhouse=ClickHouseWriter(self.settings),
+            ).build_wallet_fifa_24h_pnl(window_hours=window_hours)
         else:
             raise ValueError(f"Unknown task kind: {task.kind}")
 

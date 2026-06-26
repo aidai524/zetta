@@ -70,6 +70,7 @@ disable_units=(
   zetta-wallet-pnl-load.timer
   zetta-wallet-rollup.timer
   zetta-wallet-screener.timer
+  zetta-wallet-fifa-24h-pnl.timer
   zetta-ws-market.service
 )
 

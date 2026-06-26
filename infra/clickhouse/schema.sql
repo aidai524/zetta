@@ -585,6 +585,104 @@ create table if not exists zetta.mart_wallet_screener_next
 engine = ReplacingMergeTree(updated_at)
 order by user_address;
 
+create table if not exists zetta.mart_fifa_trade
+(
+  trade_key String,
+  timestamp DateTime64(3, 'UTC'),
+  event_id String,
+  market_id String,
+  condition_id String,
+  token_id String,
+  user_address String,
+  side LowCardinality(String),
+  price Float64,
+  size Float64,
+  notional Float64,
+  ingested_at DateTime64(3, 'UTC'),
+  updated_at DateTime64(3, 'UTC')
+)
+engine = ReplacingMergeTree(updated_at)
+partition by toYYYYMM(timestamp)
+order by (timestamp, condition_id, token_id, user_address, trade_key);
+
+create table if not exists zetta.mart_wallet_fifa_24h_pnl
+(
+  user_address String,
+  trade_count UInt64,
+  buy_count UInt64,
+  sell_count UInt64,
+  traded_size Float64,
+  traded_notional Float64,
+  buy_notional Float64,
+  sell_notional Float64,
+  trade_count_24h UInt64,
+  buy_notional_24h Float64,
+  sell_notional_24h Float64,
+  traded_notional_24h Float64,
+  net_notional_24h Float64,
+  event_count UInt64,
+  market_count UInt64,
+  event_count_24h UInt64,
+  market_count_24h UInt64,
+  token_count UInt64,
+  open_position_count UInt64,
+  open_position_value_now Float64,
+  open_position_value_24h_ago Float64,
+  equity_now Float64,
+  equity_24h_ago Float64,
+  pnl_24h Float64,
+  pnl_base_24h Float64,
+  pnl_roi_24h Float64,
+  first_trade_at Nullable(DateTime64(3, 'UTC')),
+  last_trade_at Nullable(DateTime64(3, 'UTC')),
+  latest_action LowCardinality(String),
+  missing_mark_count UInt64,
+  negative_position_count UInt64,
+  data_quality LowCardinality(String),
+  updated_at DateTime64(3, 'UTC')
+)
+engine = ReplacingMergeTree(updated_at)
+order by user_address;
+
+create table if not exists zetta.mart_wallet_fifa_24h_pnl_next
+(
+  user_address String,
+  trade_count UInt64,
+  buy_count UInt64,
+  sell_count UInt64,
+  traded_size Float64,
+  traded_notional Float64,
+  buy_notional Float64,
+  sell_notional Float64,
+  trade_count_24h UInt64,
+  buy_notional_24h Float64,
+  sell_notional_24h Float64,
+  traded_notional_24h Float64,
+  net_notional_24h Float64,
+  event_count UInt64,
+  market_count UInt64,
+  event_count_24h UInt64,
+  market_count_24h UInt64,
+  token_count UInt64,
+  open_position_count UInt64,
+  open_position_value_now Float64,
+  open_position_value_24h_ago Float64,
+  equity_now Float64,
+  equity_24h_ago Float64,
+  pnl_24h Float64,
+  pnl_base_24h Float64,
+  pnl_roi_24h Float64,
+  first_trade_at Nullable(DateTime64(3, 'UTC')),
+  last_trade_at Nullable(DateTime64(3, 'UTC')),
+  latest_action LowCardinality(String),
+  missing_mark_count UInt64,
+  negative_position_count UInt64,
+  data_quality LowCardinality(String),
+  updated_at DateTime64(3, 'UTC')
+)
+engine = ReplacingMergeTree(updated_at)
+order by user_address;
+
 alter table zetta.mart_wallet_screener add column if not exists position_count UInt64 after last_trade_at;
 alter table zetta.mart_wallet_screener add column if not exists portfolio_captured_at Nullable(DateTime64(3, 'UTC')) after total_pnl;
 alter table zetta.mart_wallet_screener add column if not exists pnl_captured_at Nullable(DateTime64(3, 'UTC')) after portfolio_captured_at;

@@ -144,6 +144,8 @@ class ProductApi:
             return ApiResponse(HTTPStatus.OK, {"summary": self.wallet_summary(query)})
         if path == "/wallets/screener":
             return ApiResponse(HTTPStatus.OK, {"wallets": self.wallet_screener(query)})
+        if path == "/wallets/fifa-24h-pnl":
+            return ApiResponse(HTTPStatus.OK, self.wallet_fifa_24h_pnl(query))
         if path == "/wallets/polycop-signals/summary":
             output = self.polycop_wallet_signals(query, include_wallets=False)
             status = (
@@ -2996,6 +2998,8 @@ class ProductApi:
         return fallback_rows[0] if fallback_rows else None
 
     def wallet_summary(self, query: dict[str, list[str]]) -> dict[str, Any]:
+        if wallet_detail_scope(param(query, "scope", "all")) == "fifa":
+            return self.wallet_summary_fifa(query)
         min_smart_notional = float_param(
             query, "min_smart_notional", 10_000.0, minimum=0.0
         )
@@ -3036,6 +3040,8 @@ class ProductApi:
         return rows[0] if rows else {}
 
     def wallet_screener(self, query: dict[str, list[str]]) -> list[dict[str, Any]]:
+        if wallet_detail_scope(param(query, "scope", "all")) == "fifa":
+            return self.wallet_screener_fifa(query)
         limit = int_param(query, "limit", 50, maximum=500)
         min_notional = float_param(query, "min_notional", 0.0, minimum=0.0)
         min_notional_24h = float_param(query, "min_notional_24h", 0.0, minimum=0.0)
@@ -3252,6 +3258,304 @@ class ProductApi:
         """
         return rows_json(self.clickhouse.query_text(sql))
 
+    def wallet_summary_fifa(self, query: dict[str, list[str]]) -> dict[str, Any]:
+        min_smart_notional = float_param(
+            query, "min_smart_notional", 10_000.0, minimum=0.0
+        )
+        min_roi = float_param(query, "min_roi", 0.55, minimum=0.0)
+        whale_min_notional = float_param(
+            query, "whale_min_notional", 1_000_000.0, minimum=0.0
+        )
+        whale_min_single_trade = float_param(
+            query, "whale_min_single_trade", 100_000.0, minimum=0.0
+        )
+        fifa_roi = "if(fifa.buy_notional = 0, 0.0, fifa.equity_now / fifa.buy_notional)"
+        sql = f"""
+            with trade_max as
+            (
+              select
+                user_address,
+                max(notional) as max_single_trade_notional
+              from mart_fifa_trade final
+              where user_address != ''
+              group by user_address
+            )
+            select
+              'fifa' as scope,
+              count() as total_wallets,
+              countIf(fifa.buy_notional >= {min_smart_notional}) as wallets_over_10k,
+              countIf(
+                fifa.buy_notional >= {min_smart_notional}
+                and fifa.data_quality = 'estimate'
+                and {fifa_roi} >= {min_roi}
+              ) as smart_wallets,
+              countIf(
+                fifa.traded_notional >= {whale_min_notional}
+                or ifNull(trade_max.max_single_trade_notional, 0.0) >= {whale_min_single_trade}
+              ) as whale_wallets,
+              count() as pnl_covered_wallets,
+              countIf(fifa.buy_notional >= {min_smart_notional}) as over_10k_with_pnl,
+              0 as over_10k_without_pnl,
+              sum(fifa.traded_notional) as traded_notional,
+              sum(fifa.traded_notional_24h) as traded_notional_24h,
+              sum(fifa.equity_now) as total_pnl,
+              max(fifa.updated_at) as updated_at
+            from mart_wallet_fifa_24h_pnl as fifa final
+            left join trade_max on fifa.user_address = trade_max.user_address
+            where fifa.user_address != ''
+            format JSONEachRow
+        """
+        rows = rows_json(self.clickhouse.query_text(sql))
+        return rows[0] if rows else {}
+
+    def wallet_screener_fifa(self, query: dict[str, list[str]]) -> list[dict[str, Any]]:
+        limit = int_param(query, "limit", 50, maximum=500)
+        min_notional = float_param(query, "min_notional", 0.0, minimum=0.0)
+        min_notional_24h = float_param(query, "min_notional_24h", 0.0, minimum=0.0)
+        tier = param(query, "tier")
+        mode = param(query, "mode", "active")
+        whale_min_notional = float_param(
+            query, "whale_min_notional", 1_000_000.0, minimum=0.0
+        )
+        whale_min_single_trade = float_param(
+            query, "whale_min_single_trade", 100_000.0, minimum=0.0
+        )
+        min_smart_notional = float_param(
+            query, "min_smart_notional", 10_000.0, minimum=0.0
+        )
+        min_roi = float_param(query, "min_roi", 0.55, minimum=0.0)
+        fifa_roi = "if(fifa.buy_notional = 0, 0.0, fifa.equity_now / fifa.buy_notional)"
+        max_single = "ifNull(trade_max.max_single_trade_notional, 0.0)"
+        where = [
+            "fifa.user_address != ''",
+            f"fifa.traded_notional >= {min_notional}",
+            f"fifa.traded_notional_24h >= {min_notional_24h}",
+        ]
+        if tier:
+            tier_floor = {
+                "10m_plus": 10_000_000,
+                "5m_plus": 5_000_000,
+                "1m_plus": 1_000_000,
+                "100k_plus": 100_000,
+                "standard": 0,
+            }.get(tier)
+            if tier_floor is not None:
+                where.append(f"fifa.traded_notional >= {float(tier_floor)}")
+        if mode == "smart":
+            where.append(
+                f"(fifa.buy_notional >= {min_smart_notional} "
+                f"and fifa.data_quality = 'estimate' "
+                f"and {fifa_roi} >= {min_roi})"
+            )
+            order_by = f"{fifa_roi} desc, fifa.equity_now desc, fifa.traded_notional desc"
+        elif mode == "whale":
+            where.append(
+                f"(fifa.traded_notional >= {whale_min_notional} "
+                f"or {max_single} >= {whale_min_single_trade})"
+            )
+            order_by = (
+                f"greatest(fifa.traded_notional / greatest({whale_min_notional}, 1), "
+                f"{max_single} / greatest({whale_min_single_trade}, 1)) desc, "
+                "fifa.traded_notional desc"
+            )
+        else:
+            order_by = "fifa.last_trade_at desc, fifa.traded_notional desc"
+
+        sql = f"""
+            with trade_max as
+            (
+              select
+                user_address,
+                max(notional) as max_single_trade_notional
+              from mart_fifa_trade final
+              where user_address != ''
+              group by user_address
+            )
+            select
+              'fifa' as scope,
+              fifa.user_address as user_address,
+              fifa.trade_count as trade_count,
+              fifa.buy_count as buy_count,
+              fifa.sell_count as sell_count,
+              fifa.traded_size as traded_size,
+              fifa.traded_notional as traded_notional,
+              fifa.first_trade_at as first_trade_at,
+              fifa.last_trade_at as last_trade_at,
+              fifa.traded_notional_24h as traded_notional_24h,
+              fifa.trade_count_24h as trade_count_24h,
+              fifa.buy_notional_24h as buy_notional_24h,
+              fifa.sell_notional_24h as sell_notional_24h,
+              fifa.net_notional_24h as net_notional_24h,
+              fifa.latest_action as latest_action,
+              fifa.traded_notional as category_traded_notional,
+              fifa.trade_count as category_trade_count,
+              fifa.buy_notional as category_buy_notional,
+              fifa.sell_notional as category_sell_notional,
+              if(fifa.trade_count = 0, cast(null, 'Nullable(Float64)'), fifa.traded_notional / fifa.trade_count)
+                as avg_bet,
+              {max_single} as max_single_trade_notional,
+              fifa.open_position_count as position_count,
+              fifa.open_position_value_now as positions_value,
+              fifa.open_position_value_now as portfolio_value,
+              0.0 as available_balance,
+              fifa.equity_now as total_pnl,
+              fifa.updated_at as portfolio_captured_at,
+              fifa.updated_at as pnl_captured_at,
+              {fifa_roi} as pnl_roi,
+              (
+                fifa.traded_notional >= {whale_min_notional}
+                or {max_single} >= {whale_min_single_trade}
+              ) as is_whale,
+              (
+                fifa.buy_notional >= {min_smart_notional}
+                and fifa.data_quality = 'estimate'
+                and {fifa_roi} >= {min_roi}
+              ) as is_smart,
+              multiIf(
+                fifa.traded_notional >= {whale_min_notional} and {max_single} >= {whale_min_single_trade},
+                  'fifa_total_volume_and_single_trade',
+                fifa.traded_notional >= {whale_min_notional}, 'fifa_total_volume',
+                {max_single} >= {whale_min_single_trade}, 'fifa_single_trade',
+                ''
+              ) as whale_reason,
+              fifa.buy_notional_24h as recent_buy_notional,
+              fifa.sell_notional_24h as recent_sell_notional,
+              multiIf(
+                fifa.traded_notional >= 10000000, '10m_plus',
+                fifa.traded_notional >= 5000000, '5m_plus',
+                fifa.traded_notional >= 1000000, '1m_plus',
+                fifa.traded_notional >= 100000, '100k_plus',
+                'standard'
+              ) as whale_tier,
+              0 as data_lag_seconds,
+              cast(null, 'Nullable(Float64)') as win_rate,
+              cast(fifa.equity_now, 'Nullable(Float64)') as realized_pnl,
+              0 as completed_event_count,
+              cast(fifa.open_position_value_now, 'Nullable(Float64)') as active_unrealized_pnl_estimate,
+              'Sports' as favorite_category,
+              fifa.event_count as fifa_event_count,
+              fifa.market_count as fifa_market_count,
+              fifa.event_count_24h as fifa_event_count_24h,
+              fifa.market_count_24h as fifa_market_count_24h,
+              fifa.pnl_24h as fifa_pnl_24h,
+              fifa.pnl_roi_24h as fifa_pnl_roi_24h,
+              fifa.data_quality as fifa_data_quality,
+              fifa.updated_at as updated_at
+            from mart_wallet_fifa_24h_pnl as fifa final
+            left join trade_max on fifa.user_address = trade_max.user_address
+            where {" and ".join(where)}
+            order by {order_by}
+            limit {limit}
+            format JSONEachRow
+        """
+        return rows_json(self.clickhouse.query_text(sql))
+
+    def wallet_fifa_24h_pnl(self, query: dict[str, list[str]]) -> dict[str, Any]:
+        limit = int_param(query, "limit", 50, maximum=500)
+        offset = bounded_int_param(query, "offset", 0, minimum=0, maximum=100_000)
+        min_notional_24h = float_param(query, "min_notional_24h", 0.0, minimum=0.0)
+        min_trades_24h = bounded_int_param(query, "min_trades_24h", 0, minimum=0, maximum=1_000_000)
+        data_quality = param(query, "data_quality").strip().lower()
+        search = param(query, "q").strip().lower()
+        sort = param(query, "sort", "pnl_24h").strip().lower()
+        direction = param(query, "direction", "desc").strip().lower()
+
+        where = [
+            "fifa.user_address != ''",
+            f"fifa.traded_notional_24h >= {min_notional_24h}",
+            f"fifa.trade_count_24h >= {min_trades_24h}",
+        ]
+        if data_quality:
+            where.append(f"lower(fifa.data_quality) = {ch_string(data_quality)}")
+        if search:
+            where.append(f"positionCaseInsensitive(fifa.user_address, {ch_string(search)}) > 0")
+
+        sort_columns = {
+            "pnl_24h": "fifa.pnl_24h",
+            "roi_24h": "fifa.pnl_roi_24h",
+            "notional_24h": "fifa.traded_notional_24h",
+            "volume_24h": "fifa.traded_notional_24h",
+            "trades_24h": "fifa.trade_count_24h",
+            "equity": "fifa.equity_now",
+            "last_trade": "fifa.last_trade_at",
+            "updated_at": "fifa.updated_at",
+        }
+        sort_column = sort_columns.get(sort, "fifa.pnl_24h")
+        sort_direction = "asc" if direction == "asc" else "desc"
+        sql = f"""
+            select
+              fifa.user_address as user_address,
+              fifa.trade_count as trade_count,
+              fifa.buy_count as buy_count,
+              fifa.sell_count as sell_count,
+              fifa.traded_size as traded_size,
+              fifa.traded_notional as traded_notional,
+              fifa.buy_notional as buy_notional,
+              fifa.sell_notional as sell_notional,
+              fifa.trade_count_24h as trade_count_24h,
+              fifa.buy_notional_24h as buy_notional_24h,
+              fifa.sell_notional_24h as sell_notional_24h,
+              fifa.traded_notional_24h as traded_notional_24h,
+              fifa.net_notional_24h as net_notional_24h,
+              fifa.event_count as event_count,
+              fifa.market_count as market_count,
+              fifa.event_count_24h as event_count_24h,
+              fifa.market_count_24h as market_count_24h,
+              fifa.token_count as token_count,
+              fifa.open_position_count as open_position_count,
+              fifa.open_position_value_now as open_position_value_now,
+              fifa.open_position_value_24h_ago as open_position_value_24h_ago,
+              fifa.equity_now as equity_now,
+              fifa.equity_24h_ago as equity_24h_ago,
+              fifa.pnl_24h as pnl_24h,
+              fifa.pnl_base_24h as pnl_base_24h,
+              fifa.pnl_roi_24h as pnl_roi_24h,
+              fifa.first_trade_at as first_trade_at,
+              fifa.last_trade_at as last_trade_at,
+              fifa.latest_action as latest_action,
+              fifa.missing_mark_count as missing_mark_count,
+              fifa.negative_position_count as negative_position_count,
+              fifa.data_quality as data_quality,
+              fifa.updated_at as updated_at,
+              ifNull(screener.is_whale, false) as is_whale,
+              ifNull(screener.is_smart, false) as is_smart,
+              ifNull(screener.total_pnl, 0.0) as total_pnl,
+              ifNull(screener.pnl_roi, 0.0) as pnl_roi,
+              ifNull(screener.portfolio_value, 0.0) as portfolio_value,
+              ifNull(screener.max_single_trade_notional, 0.0) as max_single_trade_notional
+            from mart_wallet_fifa_24h_pnl as fifa final
+            left join mart_wallet_screener as screener final
+              on fifa.user_address = screener.user_address
+            where {" and ".join(where)}
+            order by {sort_column} {sort_direction}, fifa.traded_notional_24h desc
+            limit {limit} offset {offset}
+            format JSONEachRow
+        """
+        rows = rows_json(self.clickhouse.query_text(sql))
+        summary_sql = f"""
+            select
+              count() as total,
+              countIf(fifa.pnl_24h > 0) as profitable_wallets,
+              countIf(fifa.pnl_24h < 0) as losing_wallets,
+              sum(traded_notional_24h) as traded_notional_24h,
+              sum(fifa.pnl_24h) as pnl_24h,
+              max(updated_at) as updated_at
+            from mart_wallet_fifa_24h_pnl as fifa final
+            where {" and ".join(where)}
+            format JSONEachRow
+        """
+        summary_rows = rows_json(self.clickhouse.query_text(summary_sql))
+        return {
+            "scope": "fifa",
+            "window_hours": 24,
+            "limit": limit,
+            "offset": offset,
+            "sort": sort,
+            "direction": sort_direction,
+            "summary": summary_rows[0] if summary_rows else {},
+            "wallets": rows,
+        }
+
     def polycop_wallet_signals(
         self,
         query: dict[str, list[str]],
@@ -3341,6 +3645,17 @@ class ProductApi:
         pnl_points_limit = int_param(query, "pnl_points_limit", 180, maximum=2000)
         position_scope = param(query, "position_scope", "all").lower()
         position_sort = param(query, "position_sort", "current_value").lower()
+        detail_scope = wallet_detail_scope(param(query, "scope", "all"))
+
+        if detail_scope == "fifa":
+            return self.wallet_detail_fifa(
+                user,
+                position_limit=position_limit,
+                activity_limit=activity_limit,
+                pnl_points_limit=pnl_points_limit,
+                position_scope=position_scope,
+                position_sort=position_sort,
+            )
 
         if truthy_param(query, "live"):
             live_detail = self.wallet_detail_live(
@@ -3394,6 +3709,83 @@ class ProductApi:
             position_scope=position_scope,
             position_sort=position_sort,
             data_source="snapshot",
+            data_scope="all",
+        )
+
+    def wallet_detail_fifa(
+        self,
+        user: str,
+        *,
+        position_limit: int,
+        activity_limit: int,
+        pnl_points_limit: int,
+        position_scope: str,
+        position_sort: str,
+    ) -> dict[str, Any] | None:
+        summary = self.wallet_fifa_summary(user)
+        activity_summary = self.wallet_fifa_activity_summary(user)
+        positions = self.wallet_fifa_positions(user)
+        recent_activity = self.wallet_fifa_recent_activity(user, max(activity_limit, 500))
+        if not any((summary, positions, recent_activity)):
+            return None
+
+        captured_at = (
+            (summary or {}).get("updated_at")
+            or (activity_summary or {}).get("last_activity_at")
+            or datetime.now(UTC)
+        )
+        total_pnl = value_or_fallback(
+            (summary or {}).get("equity_now"),
+            sum(float_value(position.get("cash_pnl")) for position in positions),
+        )
+        positions_value = value_or_fallback(
+            (summary or {}).get("open_position_value_now"),
+            sum(
+                float_value(position.get("current_value"))
+                for position in positions
+                if position.get("is_open")
+            ),
+        )
+        portfolio = {
+            "user_address": user,
+            "captured_at": captured_at,
+            "position_count": sum(1 for position in positions if position.get("is_open")),
+            "positions_value": float_value(positions_value),
+            "portfolio_value": float_value(positions_value),
+            "available_balance": 0.0,
+            "total_pnl": float_value(total_pnl),
+            "raw_json": "",
+        }
+        pnl = wallet_fifa_pnl_snapshot(user, summary)
+        if pnl is None:
+            pnl = {
+                "user_address": user,
+                "captured_at": captured_at,
+                "total_pnl": float_value(total_pnl),
+                "raw_json": "",
+            }
+        activity_by_type = wallet_fifa_activity_by_type(activity_summary)
+        closed_positions = [
+            position for position in positions if position.get("is_settled_or_redeemable")
+        ]
+        return self.wallet_detail_response(
+            user,
+            portfolio=portfolio,
+            pnl=pnl,
+            activity_summary=activity_summary,
+            activity_by_type=activity_by_type,
+            recent_activity=recent_activity[:activity_limit],
+            reputation=None,
+            closed_positions=closed_positions,
+            activity_positions=positions,
+            positions_override=positions,
+            position_limit=position_limit,
+            activity_limit=activity_limit,
+            pnl_points_limit=pnl_points_limit,
+            position_scope=position_scope,
+            position_sort=position_sort,
+            data_source="fifa",
+            data_scope="fifa",
         )
 
     def wallet_detail_live(
@@ -3494,6 +3886,7 @@ class ProductApi:
             position_scope=position_scope,
             position_sort=position_sort,
             data_source="live",
+            data_scope="all",
         )
 
     def wallet_detail_realtime(
@@ -3536,6 +3929,7 @@ class ProductApi:
             position_scope=position_scope,
             position_sort=position_sort,
             data_source="realtime",
+            data_scope="all",
         )
         detail["wallet"]["data_status"] = "ok" if realtime_rows else "no_realtime_activity"
         detail["wallet"]["data_freshness_status"] = "ok" if realtime_rows else "missing"
@@ -3618,13 +4012,19 @@ class ProductApi:
         position_scope: str,
         position_sort: str,
         data_source: str,
+        data_scope: str = "all",
         closed_positions: list[dict[str, Any]] | None = None,
         activity_positions: list[dict[str, Any]] | None = None,
+        positions_override: list[dict[str, Any]] | None = None,
     ) -> dict[str, Any] | None:
         if not any((portfolio, pnl, activity_summary, activity_by_type, recent_activity)):
             return None
 
-        positions = wallet_positions_from_snapshot(portfolio)
+        positions = (
+            list(positions_override)
+            if positions_override is not None
+            else wallet_positions_from_snapshot(portfolio)
+        )
         activity_positions = activity_positions or wallet_closed_positions_from_activity(
             recent_activity,
             include_open=True,
@@ -3655,8 +4055,10 @@ class ProductApi:
         pnl_lag_minutes = datetime_lag_minutes(pnl_captured_at, portfolio_captured_at)
 
         return {
+            "scope": data_scope,
             "wallet": {
                 "user_address": user,
+                "scope": data_scope,
                 "data_status": "ok",
                 "data_source": data_source,
                 "data_freshness_status": wallet_data_freshness_status(
@@ -3739,6 +4141,262 @@ class ProductApi:
             "reputation": reputation or empty_wallet_reputation(user),
             "recent_activity": recent_activity,
         }
+
+    def wallet_fifa_summary(self, user: str) -> dict[str, Any] | None:
+        sql = f"""
+            select
+              user_address,
+              trade_count,
+              buy_count,
+              sell_count,
+              traded_size,
+              traded_notional,
+              buy_notional,
+              sell_notional,
+              trade_count_24h,
+              buy_notional_24h,
+              sell_notional_24h,
+              traded_notional_24h,
+              net_notional_24h,
+              event_count,
+              market_count,
+              event_count_24h,
+              market_count_24h,
+              token_count,
+              open_position_count,
+              open_position_value_now,
+              open_position_value_24h_ago,
+              equity_now,
+              equity_24h_ago,
+              pnl_24h,
+              pnl_base_24h,
+              pnl_roi_24h,
+              first_trade_at,
+              last_trade_at,
+              latest_action,
+              missing_mark_count,
+              negative_position_count,
+              data_quality,
+              updated_at
+            from mart_wallet_fifa_24h_pnl final
+            where user_address = {ch_string(user)}
+            limit 1
+            format JSONEachRow
+        """
+        rows = rows_json(self.clickhouse.query_text(sql))
+        return rows[0] if rows else None
+
+    def wallet_fifa_activity_summary(self, user: str) -> dict[str, Any]:
+        sql = f"""
+            select
+              user_address,
+              count() as activity_count,
+              count() as trade_activity_count,
+              countIf(side = 'BUY') as buy_count,
+              countIf(side = 'SELL') as sell_count,
+              sum(size) as traded_size,
+              sum(notional) as traded_notional,
+              sumIf(notional, side = 'BUY') as buy_notional,
+              sumIf(notional, side = 'SELL') as sell_notional,
+              countIf(timestamp >= now64(3) - interval 24 hour) as activity_count_24h,
+              countIf(timestamp >= now64(3) - interval 24 hour) as trade_activity_count_24h,
+              sumIf(notional, timestamp >= now64(3) - interval 24 hour) as traded_notional_24h,
+              countIf(timestamp >= now64(3) - interval 7 day) as trade_activity_count_7d,
+              sumIf(notional, timestamp >= now64(3) - interval 7 day) as traded_notional_7d,
+              avgIf(notional, notional > 0) as avg_bet,
+              'TRADE' as latest_activity_type,
+              argMax(side, timestamp) as latest_side,
+              min(timestamp) as first_activity_at,
+              max(timestamp) as last_activity_at
+            from mart_fifa_trade final
+            where user_address = {ch_string(user)}
+              and timestamp <= now64(3) + interval 10 minute
+            group by user_address
+            limit 1
+            format JSONEachRow
+        """
+        rows = rows_json(self.clickhouse.query_text(sql))
+        return normalize_wallet_activity_summary(rows[0]) if rows else empty_wallet_activity_summary(user)
+
+    def wallet_fifa_recent_activity(self, user: str, limit: int) -> list[dict[str, Any]]:
+        sql = f"""
+            select
+              trades.timestamp as timestamp,
+              'TRADE' as activity_type,
+              trades.side as side,
+              trades.price as price,
+              trades.size as size,
+              trades.notional as notional,
+              trades.condition_id as condition_id,
+              trades.token_id as token_id,
+              '' as transaction_hash,
+              ifNull(markets.question, '') as title,
+              ifNull(markets.slug, '') as slug,
+              ifNull(events.slug, '') as event_slug,
+              ifNull(tokens.outcome, '') as outcome,
+              'fifa-mart' as source
+            from mart_fifa_trade as trades final
+            left join dim_market as markets final
+              on trades.condition_id = markets.condition_id
+            left join dim_event as events final
+              on markets.event_id = events.event_id
+            left join dim_outcome_token as tokens final
+              on trades.token_id = tokens.token_id
+            where trades.user_address = {ch_string(user)}
+              and trades.timestamp <= now64(3) + interval 10 minute
+            order by trades.timestamp desc
+            limit {limit}
+            format JSONEachRow
+        """
+        return rows_json(self.clickhouse.query_text(sql))
+
+    def wallet_fifa_positions(self, user: str) -> list[dict[str, Any]]:
+        sql = f"""
+            with
+              now64(3) as as_of,
+              user_tokens as
+              (
+                select
+                  token_id,
+                  anyLast(market_id) as market_id
+                from mart_fifa_trade final
+                where user_address = {ch_string(user)}
+                  and token_id != ''
+                group by token_id
+              ),
+              final_prices as
+              (
+                select
+                  tokens.token_id as token_id,
+                  resolved.final_price as final_price
+                from
+                (
+                  select
+                    market_id,
+                    price_index - 1 as outcome_index,
+                    toFloat64OrZero(JSONExtractString(price_raw)) as final_price
+                  from
+                  (
+                    select
+                      market_id,
+                      JSONExtractString(raw_json, 'outcomePrices') as prices
+                    from dim_market as markets final
+                    where market_id in (select market_id from user_tokens)
+                      and closed = true
+                      and JSONExtractString(raw_json, 'outcomePrices') != ''
+                  )
+                  array join
+                    JSONExtractArrayRaw(prices) as price_raw,
+                    arrayEnumerate(JSONExtractArrayRaw(prices)) as price_index
+                ) as resolved
+                inner join dim_outcome_token as tokens final
+                  on tokens.market_id = resolved.market_id
+                 and tokens.outcome_index = resolved.outcome_index
+              ),
+              marks as
+              (
+                select
+                  token_ids.token_id as token_id,
+                  multiIf(
+                    final_prices.final_price is not null,
+                      cast(final_prices.final_price, 'Nullable(Float64)'),
+                    book_marks.book_count > 0,
+                      cast(
+                        (book_marks.book_best_bid + book_marks.book_best_ask) / 2,
+                        'Nullable(Float64)'
+                      ),
+                    price_marks.price_count > 0,
+                      cast(price_marks.price, 'Nullable(Float64)'),
+                    cast(null, 'Nullable(Float64)')
+                  ) as mark_price
+                from user_tokens as token_ids
+                left join final_prices on token_ids.token_id = final_prices.token_id
+                left join
+                (
+                  select
+                    token_id,
+                    argMax(price, timestamp) as price,
+                    count() as price_count
+                  from fact_price_history
+                  where token_id in (select token_id from user_tokens)
+                    and timestamp <= as_of + toIntervalMinute(10)
+                  group by token_id
+                ) as price_marks on token_ids.token_id = price_marks.token_id
+                left join
+                (
+                  select
+                    token_id,
+                    argMax(best_bid, captured_at) as book_best_bid,
+                    argMax(best_ask, captured_at) as book_best_ask,
+                    count() as book_count
+                  from fact_orderbook_snapshot
+                  where token_id in (select token_id from user_tokens)
+                    and best_bid is not null
+                    and best_ask is not null
+                    and captured_at <= as_of + toIntervalMinute(10)
+                  group by token_id
+                ) as book_marks on token_ids.token_id = book_marks.token_id
+              )
+            select
+              position_rows.token_id as asset,
+              position_rows.condition_id as condition_id,
+              ifNull(markets.question, '') as title,
+              ifNull(markets.slug, '') as slug,
+              ifNull(markets.event_id, '') as event_id,
+              ifNull(events.slug, '') as event_slug,
+              ifNull(tokens.outcome, '') as outcome,
+              position_rows.position_size as size,
+              position_rows.avg_price as avg_price,
+              ifNull(marks.mark_price, 0.0) as cur_price,
+              position_rows.buy_notional as initial_value,
+              if(position_rows.position_size > 0.000001, position_rows.position_size * ifNull(marks.mark_price, 0.0), 0.0)
+                as current_value,
+              position_rows.sell_notional,
+              position_rows.buy_notional,
+              position_rows.buy_size,
+              position_rows.sell_size,
+              position_rows.buy_count,
+              position_rows.sell_count,
+              position_rows.trade_count,
+              position_rows.first_activity_at,
+              position_rows.last_activity_at,
+              ifNull(markets.closed, false) as market_closed,
+              if(marks.mark_price is null, true, false) as missing_mark
+            from
+            (
+              select
+                condition_id,
+                token_id,
+                anyLast(market_id) as market_id,
+                count() as trade_count,
+                countIf(side = 'BUY') as buy_count,
+                countIf(side = 'SELL') as sell_count,
+                sumIf(size, side = 'BUY') as buy_size,
+                sumIf(size, side = 'SELL') as sell_size,
+                sumIf(notional, side = 'BUY') as buy_notional,
+                sumIf(notional, side = 'SELL') as sell_notional,
+                sum(if(side = 'BUY', size, -size)) as position_size,
+                if(sumIf(size, side = 'BUY') = 0, 0.0, sumIf(notional, side = 'BUY') / sumIf(size, side = 'BUY'))
+                  as avg_price,
+                min(timestamp) as first_activity_at,
+                max(timestamp) as last_activity_at
+              from mart_fifa_trade final
+              where user_address = {ch_string(user)}
+                and timestamp <= as_of + toIntervalMinute(10)
+              group by condition_id, token_id
+            ) as position_rows
+            left join marks on position_rows.token_id = marks.token_id
+            left join dim_market as markets final
+              on position_rows.condition_id = markets.condition_id
+            left join dim_event as events final
+              on markets.event_id = events.event_id
+            left join dim_outcome_token as tokens final
+              on position_rows.token_id = tokens.token_id
+            order by abs(position_rows.sell_notional + if(position_rows.position_size > 0.000001, position_rows.position_size * ifNull(marks.mark_price, 0.0), 0.0) - position_rows.buy_notional) desc
+            limit 1000
+            format JSONEachRow
+        """
+        return [normalize_fifa_position(row) for row in rows_json(self.clickhouse.query_text(sql))]
 
     def enqueue_wallet_refresh(self, user: str) -> dict[str, Any]:
         if self.settings is None:
@@ -5138,6 +5796,107 @@ def api_datetime(value: Any) -> str | None:
     return dt.astimezone(UTC).strftime("%Y-%m-%d %H:%M:%S.%f")[:-3]
 
 
+def wallet_detail_scope(value: str) -> str:
+    normalized = str(value or "all").strip().lower().replace("-", "_")
+    if normalized in ("fifa", "fifwc", "worldcup", "world_cup", "world cup"):
+        return "fifa"
+    return "all"
+
+
+def wallet_fifa_pnl_snapshot(
+    user: str,
+    summary: dict[str, Any] | None,
+) -> dict[str, Any] | None:
+    if not summary:
+        return None
+    captured_at = summary.get("updated_at") or datetime.now(UTC)
+    captured_dt = parse_clickhouse_datetime(captured_at) or datetime.now(UTC)
+    equity_now = float_value(summary.get("equity_now"))
+    equity_24h_ago = float_value(summary.get("equity_24h_ago"))
+    points = [
+        {"t": int(captured_dt.timestamp()) - 86_400, "p": equity_24h_ago},
+        {"t": int(captured_dt.timestamp()), "p": equity_now},
+    ]
+    return {
+        "user_address": user,
+        "captured_at": api_datetime(captured_dt),
+        "total_pnl": equity_now,
+        "raw_json": json.dumps({"points": points}, separators=(",", ":")),
+    }
+
+
+def wallet_fifa_activity_by_type(summary: dict[str, Any] | None) -> list[dict[str, Any]]:
+    if not summary or int_value(summary.get("trade_activity_count")) <= 0:
+        return []
+    return [
+        {
+            "activity_type": "TRADE",
+            "count": int_value(summary.get("trade_activity_count")),
+            "size": float_value(summary.get("traded_size")),
+            "notional": float_value(summary.get("traded_notional")),
+            "first_activity_at": summary.get("first_activity_at"),
+            "last_activity_at": summary.get("last_activity_at"),
+        }
+    ]
+
+
+def normalize_fifa_position(row: dict[str, Any]) -> dict[str, Any]:
+    position_size = float_value(row.get("size"))
+    buy_size = float_value(row.get("buy_size"))
+    sell_size = float_value(row.get("sell_size"))
+    buy_notional = float_value(row.get("buy_notional"))
+    sell_notional = float_value(row.get("sell_notional"))
+    current_value = float_value(row.get("current_value"))
+    cash_pnl = sell_notional + current_value - buy_notional
+    market_closed = bool_value(row.get("market_closed"))
+    dust_threshold = max(0.01, buy_size * 0.0001)
+    is_open = position_size > dust_threshold and not market_closed
+    display_size = position_size if is_open else max(buy_size, sell_size, position_size)
+    percent_pnl = cash_pnl / buy_notional * 100.0 if buy_notional else 0.0
+    return {
+        "asset": str(row.get("asset") or ""),
+        "condition_id": str(row.get("condition_id") or ""),
+        "title": str(row.get("title") or ""),
+        "slug": str(row.get("slug") or ""),
+        "event_id": str(row.get("event_id") or ""),
+        "event_slug": str(row.get("event_slug") or ""),
+        "outcome": str(row.get("outcome") or ""),
+        "opposite_outcome": "",
+        "size": display_size,
+        "avg_price": float_value(row.get("avg_price")),
+        "cur_price": float_value(row.get("cur_price")),
+        "initial_value": buy_notional,
+        "current_value": current_value if is_open else 0.0,
+        "cash_pnl": cash_pnl,
+        "percent_pnl": percent_pnl,
+        "realized_pnl": cash_pnl if not is_open else 0.0,
+        "percent_realized_pnl": percent_pnl if not is_open else 0.0,
+        "total_bought": buy_size,
+        "redeemable": market_closed and position_size > dust_threshold,
+        "mergeable": False,
+        "negative_risk": False,
+        "end_date": row.get("last_activity_at"),
+        "icon": "",
+        "is_worldcup": True,
+        "is_open": is_open,
+        "is_settled_or_redeemable": not is_open,
+        "cost_basis_estimate": buy_notional,
+        "sold_value": sell_notional,
+        "redeemed_value": 0.0,
+        "buy_notional": buy_notional,
+        "sell_notional": sell_notional,
+        "buy_size": buy_size,
+        "sell_size": sell_size,
+        "buy_count": int_value(row.get("buy_count")),
+        "sell_count": int_value(row.get("sell_count")),
+        "trade_count": int_value(row.get("trade_count")),
+        "activity_count": int_value(row.get("trade_count")),
+        "first_activity_at": api_datetime(row.get("first_activity_at")),
+        "last_activity_at": api_datetime(row.get("last_activity_at")),
+        "missing_mark": bool_value(row.get("missing_mark")),
+    }
+
+
 def dedupe_wallet_activity_rows(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
     deduped: dict[tuple[Any, ...], dict[str, Any]] = {}
     for row in rows:
@@ -6235,6 +6994,14 @@ def int_value(value: Any) -> int:
         return int(float(value or 0))
     except (TypeError, ValueError):
         return 0
+
+
+def bool_value(value: Any) -> bool:
+    if isinstance(value, bool):
+        return value
+    if value is None:
+        return False
+    return str(value).strip().lower() in ("1", "true", "yes", "y", "on")
 
 
 def collect_system_stats() -> dict[str, Any]:

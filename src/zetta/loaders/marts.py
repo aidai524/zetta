@@ -621,6 +621,494 @@ class MartBuilder:
         )
         return MartBuildResult(mart="wallet_screener", rows=rows)
 
+    def build_wallet_fifa_24h_pnl(self, *, window_hours: int = 24) -> MartBuildResult:
+        if window_hours <= 0:
+            raise ValueError("window_hours must be positive")
+        self.build_fifa_trades(window_hours=max(72, window_hours * 2))
+        self.clickhouse.execute("truncate table mart_wallet_fifa_24h_pnl_next")
+        self.clickhouse.execute(
+            f"""
+            insert into mart_wallet_fifa_24h_pnl_next
+            with
+              now64(3) as as_of,
+              as_of - toIntervalHour({window_hours}) as since,
+              fifa_tokens as
+              (
+                select
+                  token_id,
+                  anyLast(market_id) as market_id
+                from mart_fifa_trade final
+                where token_id != ''
+                group by token_id
+              ),
+              final_prices_now as
+              (
+                select
+                  resolved.market_id as market_id,
+                  tokens.token_id as token_id,
+                  resolved.final_price as final_price
+                from
+                (
+                  select
+                    market_id,
+                    condition_id,
+                    price_index - 1 as outcome_index,
+                    toFloat64OrZero(JSONExtractString(price_raw)) as final_price
+                  from
+                  (
+                    select
+                      market_id,
+                      condition_id,
+                      JSONExtractString(raw_json, 'outcomePrices') as prices
+                    from dim_market as markets final
+                    where market_id in (select market_id from fifa_tokens)
+                      and closed = true
+                      and JSONExtractString(raw_json, 'outcomePrices') != ''
+                  )
+                  array join
+                    JSONExtractArrayRaw(prices) as price_raw,
+                    arrayEnumerate(JSONExtractArrayRaw(prices)) as price_index
+                ) as resolved
+                inner join dim_outcome_token as tokens final
+                  on tokens.market_id = resolved.market_id
+                 and tokens.outcome_index = resolved.outcome_index
+              ),
+              final_prices_ago as
+              (
+                select
+                  resolved.market_id as market_id,
+                  tokens.token_id as token_id,
+                  resolved.final_price as final_price
+                from
+                (
+                  select
+                    market_id,
+                    condition_id,
+                    price_index - 1 as outcome_index,
+                    toFloat64OrZero(JSONExtractString(price_raw)) as final_price
+                  from
+                  (
+                    select
+                      market_id,
+                      condition_id,
+                      JSONExtractString(raw_json, 'outcomePrices') as prices
+                    from dim_market as markets final
+                    where market_id in (select market_id from fifa_tokens)
+                      and closed = true
+                      and end_time <= since
+                      and JSONExtractString(raw_json, 'outcomePrices') != ''
+                  )
+                  array join
+                    JSONExtractArrayRaw(prices) as price_raw,
+                    arrayEnumerate(JSONExtractArrayRaw(prices)) as price_index
+                ) as resolved
+                inner join dim_outcome_token as tokens final
+                  on tokens.market_id = resolved.market_id
+                 and tokens.outcome_index = resolved.outcome_index
+              ),
+              marks as
+              (
+                select
+                  token_ids.token_id as token_id,
+                  multiIf(
+                    final_now.final_price is not null,
+                      cast(final_now.final_price, 'Nullable(Float64)'),
+                    book_marks.book_now_count > 0,
+                      cast((book_marks.book_best_bid_now + book_marks.book_best_ask_now) / 2, 'Nullable(Float64)'),
+                    price_marks.price_now_count > 0,
+                      cast(price_marks.price_now, 'Nullable(Float64)'),
+                    cast(null, 'Nullable(Float64)')
+                  ) as mark_price_now,
+                  multiIf(
+                    final_ago.final_price is not null,
+                      cast(final_ago.final_price, 'Nullable(Float64)'),
+                    book_marks.book_ago_count > 0,
+                      cast((book_marks.book_best_bid_ago + book_marks.book_best_ask_ago) / 2, 'Nullable(Float64)'),
+                    price_marks.price_ago_count > 0,
+                      cast(price_marks.price_ago, 'Nullable(Float64)'),
+                    cast(null, 'Nullable(Float64)')
+                  ) as mark_price_24h_ago
+                from fifa_tokens as token_ids
+                left join final_prices_now as final_now
+                  on token_ids.token_id = final_now.token_id
+                left join final_prices_ago as final_ago
+                  on token_ids.token_id = final_ago.token_id
+                left join
+                (
+                  select
+                    token_id,
+                    argMaxIf(price, timestamp, timestamp <= as_of + toIntervalMinute(10))
+                      as price_now,
+                    countIf(timestamp <= as_of + toIntervalMinute(10)) as price_now_count,
+                    argMaxIf(price, timestamp, timestamp <= since) as price_ago,
+                    countIf(timestamp <= since) as price_ago_count
+                  from fact_price_history
+                  where token_id in (select token_id from fifa_tokens)
+                    and timestamp <= as_of + toIntervalMinute(10)
+                  group by token_id
+                ) as price_marks on token_ids.token_id = price_marks.token_id
+                left join
+                (
+                  select
+                    token_id,
+                    argMaxIf(best_bid, captured_at, captured_at <= as_of + toIntervalMinute(10))
+                      as book_best_bid_now,
+                    argMaxIf(best_ask, captured_at, captured_at <= as_of + toIntervalMinute(10))
+                      as book_best_ask_now,
+                    countIf(captured_at <= as_of + toIntervalMinute(10)) as book_now_count,
+                    argMaxIf(best_bid, captured_at, captured_at <= since) as book_best_bid_ago,
+                    argMaxIf(best_ask, captured_at, captured_at <= since) as book_best_ask_ago,
+                    countIf(captured_at <= since) as book_ago_count
+                  from fact_orderbook_snapshot
+                  where token_id in (select token_id from fifa_tokens)
+                    and best_bid is not null
+                    and best_ask is not null
+                    and captured_at <= as_of + toIntervalMinute(10)
+                  group by token_id
+                ) as book_marks on token_ids.token_id = book_marks.token_id
+              )
+            select
+              user_address,
+              trade_count,
+              buy_count,
+              sell_count,
+              traded_size,
+              traded_notional,
+              buy_notional,
+              sell_notional,
+              trade_count_24h,
+              buy_notional_24h,
+              sell_notional_24h,
+              traded_notional_24h,
+              sell_notional_24h - buy_notional_24h as net_notional_24h,
+              event_count,
+              market_count,
+              event_count_24h,
+              market_count_24h,
+              token_count,
+              open_position_count,
+              open_position_value_now,
+              open_position_value_24h_ago,
+              equity_now,
+              equity_24h_ago,
+              equity_now - equity_24h_ago as pnl_24h,
+              open_position_value_24h_ago + buy_notional_24h as pnl_base_24h,
+              if(
+                open_position_value_24h_ago + buy_notional_24h = 0,
+                0.0,
+                (equity_now - equity_24h_ago)
+                  / (open_position_value_24h_ago + buy_notional_24h)
+              ) as pnl_roi_24h,
+              first_trade_at,
+              last_trade_at,
+              latest_action,
+              missing_mark_count,
+              negative_position_count,
+              multiIf(
+                negative_position_count > 0, 'needs_chain_balance',
+                missing_mark_count > 0, 'missing_mark_price',
+                'estimate'
+              ) as data_quality,
+              as_of as updated_at
+            from
+            (
+              select
+                user_address,
+                sum(trade_count) as trade_count,
+                sum(buy_count) as buy_count,
+                sum(sell_count) as sell_count,
+                sum(traded_size) as traded_size,
+                sum(traded_notional) as traded_notional,
+                sum(buy_notional) as buy_notional,
+                sum(sell_notional) as sell_notional,
+                sum(token_trade_count_24h) as trade_count_24h,
+                sum(token_buy_notional_24h) as buy_notional_24h,
+                sum(token_sell_notional_24h) as sell_notional_24h,
+                sum(token_traded_notional_24h) as traded_notional_24h,
+                uniqExact(event_id) as event_count,
+                uniqExact(market_id) as market_count,
+                uniqExactIf(event_id, token_trade_count_24h > 0) as event_count_24h,
+                uniqExactIf(market_id, token_trade_count_24h > 0) as market_count_24h,
+                count() as token_count,
+                countIf(position_size_now > 0.000001) as open_position_count,
+                sum(token_open_position_value_now) as open_position_value_now,
+                sum(token_open_position_value_24h_ago) as open_position_value_24h_ago,
+                sum(net_cashflow_now + token_open_position_value_now) as equity_now,
+                sum(net_cashflow_24h_ago + token_open_position_value_24h_ago) as equity_24h_ago,
+                min(first_trade_at) as first_trade_at,
+                max(last_trade_at) as last_trade_at,
+                argMax(token_latest_action, token_last_trade_at) as latest_action,
+                sum(missing_mark) as missing_mark_count,
+                sum(negative_position) as negative_position_count
+              from
+              (
+                select
+                  positions.event_id,
+                  positions.market_id,
+                  positions.user_address,
+                  positions.trade_count,
+                  positions.buy_count,
+                  positions.sell_count,
+                  positions.traded_size,
+                  positions.traded_notional,
+                  positions.buy_notional,
+                  positions.sell_notional,
+                  positions.trade_count_24h as token_trade_count_24h,
+                  positions.buy_notional_24h as token_buy_notional_24h,
+                  positions.sell_notional_24h as token_sell_notional_24h,
+                  positions.traded_notional_24h as token_traded_notional_24h,
+                  positions.position_size_now,
+                  positions.position_size_24h_ago,
+                  positions.net_cashflow_now,
+                  positions.net_cashflow_24h_ago,
+                  if(
+                    positions.position_size_now > 0.000001,
+                    positions.position_size_now * ifNull(marks.mark_price_now, 0.0),
+                    0.0
+                  ) as token_open_position_value_now,
+                  if(
+                    positions.position_size_24h_ago > 0.000001,
+                    positions.position_size_24h_ago * ifNull(marks.mark_price_24h_ago, 0.0),
+                    0.0
+                  ) as token_open_position_value_24h_ago,
+                  positions.first_trade_at,
+                  positions.last_trade_at,
+                  positions.last_trade_at as token_last_trade_at,
+                  positions.latest_action as token_latest_action,
+                  if(
+                    (
+                      positions.position_size_now > 0.000001
+                      and marks.mark_price_now is null
+                    )
+                    or (
+                      positions.position_size_24h_ago > 0.000001
+                      and marks.mark_price_24h_ago is null
+                    ),
+                    1,
+                    0
+                  ) as missing_mark,
+                  if(
+                    positions.position_size_now < -0.000001
+                    or positions.position_size_24h_ago < -0.000001,
+                    1,
+                    0
+                  ) as negative_position
+                from
+                (
+                  select
+                    trades.event_id as event_id,
+                    trades.market_id as market_id,
+                    trades.condition_id as condition_id,
+                    trades.token_id as token_id,
+                    trades.user_address as user_address,
+                    count() as trade_count,
+                    countIf(trades.side = 'BUY') as buy_count,
+                    countIf(trades.side = 'SELL') as sell_count,
+                    sum(trades.size) as traded_size,
+                    sum(trades.notional) as traded_notional,
+                    sumIf(trades.notional, trades.side = 'BUY') as buy_notional,
+                    sumIf(trades.notional, trades.side = 'SELL') as sell_notional,
+                    countIf(trades.timestamp >= since) as trade_count_24h,
+                    sumIf(
+                      trades.notional,
+                      trades.side = 'BUY' and trades.timestamp >= since
+                    ) as buy_notional_24h,
+                    sumIf(
+                      trades.notional,
+                      trades.side = 'SELL' and trades.timestamp >= since
+                    ) as sell_notional_24h,
+                    sumIf(trades.notional, trades.timestamp >= since) as traded_notional_24h,
+                    sum(if(trades.side = 'BUY', trades.size, -trades.size))
+                      as position_size_now,
+                    sumIf(
+                      if(trades.side = 'BUY', trades.size, -trades.size),
+                      trades.timestamp < since
+                    ) as position_size_24h_ago,
+                    sum(if(trades.side = 'SELL', trades.notional, -trades.notional))
+                      as net_cashflow_now,
+                    sumIf(
+                      if(trades.side = 'SELL', trades.notional, -trades.notional),
+                      trades.timestamp < since
+                    ) as net_cashflow_24h_ago,
+                    min(trades.timestamp) as first_trade_at,
+                    max(trades.timestamp) as last_trade_at,
+                    argMax(trades.side, trades.timestamp) as latest_action
+                  from
+                  mart_fifa_trade as trades final
+                  where trades.user_address != ''
+                    and trades.timestamp <= as_of + toIntervalMinute(10)
+                  group by
+                    trades.event_id,
+                    trades.market_id,
+                    trades.condition_id,
+                    trades.token_id,
+                    trades.user_address
+                ) as positions
+                left join marks on positions.token_id = marks.token_id
+              )
+              group by user_address
+            )
+            where user_address != ''
+            settings join_use_nulls = 1, max_threads = 4
+            """
+        )
+        self.clickhouse.execute(
+            "exchange tables mart_wallet_fifa_24h_pnl and mart_wallet_fifa_24h_pnl_next"
+        )
+        rows = int(
+            self.clickhouse.query_text(
+                "select count() from mart_wallet_fifa_24h_pnl final"
+            ).strip()
+            or "0"
+        )
+        return MartBuildResult(mart="wallet_fifa_24h_pnl", rows=rows)
+
+    def build_fifa_trades(self, *, window_hours: int = 72) -> MartBuildResult:
+        if window_hours <= 0:
+            raise ValueError("window_hours must be positive")
+        self.clickhouse.execute(
+            f"""
+            insert into mart_fifa_trade
+            with
+              now64(3) as as_of,
+              as_of - toIntervalHour({window_hours}) as refresh_since,
+              existing_max as
+              (
+                select ifNull(max(timestamp), toDateTime64(0, 3, 'UTC')) as max_timestamp
+                from mart_fifa_trade final
+              ),
+              fifa_bounds as
+              (
+                select
+                  greatest(
+                    toDateTime64('2026-01-01 00:00:00', 3, 'UTC'),
+                    ifNull(min(markets.created_at), ifNull(min(markets.start_time), refresh_since))
+                      - toIntervalDay(1)
+                  ) as initial_min_trade_at,
+                  least(
+                    refresh_since,
+                    if(
+                      (select max_timestamp from existing_max) = toDateTime64(0, 3, 'UTC'),
+                      refresh_since,
+                      (select max_timestamp from existing_max) - toIntervalHour({window_hours})
+                    )
+                  ) as incremental_min_trade_at
+                from dim_market as markets final
+                left join dim_event as events final on markets.event_id = events.event_id
+                where markets.condition_id != ''
+                  and markets.market_id != ''
+                  and (
+                    startsWith(markets.slug, 'fifwc-')
+                    or startsWith(ifNull(events.slug, ''), 'fifwc-')
+                  )
+              ),
+              fifa_markets as
+              (
+                select
+                  raw_condition_id as condition_id,
+                  anyLast(raw_market_id) as market_id,
+                  anyLast(raw_event_id) as event_id
+                from
+                (
+                  select
+                    markets.condition_id as raw_condition_id,
+                    markets.market_id as raw_market_id,
+                    markets.event_id as raw_event_id
+                  from dim_market as markets final
+                  left join dim_event as events final on markets.event_id = events.event_id
+                  where markets.condition_id != ''
+                    and markets.market_id != ''
+                    and (
+                      startsWith(markets.slug, 'fifwc-')
+                      or startsWith(ifNull(events.slug, ''), 'fifwc-')
+                    )
+                )
+                group by raw_condition_id
+              ),
+              fifa_tokens as
+              (
+                select
+                  tokens.token_id as token_id,
+                  anyLast(tokens.market_id) as market_id
+                from dim_outcome_token as tokens final
+                inner join
+                (
+                  select market_id
+                  from fifa_markets
+                  group by market_id
+                ) as markets on tokens.market_id = markets.market_id
+                where tokens.token_id != ''
+                group by tokens.token_id
+              )
+            select
+              dedup.trade_key as trade_key,
+              dedup.timestamp as timestamp,
+              markets.event_id as event_id,
+              markets.market_id as market_id,
+              dedup.condition_id as condition_id,
+              dedup.token_id as token_id,
+              dedup.user_address as user_address,
+              dedup.side as side,
+              dedup.price as price,
+              dedup.size as size,
+              dedup.notional as notional,
+              dedup.ingested_at as ingested_at,
+              as_of as updated_at
+            from
+            (
+              select
+                trade_key,
+                argMax(raw_timestamp, raw_ingested_at) as timestamp,
+                argMax(raw_condition_id, raw_ingested_at) as condition_id,
+                argMax(raw_token_id, raw_ingested_at) as token_id,
+                argMax(raw_user_address, raw_ingested_at) as user_address,
+                argMax(raw_side, raw_ingested_at) as side,
+                argMax(raw_price, raw_ingested_at) as price,
+                argMax(raw_size, raw_ingested_at) as size,
+                argMax(raw_notional, raw_ingested_at) as notional,
+                max(raw_ingested_at) as ingested_at
+              from
+              (
+                select
+                  concat(
+                    toString(timestamp), ':', condition_id, ':', token_id, ':',
+                    lower(user_address), ':', side, ':',
+                    toString(round(price, 12)), ':',
+                    toString(round(size, 6)), ':',
+                    toString(round(notional, 6))
+                  ) as trade_key,
+                  timestamp as raw_timestamp,
+                  condition_id as raw_condition_id,
+                  token_id as raw_token_id,
+                  lower(user_address) as raw_user_address,
+                  side as raw_side,
+                  price as raw_price,
+                  size as raw_size,
+                  notional as raw_notional,
+                  ingested_at as raw_ingested_at
+                from fact_trade_by_time
+                where user_address != ''
+                  and condition_id in (select condition_id from fifa_markets)
+                  and token_id in (select token_id from fifa_tokens)
+                  and timestamp >= if(
+                    (select max_timestamp from existing_max) = toDateTime64(0, 3, 'UTC'),
+                    (select initial_min_trade_at from fifa_bounds),
+                    (select incremental_min_trade_at from fifa_bounds)
+                  )
+                  and timestamp <= as_of + toIntervalMinute(10)
+              )
+              group by trade_key
+            ) as dedup
+            inner join fifa_markets as markets on dedup.condition_id = markets.condition_id
+            settings max_threads = 4
+            """
+        )
+        rows = int(
+            self.clickhouse.query_text("select count() from mart_fifa_trade final").strip()
+            or "0"
+        )
+        return MartBuildResult(mart="fifa_trade", rows=rows)
+
     def build_trader_chain_pnl(self) -> MartBuildResult:
         self.clickhouse.execute(
             """

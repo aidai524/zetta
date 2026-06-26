@@ -76,6 +76,7 @@ systemctl enable --now zetta-ws-market.service
 systemctl enable --now zetta-frontier.timer
 systemctl enable --now zetta-load.timer
 systemctl enable --now zetta-marts.timer
+systemctl enable --now zetta-wallet-fifa-24h-pnl.timer
 
 cat <<'EOF'
 Zetta server bootstrap complete.
