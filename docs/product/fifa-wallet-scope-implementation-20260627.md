@@ -84,6 +84,17 @@ GET /api/wallets/screener?scope=fifa&mode=whale&limit=50
 
 Default whole-site screener behavior is unchanged when `scope=fifa` is omitted.
 
+For FIFA lists, `range=1d` / `range=24h` filters to wallets with
+`trade_count_24h > 0` and orders active flow by `traded_notional_24h` first:
+
+```text
+GET /api/wallets/screener?scope=fifa&mode=watch&range=1d&limit=100
+```
+
+The FIFA mart currently stores 24h activity fields and 7d PnL / win-rate fields.
+Precise `range=7d` and `range=30d` list activity filters require additional
+persisted 7d / 30d traded-notional or trade-count fields.
+
 ## Scope Definition
 
 FIFA scope includes markets whose market slug or event slug starts with:
@@ -99,6 +110,8 @@ same `fifwc-*` namespace.
 ## Segment Definitions
 
 Whole-site smart and whale labels still come from `mart_wallet_screener`.
+The shared screener segment contract is documented in
+`docs/product/wallet-screener-segments.md`.
 
 FIFA scoped labels are recomputed from FIFA-only data:
 
@@ -111,6 +124,15 @@ FIFA smart:
 FIFA whale:
   fifa_traded_notional >= 1000000
   or fifa_max_single_trade_notional >= 100000
+
+FIFA candidate smart:
+  fifa_buy_notional >= 1000
+  and fifa_data_quality = estimate
+  and fifa_pnl_roi >= 0.10
+
+FIFA watch:
+  candidate smart, FIFA whale, fifa_traded_notional >= 10000,
+  or fifa_traded_notional_24h >= 1000
 ```
 
 FIFA smart intentionally excludes `missing_mark_price` and

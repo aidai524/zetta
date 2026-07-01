@@ -5,7 +5,7 @@ import json
 import sys
 import time
 from dataclasses import asdict, is_dataclass
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any
 
@@ -33,7 +33,13 @@ from zetta.loaders.data import DataRawLoader
 from zetta.loaders.gamma import GammaRawLoader
 from zetta.loaders.marts import MartBuilder
 from zetta.polymarket import PolymarketClient
-from zetta.official_trade_feed import POLYMARKET_RTDS_URL, serve_official_trade_feed
+from zetta.official_trade_feed import (
+    POLYMARKET_RTDS_URL,
+    WALLET_CACHE_DIR,
+    load_recent_trade_messages,
+    load_recent_wallet_trade_messages,
+    serve_official_trade_feed,
+)
 from zetta.realtime.orderbook import reconciliation_diff, reconstruct_ws_market_raw, rest_book_summary
 from zetta.realtime_trades import serve_trade_stream
 from zetta.scheduler.runner import TaskRunner
@@ -317,8 +323,8 @@ def build_parser() -> argparse.ArgumentParser:
         "polycop-wallet-signals",
         help="Refresh cached Polycop smart wallet signal rankings.",
     )
-    polycop_wallet_signals.add_argument("--page-size", type=int, default=50)
-    polycop_wallet_signals.add_argument("--max-pages", type=int, default=25)
+    polycop_wallet_signals.add_argument("--page-size", type=int, default=15)
+    polycop_wallet_signals.add_argument("--max-pages", type=int, default=100)
     polycop_wallet_signals.add_argument("--sleep-seconds", type=float, default=0.1)
     polycop_wallet_signals.add_argument("--timeout-seconds", type=float, default=20.0)
     polycop_wallet_signals.add_argument("--limit", type=int, default=500)
@@ -458,6 +464,36 @@ def build_parser() -> argparse.ArgumentParser:
         default=True,
         help=argparse.SUPPRESS,
     )
+    seed_active_event_wallets.add_argument(
+        "--include-realtime-wallets",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help=argparse.SUPPRESS,
+    )
+    seed_active_event_wallets.add_argument(
+        "--realtime-wallet-limit",
+        type=int,
+        default=100,
+        help=argparse.SUPPRESS,
+    )
+    seed_active_event_wallets.add_argument(
+        "--realtime-wallet-since-minutes",
+        type=int,
+        default=360,
+        help=argparse.SUPPRESS,
+    )
+    seed_active_event_wallets.add_argument(
+        "--realtime-wallet-scan-limit",
+        type=int,
+        default=5000,
+        help=argparse.SUPPRESS,
+    )
+    seed_active_event_wallets.add_argument(
+        "--realtime-wallet-min-notional",
+        type=float,
+        default=0.0,
+        help=argparse.SUPPRESS,
+    )
     seed_active_event_wallets.add_argument("--refresh-run", help=argparse.SUPPRESS)
     seed_active_event_wallets.add_argument(
         "--requeue-done",
@@ -587,6 +623,28 @@ def build_parser() -> argparse.ArgumentParser:
     data_trades.add_argument("--newest-first", action="store_true")
     data_trades.set_defaults(func=cmd_load_data_trades)
 
+    official_feed_cache = load_subparsers.add_parser(
+        "official-trade-feed-cache",
+        help="Load cached official real-time trade feed messages into ClickHouse.",
+    )
+    official_feed_cache.add_argument("--since-hours", type=int, default=24)
+    official_feed_cache.add_argument("--batch-size", type=int, default=10_000)
+    official_feed_cache.add_argument("--wallet-scan-limit", type=int, default=5_000)
+    official_feed_cache.add_argument("--per-wallet-limit", type=int, default=50)
+    official_feed_cache.add_argument("--recent-limit", type=int, default=5_000)
+    official_feed_cache.add_argument(
+        "--fifa-only",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+    )
+    official_feed_cache.add_argument(
+        "--state-dedupe",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+    )
+    official_feed_cache.add_argument("--loaded-key-limit", type=int, default=500_000)
+    official_feed_cache.set_defaults(func=cmd_load_official_trade_feed_cache)
+
     data_activity = load_subparsers.add_parser("data-activity", help="Load raw user activity.")
     data_activity.add_argument("--force", action="store_true")
     data_activity.add_argument("--batch-size", type=int, default=10_000)
@@ -715,6 +773,12 @@ def build_parser() -> argparse.ArgumentParser:
     )
     wallet_fifa_24h_pnl.add_argument("--window-hours", type=int, default=24)
     wallet_fifa_24h_pnl.set_defaults(func=cmd_build_wallet_fifa_24h_pnl)
+
+    wallet_fifa_chain_cashflow = build_subparsers.add_parser(
+        "wallet-fifa-chain-cashflow", help="Build FIFA wallet chain cashflow mart."
+    )
+    wallet_fifa_chain_cashflow.add_argument("--window-days", type=int, default=7)
+    wallet_fifa_chain_cashflow.set_defaults(func=cmd_build_wallet_fifa_chain_cashflow)
 
     fifa_trades = build_subparsers.add_parser(
         "fifa-trades", help="Build scoped FIFA trade cache mart."
@@ -1661,6 +1725,86 @@ def discover_active_event_wallets(
     ]
 
 
+def discover_realtime_fifa_wallets(
+    state_dir: Path,
+    *,
+    wallet_limit: int,
+    since_minutes: int,
+    scan_limit: int,
+    min_notional: float,
+    now: datetime | None = None,
+) -> list[str]:
+    if wallet_limit <= 0:
+        return []
+    if since_minutes <= 0:
+        raise ValueError("realtime_wallet_since_minutes must be positive")
+    if scan_limit <= 0:
+        raise ValueError("realtime_wallet_scan_limit must be positive")
+    if min_notional < 0:
+        raise ValueError("realtime_wallet_min_notional must be non-negative")
+
+    cutoff = (now or datetime.now(UTC)) - timedelta(minutes=since_minutes)
+    wallet_stats: dict[str, dict[str, Any]] = {}
+
+    def ingest_message(message: dict[str, Any]) -> None:
+        trade = message.get("trade")
+        if not isinstance(trade, dict):
+            return
+        market_slug = str(trade.get("market_slug") or "")
+        event_slug = str(trade.get("event_slug") or "")
+        if not (market_slug.startswith("fifwc-") or event_slug.startswith("fifwc-")):
+            return
+        wallet = str(trade.get("user_address") or "").strip().lower()
+        if not wallet:
+            return
+        timestamp_text = str(trade.get("timestamp") or "")
+        try:
+            timestamp = datetime.fromisoformat(timestamp_text.replace(" ", "T")).replace(
+                tzinfo=UTC
+            )
+        except ValueError:
+            return
+        if timestamp < cutoff:
+            return
+        try:
+            notional = abs(float(trade.get("notional") or 0.0))
+        except (TypeError, ValueError):
+            notional = 0.0
+        if notional < min_notional:
+            return
+        stats = wallet_stats.setdefault(
+            wallet,
+            {"latest": timestamp, "notional": 0.0},
+        )
+        if timestamp > stats["latest"]:
+            stats["latest"] = timestamp
+        stats["notional"] = float(stats["notional"]) + notional
+
+    for message in load_recent_trade_messages(state_dir, limit=scan_limit):
+        ingest_message(message)
+
+    wallet_cache_dir = state_dir / WALLET_CACHE_DIR
+    wallet_files: list[tuple[float, Path]] = []
+    try:
+        for path in wallet_cache_dir.glob("*.json"):
+            mtime = path.stat().st_mtime
+            if mtime >= cutoff.timestamp():
+                wallet_files.append((mtime, path))
+    except OSError:
+        wallet_files = []
+    for _mtime, path in sorted(wallet_files, reverse=True)[:scan_limit]:
+        wallet = path.stem
+        for message in load_recent_wallet_trade_messages(state_dir, wallet, limit=20):
+            ingest_message(message)
+
+    ordered_wallets = sorted(
+        wallet_stats,
+        key=lambda wallet: (wallet_stats[wallet]["latest"], wallet_stats[wallet]["notional"]),
+        reverse=True,
+    )
+    return ordered_wallets[:wallet_limit]
+
+
 def discover_unusual_betting_event_slugs(
     clickhouse: ClickHouseWriter,
     *,
@@ -2102,6 +2246,7 @@ def cmd_tasks_seed_active_event_wallets(args: argparse.Namespace, app_settings: 
         )
 
     discovered_wallets: list[str] = []
+    realtime_wallets: list[str] = []
     if (
         args.include_wallet_trades
         or args.include_wallet_activity
@@ -2116,10 +2261,18 @@ def cmd_tasks_seed_active_event_wallets(args: argparse.Namespace, app_settings: 
             condition_limit=args.condition_limit,
             min_notional=args.min_notional,
         )
+        if getattr(args, "include_realtime_wallets", True):
+            realtime_wallets = discover_realtime_fifa_wallets(
+                app_settings.state_dir,
+                wallet_limit=getattr(args, "realtime_wallet_limit", 100),
+                since_minutes=getattr(args, "realtime_wallet_since_minutes", args.since_minutes),
+                scan_limit=getattr(args, "realtime_wallet_scan_limit", 5000),
+                min_notional=getattr(args, "realtime_wallet_min_notional", 0.0),
+            )
 
     tracked_wallets = tracked_wallet_addresses(app_settings) if args.include_tracked_wallets else []
     explicit_wallets = normalize_wallet_list([*args.wallets, *tracked_wallets])
-    wallets = merge_wallet_lists(discovered_wallets, explicit_wallets)
+    wallets = merge_wallet_lists([*discovered_wallets, *realtime_wallets], explicit_wallets)
     explicit_wallet_set = set(explicit_wallets)
 
     tasks: list[Task] = []
@@ -2251,6 +2404,7 @@ def cmd_tasks_seed_active_event_wallets(args: argparse.Namespace, app_settings: 
         "condition_ids": len(condition_ids),
         "wallets": len(wallets),
         "discovered_wallets": len(discovered_wallets),
+        "realtime_wallets": len(realtime_wallets),
         "explicit_wallets": len(explicit_wallets),
         "since_minutes": args.since_minutes,
         "refresh_run": refresh_run,
@@ -2681,6 +2835,20 @@ def cmd_load_data_trades(args: argparse.Namespace, app_settings: Settings) -> An
     )
 
 
+def cmd_load_official_trade_feed_cache(args: argparse.Namespace, app_settings: Settings) -> Any:
+    return DataRawLoader(clickhouse=ClickHouseWriter(app_settings)).load_official_trade_feed_cache(
+        state_dir=app_settings.state_dir,
+        since_hours=args.since_hours,
+        batch_size=args.batch_size,
+        wallet_scan_limit=args.wallet_scan_limit,
+        per_wallet_limit=args.per_wallet_limit,
+        recent_limit=args.recent_limit,
+        fifa_only=args.fifa_only,
+        state_dedupe=args.state_dedupe,
+        loaded_key_limit=args.loaded_key_limit,
+    )
+
+
 def cmd_load_data_activity(args: argparse.Namespace, app_settings: Settings) -> Any:
     return DataRawLoader(clickhouse=ClickHouseWriter(app_settings)).load_activity(
         raw_root=app_settings.raw_data_dir,
@@ -2817,6 +2985,12 @@ def cmd_build_wallet_screener(_args: argparse.Namespace, app_settings: Settings)
 def cmd_build_wallet_fifa_24h_pnl(args: argparse.Namespace, app_settings: Settings) -> Any:
     return MartBuilder(clickhouse=ClickHouseWriter(app_settings)).build_wallet_fifa_24h_pnl(
         window_hours=args.window_hours,
+    )
+
+
+def cmd_build_wallet_fifa_chain_cashflow(args: argparse.Namespace, app_settings: Settings) -> Any:
+    return MartBuilder(clickhouse=ClickHouseWriter(app_settings)).build_wallet_fifa_chain_cashflow(
+        window_days=args.window_days,
     )
 
 

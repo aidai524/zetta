@@ -716,6 +716,119 @@ def test_seed_active_event_wallets_adds_market_and_wallet_tasks(monkeypatch, tmp
     assert all(requeue_done_task(task.params) for task in tasks)
 
 
+def test_seed_active_event_wallets_includes_realtime_fifa_wallets(
+    monkeypatch, tmp_path
+) -> None:
+    class FakeClickHouse:
+        def __init__(self, _settings):
+            pass
+
+        def query_text(self, query):
+            if "from fact_trade_by_time" in query:
+                return ""
+            return ""
+
+    monkeypatch.setattr("zetta.cli.ClickHouseWriter", FakeClickHouse)
+    state_dir = tmp_path / "state"
+    now_text = datetime.now(UTC).strftime("%Y-%m-%d %H:%M:%S.%f")[:-3]
+    cache_path = state_dir / "official_trade_feed" / "recent.json"
+    cache_path.parent.mkdir(parents=True)
+    cache_path.write_text(
+        json.dumps(
+            {
+                "messages": [
+                    {
+                        "type": "trade",
+                        "trade": {
+                            "timestamp": now_text,
+                            "user_address": "0xDEF",
+                            "market_slug": "bitcoin-up-or-down",
+                            "event_slug": "crypto-event",
+                            "notional": 5000,
+                        },
+                    },
+                ]
+            }
+        ),
+        encoding="utf-8",
+    )
+    wallet_cache_path = state_dir / "official_trade_feed" / "wallets" / "0xabc.json"
+    wallet_cache_path.parent.mkdir(parents=True)
+    wallet_cache_path.write_text(
+        json.dumps(
+            {
+                "messages": [
+                    {
+                        "type": "trade",
+                        "trade": {
+                            "timestamp": now_text,
+                            "user_address": "0xABC",
+                            "market_slug": "fifwc-civ-nor-2026-06-30-nor",
+                            "event_slug": "fifwc-civ-nor-2026-06-30",
+                            "notional": 1500,
+                        },
+                    }
+                ]
+            }
+        ),
+        encoding="utf-8",
+    )
+    args = type(
+        "Args",
+        (),
+        {
+            "task_store": "local",
+            "task_file": str(tmp_path / "tasks.json"),
+            "node_id": "node-1",
+            "lease_seconds": 300,
+            "wallets": [],
+            "event_limit": 0,
+            "condition_limit": 25,
+            "wallet_limit": 10,
+            "since_minutes": 90,
+            "min_notional": 0.0,
+            "trade_page_limit": 500,
+            "trade_max_pages": 1,
+            "wallet_page_limit": 500,
+            "wallet_max_pages": 1,
+            "include_market_trades": False,
+            "include_wallet_trades": True,
+            "include_wallet_activity": True,
+            "include_wallet_portfolio": True,
+            "include_wallet_pnl": True,
+            "include_unusual_betting_refresh": False,
+            "unusual_betting_event_limit": 20,
+            "unusual_betting_min_notional": 500000.0,
+            "include_tracked_wallets": False,
+            "include_realtime_wallets": True,
+            "realtime_wallet_limit": 10,
+            "realtime_wallet_since_minutes": 120,
+            "realtime_wallet_scan_limit": 100,
+            "realtime_wallet_min_notional": 1000.0,
+            "refresh_run": "active-event-wallets",
+            "requeue_done": True,
+        },
+    )()
+
+    result = cmd_tasks_seed_active_event_wallets(
+        args,
+        Settings(state_dir=state_dir),
+    )
+    tasks = LocalTaskStore(tmp_path / "tasks.json").load()
+
+    assert result["discovered_wallets"] == 0
+    assert result["realtime_wallets"] == 1
+    assert result["wallets"] == 1
+    assert result["candidate_tasks"] == 4
+    assert {task.params["user"] for task in tasks} == {"0xabc"}
+    assert [task.kind for task in tasks] == [
+        "wallet-trades",
+        "wallet-activity",
+        "wallet-portfolio",
+        "wallet-pnl",
+    ]
+
+
 def test_seed_active_event_wallets_treats_tracked_wallets_as_explicit(
     monkeypatch, tmp_path
 ) -> None:

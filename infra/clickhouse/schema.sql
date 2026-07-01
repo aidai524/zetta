@@ -605,6 +605,21 @@ engine = ReplacingMergeTree(updated_at)
 partition by toYYYYMM(timestamp)
 order by (timestamp, condition_id, token_id, user_address, trade_key);
 
+create table if not exists zetta.mart_wallet_fifa_chain_cashflow
+(
+  user_address String,
+  token_id String,
+  redeemed_value_now Float64,
+  redeemed_value_24h_ago Float64,
+  redeemed_value_7d_ago Float64,
+  fee_now Float64,
+  fee_24h_ago Float64,
+  fee_7d_ago Float64,
+  updated_at DateTime64(3, 'UTC')
+)
+engine = ReplacingMergeTree(updated_at)
+order by (user_address, token_id);
+
 create table if not exists zetta.mart_wallet_fifa_24h_pnl
 (
   user_address String,
@@ -628,11 +643,27 @@ create table if not exists zetta.mart_wallet_fifa_24h_pnl
   open_position_count UInt64,
   open_position_value_now Float64,
   open_position_value_24h_ago Float64,
+  open_position_value_7d_ago Float64,
   equity_now Float64,
   equity_24h_ago Float64,
+  equity_7d_ago Float64,
+  total_pnl Float64,
+  total_pnl_roi Float64,
   pnl_24h Float64,
   pnl_base_24h Float64,
   pnl_roi_24h Float64,
+  pnl_7d Float64,
+  pnl_base_7d Float64,
+  pnl_roi_7d Float64,
+  profitable_token_count UInt64,
+  losing_token_count UInt64,
+  win_rate Float64,
+  profitable_token_count_24h UInt64,
+  losing_token_count_24h UInt64,
+  win_rate_24h Float64,
+  profitable_token_count_7d UInt64,
+  losing_token_count_7d UInt64,
+  win_rate_7d Float64,
   first_trade_at Nullable(DateTime64(3, 'UTC')),
   last_trade_at Nullable(DateTime64(3, 'UTC')),
   latest_action LowCardinality(String),
@@ -667,11 +698,27 @@ create table if not exists zetta.mart_wallet_fifa_24h_pnl_next
   open_position_count UInt64,
   open_position_value_now Float64,
   open_position_value_24h_ago Float64,
+  open_position_value_7d_ago Float64,
   equity_now Float64,
   equity_24h_ago Float64,
+  equity_7d_ago Float64,
+  total_pnl Float64,
+  total_pnl_roi Float64,
   pnl_24h Float64,
   pnl_base_24h Float64,
   pnl_roi_24h Float64,
+  pnl_7d Float64,
+  pnl_base_7d Float64,
+  pnl_roi_7d Float64,
+  profitable_token_count UInt64,
+  losing_token_count UInt64,
+  win_rate Float64,
+  profitable_token_count_24h UInt64,
+  losing_token_count_24h UInt64,
+  win_rate_24h Float64,
+  profitable_token_count_7d UInt64,
+  losing_token_count_7d UInt64,
+  win_rate_7d Float64,
   first_trade_at Nullable(DateTime64(3, 'UTC')),
   last_trade_at Nullable(DateTime64(3, 'UTC')),
   latest_action LowCardinality(String),
@@ -682,6 +729,39 @@ create table if not exists zetta.mart_wallet_fifa_24h_pnl_next
 )
 engine = ReplacingMergeTree(updated_at)
 order by user_address;
+
+alter table zetta.mart_wallet_fifa_24h_pnl add column if not exists open_position_value_7d_ago Float64 after open_position_value_24h_ago;
+alter table zetta.mart_wallet_fifa_24h_pnl add column if not exists equity_7d_ago Float64 after equity_24h_ago;
+alter table zetta.mart_wallet_fifa_24h_pnl add column if not exists total_pnl Float64 after equity_7d_ago;
+alter table zetta.mart_wallet_fifa_24h_pnl add column if not exists total_pnl_roi Float64 after total_pnl;
+alter table zetta.mart_wallet_fifa_24h_pnl add column if not exists pnl_7d Float64 after pnl_roi_24h;
+alter table zetta.mart_wallet_fifa_24h_pnl add column if not exists pnl_base_7d Float64 after pnl_7d;
+alter table zetta.mart_wallet_fifa_24h_pnl add column if not exists pnl_roi_7d Float64 after pnl_base_7d;
+alter table zetta.mart_wallet_fifa_24h_pnl add column if not exists profitable_token_count UInt64 after pnl_roi_7d;
+alter table zetta.mart_wallet_fifa_24h_pnl add column if not exists losing_token_count UInt64 after profitable_token_count;
+alter table zetta.mart_wallet_fifa_24h_pnl add column if not exists win_rate Float64 after losing_token_count;
+alter table zetta.mart_wallet_fifa_24h_pnl add column if not exists profitable_token_count_24h UInt64 after win_rate;
+alter table zetta.mart_wallet_fifa_24h_pnl add column if not exists losing_token_count_24h UInt64 after profitable_token_count_24h;
+alter table zetta.mart_wallet_fifa_24h_pnl add column if not exists win_rate_24h Float64 after losing_token_count_24h;
+alter table zetta.mart_wallet_fifa_24h_pnl add column if not exists profitable_token_count_7d UInt64 after win_rate_24h;
+alter table zetta.mart_wallet_fifa_24h_pnl add column if not exists losing_token_count_7d UInt64 after profitable_token_count_7d;
+alter table zetta.mart_wallet_fifa_24h_pnl add column if not exists win_rate_7d Float64 after losing_token_count_7d;
+alter table zetta.mart_wallet_fifa_24h_pnl_next add column if not exists open_position_value_7d_ago Float64 after open_position_value_24h_ago;
+alter table zetta.mart_wallet_fifa_24h_pnl_next add column if not exists equity_7d_ago Float64 after equity_24h_ago;
+alter table zetta.mart_wallet_fifa_24h_pnl_next add column if not exists total_pnl Float64 after equity_7d_ago;
+alter table zetta.mart_wallet_fifa_24h_pnl_next add column if not exists total_pnl_roi Float64 after total_pnl;
+alter table zetta.mart_wallet_fifa_24h_pnl_next add column if not exists pnl_7d Float64 after pnl_roi_24h;
+alter table zetta.mart_wallet_fifa_24h_pnl_next add column if not exists pnl_base_7d Float64 after pnl_7d;
+alter table zetta.mart_wallet_fifa_24h_pnl_next add column if not exists pnl_roi_7d Float64 after pnl_base_7d;
+alter table zetta.mart_wallet_fifa_24h_pnl_next add column if not exists profitable_token_count UInt64 after pnl_roi_7d;
+alter table zetta.mart_wallet_fifa_24h_pnl_next add column if not exists losing_token_count UInt64 after profitable_token_count;
+alter table zetta.mart_wallet_fifa_24h_pnl_next add column if not exists win_rate Float64 after losing_token_count;
+alter table zetta.mart_wallet_fifa_24h_pnl_next add column if not exists profitable_token_count_24h UInt64 after win_rate;
+alter table zetta.mart_wallet_fifa_24h_pnl_next add column if not exists losing_token_count_24h UInt64 after profitable_token_count_24h;
+alter table zetta.mart_wallet_fifa_24h_pnl_next add column if not exists win_rate_24h Float64 after losing_token_count_24h;
+alter table zetta.mart_wallet_fifa_24h_pnl_next add column if not exists profitable_token_count_7d UInt64 after win_rate_24h;
+alter table zetta.mart_wallet_fifa_24h_pnl_next add column if not exists losing_token_count_7d UInt64 after profitable_token_count_7d;
+alter table zetta.mart_wallet_fifa_24h_pnl_next add column if not exists win_rate_7d Float64 after losing_token_count_7d;
 
 alter table zetta.mart_wallet_screener add column if not exists position_count UInt64 after last_trade_at;
 alter table zetta.mart_wallet_screener add column if not exists portfolio_captured_at Nullable(DateTime64(3, 'UTC')) after total_pnl;

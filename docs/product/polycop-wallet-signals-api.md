@@ -28,6 +28,7 @@ http://127.0.0.1:8088
 - 刷新频率：每 10 分钟
 - 数据源：`https://polycop.ai/v1/web/trade`
 - 排序源：Polycop `score desc`
+- 分页请求：POST body 使用 `page_size=15`，按 Polycop 前端一页 15 个钱包分页抓取，默认最多 100 页。
 - 缓存表：Postgres `polycop_wallet_signal_cache`
 - 缓存键：`latest`
 - API 默认只读缓存，不在请求时现场抓 Polycop。
@@ -115,10 +116,10 @@ https://discovery.prophet.zone/api/wallets/polycop-signals/summary
   "parameters": {
     "source_url": "https://polycop.ai/v1/web/trade",
     "sort_options": [{"field": "score", "descending": true}],
-    "page_size": 50,
-    "max_pages": 25,
+    "page_size": 15,
+    "max_pages": 100,
     "pages_fetched": 17,
-    "result_limit": 500
+    "result_limit": 2000
   }
 }
 ```
@@ -213,10 +214,10 @@ https://discovery.prophet.zone/api/wallets/polycop-signals?segment=stable&limit=
   "parameters": {
     "source_url": "https://polycop.ai/v1/web/trade",
     "sort_options": [{"field": "score", "descending": true}],
-    "page_size": 50,
-    "max_pages": 25,
+    "page_size": 15,
+    "max_pages": 100,
     "pages_fetched": 17,
-    "result_limit": 500
+    "result_limit": 2000
   },
   "segment": "stable",
   "total": 23,
@@ -262,6 +263,140 @@ https://discovery.prophet.zone/api/wallets/polycop-signals?segment=stable&limit=
 ```
 
 ## Response Fields
+
+## Endpoint: Polycop FIFA Wallets
+
+用于把 Polycop 的聪明钱包榜单和我们自己的 FIFA 钱包数据做交集。这个接口不会覆盖
+`/wallets/screener?scope=fifa`，只是提供一个独立的“第三方聪明钱包里交易过 FIFA 的钱包”列表。
+
+```http
+GET /wallets/polycop-fifa-signals
+```
+
+完整链接：
+
+```text
+https://discovery.prophet.zone/api/wallets/polycop-fifa-signals?limit=100
+```
+
+### Query Parameters
+
+| 参数 | 类型 | 默认值 | 说明 |
+|---|---:|---:|---|
+| `segment` | string | `ai_top` | Polycop 分段：`ai_top`, `stable`, `flow`, `burst`, `watch`, `all`。 |
+| `limit` | integer | `100` | 返回条数，最大 500。 |
+| `offset` | integer | `0` | 分页偏移。 |
+| `candidate_limit` | integer | `max(limit + offset, 2000)` | 从 Polycop 缓存里参与 FIFA 交集的候选钱包数量，最大 2000。 |
+| `min_ai_score` | number | `0` | 只看 Polycop `ai_score >= min_ai_score` 的钱包。 |
+| `min_fifa_notional` | number | `0` | 只返回 FIFA 交易额达到该值的钱包。 |
+| `min_fifa_events` | integer | `0` | 只返回至少参与 N 个 FIFA event 的钱包。 |
+| `positive_fifa` | boolean | `false` | 为 `1/true` 时只返回 FIFA equity 为正的钱包。 |
+| `active_24h` | boolean | `false` | 为 `1/true` 时只返回最近 24 小时有 FIFA 交易的钱包。 |
+| `data_quality` | string | 空 | 可选 `estimate`, `missing_mark_price`, `needs_chain_balance`。 |
+| `q` | string | 空 | 搜索 Polycop 地址、用户名、X 名称、分段。 |
+| `max_age_seconds` | integer | `0` | 可接受的最大缓存年龄。 |
+
+### Examples
+
+Top 100 Polycop smart wallets that traded FIFA:
+
+```text
+https://discovery.prophet.zone/api/wallets/polycop-fifa-signals?limit=100
+```
+
+Search one wallet inside the Polycop-FIFA list:
+
+```text
+https://discovery.prophet.zone/api/wallets/polycop-fifa-signals?q=0xb56db5215443706244b0af76b3daaad3066ad621&limit=1
+```
+
+The returned wallet row uses flat FIFA fields only:
+
+- `fifa_pnl_24h`: FIFA 24 hour PnL.
+- `fifa_pnl_roi_24h`: FIFA 24 hour ROI.
+- `fifa_traded_notional_24h`: FIFA 24 hour traded notional.
+- `fifa_total_pnl`: FIFA total/current PnL.
+- `fifa_win_rate`: FIFA total token-position win rate.
+- `fifa_pnl_7d`: FIFA 7 day PnL.
+- `fifa_win_rate_7d`: FIFA 7 day token-position win rate.
+
+只看 Polycop 稳定型钱包，并要求 FIFA 交易额至少 1000：
+
+```text
+https://discovery.prophet.zone/api/wallets/polycop-fifa-signals?segment=stable&limit=100&min_fifa_notional=1000
+```
+
+只看 FIFA 数据质量最高且 FIFA 盈利为正：
+
+```text
+https://discovery.prophet.zone/api/wallets/polycop-fifa-signals?limit=100&data_quality=estimate&positive_fifa=1
+```
+
+只看 Polycop 钱包集合里最近 24 小时有 FIFA 交易的钱包：
+
+```text
+https://discovery.prophet.zone/api/wallets/polycop-fifa-signals?limit=100&active_24h=1
+```
+
+If this response is empty while `/api/wallets/fifa-24h-pnl?active_24h=1`
+has rows, it means the current Polycop smart-wallet candidate set has no
+overlap with the active FIFA wallets in the last 24 hours.
+
+### Response Shape
+
+```json
+{
+  "status": "ok",
+  "source": "polycop_fifa",
+  "summary": {
+    "polycop_wallet_count": 500,
+    "candidate_wallet_count": 500,
+    "fifa_wallet_count": 42,
+    "active_wallets_24h": 8,
+    "nonzero_pnl_wallets_24h": 8,
+    "returned_wallet_count": 42
+  },
+  "parameters": {
+    "segment": "ai_top",
+    "limit": 100,
+    "candidate_limit": 2000
+  },
+  "wallets": [
+    {
+      "rank": 1,
+      "address": "0x...",
+      "polycop_rank": 12,
+      "user_name": "example",
+      "ai_score": 83.2,
+      "primary_segment": "stable",
+      "polycop_metrics": {
+        "actual_total_pnl": 50000,
+        "recent20_pnl": 5000,
+        "win_rate": 62
+      },
+      "fifa_traded_notional": 12000,
+      "fifa_trade_count_24h": 8,
+      "fifa_traded_notional_24h": 2500,
+      "fifa_total_pnl": 2400,
+      "fifa_total_pnl_roi": 0.4,
+      "fifa_pnl_24h": 700,
+      "fifa_pnl_roi_24h": 0.368421,
+      "fifa_pnl_7d": 1600,
+      "fifa_pnl_roi_7d": 0.64,
+      "fifa_win_rate": 0.666667,
+      "fifa_win_rate_24h": 0.5,
+      "fifa_win_rate_7d": 0.714286,
+      "fifa_equity_now": 2400,
+      "fifa_pnl_roi": 0.4,
+      "fifa_event_count": 3,
+      "fifa_market_count": 5,
+      "fifa_data_quality": "estimate"
+    }
+  ]
+}
+```
+
+排序逻辑：先按 Polycop `ai_score`，再按 FIFA 交易额和 FIFA equity 排序。
 
 ### Top Level
 

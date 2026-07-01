@@ -19,8 +19,8 @@ from zetta.unusual_betting_cache import (
 
 POLYCOP_TRADE_URL = "https://polycop.ai/v1/web/trade"
 POLYCOP_SIGNAL_CACHE_KEY = "latest"
-DEFAULT_PAGE_SIZE = 50
-DEFAULT_MAX_PAGES = 25
+DEFAULT_PAGE_SIZE = 15
+DEFAULT_MAX_PAGES = 100
 DEFAULT_LIMIT = 500
 
 

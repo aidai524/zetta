@@ -107,9 +107,29 @@ def test_build_wallet_fifa_24h_pnl_uses_equity_delta_scope() -> None:
     assert "insert into mart_wallet_fifa_24h_pnl_next" in joined_sql
     assert "startsWith(markets.slug, 'fifwc-')" in joined_sql
     assert "equity_now - equity_24h_ago as pnl_24h" in joined_sql
+    assert "since_7d" in joined_sql
+    assert "equity_now - equity_7d_ago as pnl_7d" in joined_sql
+    assert "win_rate_7d" in joined_sql
+    assert "mart_wallet_fifa_chain_cashflow final" in joined_sql
+    assert "countIf(token_pnl_now > 0.000001) as profitable_token_count" in joined_sql
     assert "position_size_24h_ago" in joined_sql
-    assert "from mart_fifa_trade as trades final" in joined_sql
+    assert "position_size_7d_ago" in joined_sql
+    assert "mart_fifa_trade as trades final" in joined_sql
     assert "exchange tables mart_wallet_fifa_24h_pnl and mart_wallet_fifa_24h_pnl_next" in joined_sql
+
+
+def test_build_wallet_fifa_chain_cashflow_uses_chain_redeems_and_fees() -> None:
+    fake = FakeClickHouse()
+
+    result = MartBuilder(clickhouse=fake).build_wallet_fifa_chain_cashflow(window_days=7)
+
+    assert result.mart == "wallet_fifa_chain_cashflow"
+    joined_sql = "\n".join(fake.executed)
+    assert "insert into mart_wallet_fifa_chain_cashflow" in joined_sql
+    assert "fact_ctf_balance_movement final" in joined_sql
+    assert "0xada100db00ca00073811820692005400218fce1f" in joined_sql
+    assert "fact_exchange_fill final" in joined_sql
+    assert "JSONExtractFloat(JSONExtractRaw(raw_json, 'decoded'), 'fee')" in joined_sql
 
 
 def test_build_fifa_trades_uses_time_indexed_fact_trade_cache() -> None:
@@ -125,7 +145,9 @@ def test_build_fifa_trades_uses_time_indexed_fact_trade_cache() -> None:
     assert "existing_max" in joined_sql
     assert "round(price, 12)" in joined_sql
     assert "round(size, 6)" in joined_sql
-    assert "round(notional, 6)" in joined_sql
+    assert "raw_market_slug" in joined_sql
+    assert "JSONExtractString(JSONExtractRaw(raw_json, 'trade'), 'market_slug')" in joined_sql
+    assert "condition_id in (select condition_id from fifa_markets)" in joined_sql
 
 
 def test_build_event_anomaly_signals_are_evidence_signals() -> None:

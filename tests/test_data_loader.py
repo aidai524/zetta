@@ -6,6 +6,7 @@ from zetta.loaders.data import (
     holder_rows,
     market_position_rows,
     open_interest_rows,
+    official_trade_feed_trade_row,
     trade_id,
     wallet_portfolio_rows,
 )
@@ -76,6 +77,76 @@ def test_data_trades_loader_writes_fact_rows(tmp_path) -> None:
     assert row["notional"] == 0.5
     assert indexed_row == row
     assert time_indexed_row == row
+
+
+def test_official_trade_feed_cache_loader_writes_fact_rows(tmp_path) -> None:
+    state_dir = tmp_path / "state"
+    wallet_path = state_dir / "official_trade_feed" / "wallets" / "0xabc.json"
+    wallet_path.parent.mkdir(parents=True)
+    wallet_path.write_text(
+        __import__("json").dumps(
+            {
+                "messages": [
+                    {
+                        "source": "polymarket-rtds",
+                        "trade": {
+                            "timestamp": "2026-06-30 05:56:34.000",
+                            "transaction_hash": "0xTX",
+                            "condition_id": "condition-1",
+                            "token_id": "token-1",
+                            "user_address": "0xABC",
+                            "side": "BUY",
+                            "price": 0.55,
+                            "size": 10,
+                            "notional": 5.5,
+                            "market_slug": "fifwc-civ-nor-2026-06-30-nor",
+                            "event_slug": "fifwc-civ-nor-2026-06-30",
+                        },
+                    }
+                ]
+            }
+        ),
+        encoding="utf-8",
+    )
+    fake = FakeClickHouse()
+
+    result = DataRawLoader(clickhouse=fake).load_official_trade_feed_cache(
+        state_dir=state_dir,
+        since_hours=24 * 365,
+        batch_size=1,
+    )
+
+    assert result.trades == 1
+    row = fake.tables["fact_trade"][0]
+    assert row["user_address"] == "0xabc"
+    assert row["condition_id"] == "condition-1"
+    assert row["token_id"] == "token-1"
+    assert row["notional"] == 5.5
+    assert row["timestamp"].hour == 5
+    assert fake.tables["fact_trade_by_user"][0] == row
+    assert fake.tables["fact_trade_by_time"][0] == row
+
+
+def test_official_trade_feed_trade_row_keeps_utc_timestamp() -> None:
+    row = official_trade_feed_trade_row(
+        {
+            "trade": {
+                "timestamp": "2026-06-30 05:56:34.000",
+                "transaction_hash": "0xTX",
+                "condition_id": "condition-1",
+                "token_id": "token-1",
+                "user_address": "0xABC",
+                "side": "BUY",
+                "price": 0.55,
+                "size": 10,
+                "notional": 5.5,
+            }
+        }
+    )
+
+    assert row is not None
+    assert row["timestamp"].hour == 5
+    assert row["timestamp"].tzinfo is not None
 
 
 def test_activity_rows_normalize_user_activity() -> None:

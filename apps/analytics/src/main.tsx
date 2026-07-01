@@ -38,6 +38,8 @@ const OFFICIAL_TRADE_SETTINGS_KEY = "zetta.discovery.officialTradeSettings.v1";
 const DETAIL_QUERY = "live=1&position_limit=100&activity_limit=80&pnl_points_limit=240";
 const SHANGHAI_TIME_ZONE = "Asia/Shanghai";
 const SMART_CATEGORIES = ["全部", "政治", "体育", "加密货币", "电竞", "伊朗", "金融", "地缘政治", "科技", "文化", "经济", "天气", "选举", "提及"];
+const SMART_SEGMENTS = ["candidate_smart", "strict_smart", "whale", "watch", "active"] as const;
+type SmartSegment = (typeof SMART_SEGMENTS)[number];
 
 type Route =
   | { name: "track"; modal?: "add" }
@@ -235,6 +237,9 @@ type SmartWallet = {
   pnl_roi?: number;
   is_whale?: boolean;
   is_smart?: boolean;
+  is_candidate_smart?: boolean;
+  wallet_segment?: string;
+  candidate_reason?: string;
   whale_reason?: string;
   traded_notional_24h?: number;
   trade_count_24h?: number;
@@ -244,11 +249,25 @@ type SmartWallet = {
   latest_action?: string;
   data_lag_seconds?: number;
   win_rate?: number | null;
+  win_rate_24h?: number | null;
+  win_rate_7d?: number | null;
   avg_bet?: number | null;
   realized_pnl?: number;
   completed_event_count?: number;
+  profitable_event_count?: number;
+  losing_event_count?: number;
   active_unrealized_pnl_estimate?: number;
   favorite_category?: string;
+  fifa_total_pnl?: number | null;
+  fifa_total_pnl_roi?: number | null;
+  fifa_pnl_24h?: number | null;
+  fifa_pnl_roi_24h?: number | null;
+  fifa_pnl_7d?: number | null;
+  fifa_pnl_roi_7d?: number | null;
+  fifa_win_rate?: number | null;
+  fifa_win_rate_24h?: number | null;
+  fifa_win_rate_7d?: number | null;
+  fifa_traded_notional_24h?: number | null;
   updated_at?: string;
 };
 
@@ -500,6 +519,7 @@ function App() {
   const [trackedError, setTrackedError] = useState("");
   const [smartWallets, setSmartWallets] = useState<SmartWallet[]>([]);
   const [smartLoading, setSmartLoading] = useState(false);
+  const [smartSegment, setSmartSegment] = useState<SmartSegment>("candidate_smart");
   const [smartRange, setSmartRange] = useState("7d");
   const [smartCategory, setSmartCategory] = useState("全部");
   const [liveTradeCache, setLiveTradeCache] = useState<RecentTrade[]>(initialLiveTrades);
@@ -599,14 +619,14 @@ function App() {
   const fetchSmartWallets = useCallback(async () => {
     setSmartLoading(true);
     try {
-      const params = new URLSearchParams({ mode: "smart", limit: "100", range: smartRange });
+      const params = new URLSearchParams({ mode: smartSegment, limit: "100", range: smartRange });
       if (smartCategory !== "全部") params.set("category", smartCategory);
       const data = await requestJson<{ wallets: SmartWallet[] }>(`/wallets/screener?${params.toString()}`);
       setSmartWallets(data.wallets || []);
     } finally {
       setSmartLoading(false);
     }
-  }, [smartCategory, smartRange]);
+  }, [smartCategory, smartRange, smartSegment]);
 
   const mergeLiveTrades = useCallback((rows: RecentTrade[]) => {
     const previousNewestTime = tradeTimestamp(liveTradeCacheRef.current[0]);
@@ -1018,9 +1038,11 @@ function App() {
           newTradeKeys={newTradeKeys}
           smartRange={smartRange}
           smartCategory={smartCategory}
+          smartSegment={smartSegment}
           onFilterChange={setLeaderFilters}
           onSmartRangeChange={setSmartRange}
           onSmartCategoryChange={setSmartCategory}
+          onSmartSegmentChange={setSmartSegment}
           onRefreshTrades={fetchRecentTrades}
         />
       ) : null}
@@ -1520,9 +1542,11 @@ function LeaderboardPage({
   newTradeKeys,
   smartRange,
   smartCategory,
+  smartSegment,
   onFilterChange,
   onSmartRangeChange,
   onSmartCategoryChange,
+  onSmartSegmentChange,
   onRefreshTrades,
 }: {
   tab: "trades" | "smart";
@@ -1536,9 +1560,11 @@ function LeaderboardPage({
   newTradeKeys: Set<string>;
   smartRange: string;
   smartCategory: string;
+  smartSegment: SmartSegment;
   onFilterChange: React.Dispatch<React.SetStateAction<LeaderFilters>>;
   onSmartRangeChange: (value: string) => void;
   onSmartCategoryChange: (value: string) => void;
+  onSmartSegmentChange: (value: SmartSegment) => void;
   onRefreshTrades: () => void;
 }) {
   const smartRows = useMemo(() => {
@@ -1555,6 +1581,7 @@ function LeaderboardPage({
         </div>
         {tab === "smart" ? (
           <div className="list-controls leaderboard-smart-actions">
+            <SmartSegmented value={smartSegment} onChange={onSmartSegmentChange} />
             <Segmented value={smartRange} values={["1d", "7d", "30d", "All"]} onChange={onSmartRangeChange} />
             <label className="list-search">
               <Search size={15} />
@@ -1587,6 +1614,18 @@ function LeaderboardPage({
         </>
       )}
     </main>
+  );
+}
+
+function SmartSegmented({ value, onChange }: { value: SmartSegment; onChange: (value: SmartSegment) => void }) {
+  return (
+    <div className="segmented smart-segmented">
+      {SMART_SEGMENTS.map((item) => (
+        <button className={value === item ? "active" : ""} type="button" key={item} onClick={() => onChange(item)}>
+          {smartSegmentLabel(item)}
+        </button>
+      ))}
+    </div>
   );
 }
 
@@ -1827,7 +1866,7 @@ function SmartTable({ rows }: { rows: SmartWallet[] }) {
           {rows.map((row, index) => (
             <tr key={row.user_address}>
               <td>{medal(index + 1)}</td>
-              <td><button className="smart-wallet" type="button" onClick={() => navigateAddress(row.user_address)}>{walletBadgeColor(index, "large-ish")}<div><div className="smart-name">{shortAddress(row.user_address)} <span className="tag-icons">✎ {row.is_whale ? "💰" : ""} ✽ ♥</span></div><div className="wallet-meta">{walletAge(row.first_trade_at)} | {shortAddress(row.user_address)} <Copy size={12} /></div></div></button></td>
+              <td><button className="smart-wallet" type="button" onClick={() => navigateAddress(row.user_address)}>{walletBadgeColor(index, "large-ish")}<div><div className="smart-name">{shortAddress(row.user_address)} <WalletSegmentPill row={row} /></div><div className="wallet-meta">{walletAge(row.first_trade_at)} | {shortAddress(row.user_address)} <Copy size={12} /></div></div></button></td>
               <td><div className="cell-stack"><strong className={tone(row.total_pnl)}>{formatSignedCurrency(row.total_pnl)}</strong><span className={tone(row.pnl_roi)}>{formatRatioPercent(row.pnl_roi)}</span></div></td>
               <td><div className="cell-stack"><strong>{formatRatioPercent(row.win_rate)}</strong><span className="small-muted">{formatCurrency(avgTrade(row))}</span></div></td>
               <td><span className="currency"><span className="money-icon" /><strong className="value-main">{formatCurrency(row.available_balance ?? row.portfolio_value)}</strong></span></td>
@@ -1841,6 +1880,11 @@ function SmartTable({ rows }: { rows: SmartWallet[] }) {
       </table>
     </div>
   );
+}
+
+function WalletSegmentPill({ row }: { row: SmartWallet }) {
+  const segment = String(row.wallet_segment || (row.is_smart ? "strict_smart" : row.is_candidate_smart ? "candidate_smart" : row.is_whale ? "whale" : "active"));
+  return <span className={`wallet-segment ${segment.replace(/_/g, "-")}`}>{smartSegmentLabel(segment)}</span>;
 }
 
 function UnusualBettingPage({
@@ -2520,6 +2564,20 @@ function walletBadgeColor(index: number, size = "") {
 
 function walletTypeLabel(value: LeaderFilters["walletType"]) {
   return ({ all: "全部", new: "新钱包", smart: "聪明钱", whale: "鲸鱼" } as const)[value];
+}
+
+function smartSegmentLabel(value: string) {
+  return (
+    {
+      strict_smart: "严格",
+      smart: "严格",
+      candidate_smart: "候选",
+      whale: "鲸鱼",
+      watch: "观察",
+      recent_flow: "近期",
+      active: "活跃",
+    } as Record<string, string>
+  )[value] || value;
 }
 
 function sideLabel(value: LeaderFilters["side"]) {

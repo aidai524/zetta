@@ -201,6 +201,11 @@ case "$MODE" in
         "--${ZETTA_ACTIVE_EVENT_INCLUDE_WALLET_ACTIVITY:-include-wallet-activity}" \
         "--${ZETTA_ACTIVE_EVENT_INCLUDE_WALLET_PORTFOLIO:-include-wallet-portfolio}" \
         "--${ZETTA_ACTIVE_EVENT_INCLUDE_WALLET_PNL:-include-wallet-pnl}" \
+        "--${ZETTA_ACTIVE_EVENT_INCLUDE_REALTIME_WALLETS:-include-realtime-wallets}" \
+        --realtime-wallet-limit "${ZETTA_ACTIVE_EVENT_REALTIME_WALLET_LIMIT:-100}" \
+        --realtime-wallet-since-minutes "${ZETTA_ACTIVE_EVENT_REALTIME_WALLET_SINCE_MINUTES:-360}" \
+        --realtime-wallet-scan-limit "${ZETTA_ACTIVE_EVENT_REALTIME_WALLET_SCAN_LIMIT:-5000}" \
+        --realtime-wallet-min-notional "${ZETTA_ACTIVE_EVENT_REALTIME_WALLET_MIN_NOTIONAL:-0}" \
         "--${ZETTA_ACTIVE_EVENT_INCLUDE_UNUSUAL_BETTING_REFRESH:-no-include-unusual-betting-refresh}" \
         --unusual-betting-event-limit "${ZETTA_ACTIVE_EVENT_UNUSUAL_BETTING_EVENT_LIMIT:-20}" \
         --unusual-betting-min-notional "${ZETTA_ACTIVE_EVENT_UNUSUAL_BETTING_MIN_NOTIONAL:-500000}" \
@@ -285,6 +290,15 @@ case "$MODE" in
       --batch-size "${ZETTA_WALLET_PNL_LOAD_BATCH_SIZE:-20000}"
     ;;
   load-trades-realtime)
+    "$ZETTA_PYTHON" -m zetta.cli "${COMMON_ARGS[@]}" load official-trade-feed-cache \
+      --since-hours "${ZETTA_OFFICIAL_TRADE_FEED_CACHE_SINCE_HOURS:-24}" \
+      --batch-size "${ZETTA_OFFICIAL_TRADE_FEED_CACHE_BATCH_SIZE:-10000}" \
+      --wallet-scan-limit "${ZETTA_OFFICIAL_TRADE_FEED_CACHE_WALLET_SCAN_LIMIT:-5000}" \
+      --per-wallet-limit "${ZETTA_OFFICIAL_TRADE_FEED_CACHE_PER_WALLET_LIMIT:-50}" \
+      --recent-limit "${ZETTA_OFFICIAL_TRADE_FEED_CACHE_RECENT_LIMIT:-5000}" \
+      "--${ZETTA_OFFICIAL_TRADE_FEED_CACHE_STATE_DEDUPE:-state-dedupe}" \
+      --loaded-key-limit "${ZETTA_OFFICIAL_TRADE_FEED_CACHE_LOADED_KEY_LIMIT:-500000}" \
+      "--${ZETTA_OFFICIAL_TRADE_FEED_CACHE_FIFA_ONLY:-fifa-only}"
     TRADE_LOAD_ARGS=(
       "${COMMON_ARGS[@]}"
       load data-trades
@@ -319,11 +333,11 @@ case "$MODE" in
     ;;
   polycop-wallet-signals)
     "$ZETTA_PYTHON" -m zetta.cli "${COMMON_ARGS[@]}" refresh polycop-wallet-signals \
-      --page-size "${ZETTA_POLYCOP_WALLET_SIGNAL_PAGE_SIZE:-50}" \
-      --max-pages "${ZETTA_POLYCOP_WALLET_SIGNAL_MAX_PAGES:-25}" \
+      --page-size "${ZETTA_POLYCOP_WALLET_SIGNAL_PAGE_SIZE:-15}" \
+      --max-pages "${ZETTA_POLYCOP_WALLET_SIGNAL_MAX_PAGES:-100}" \
       --sleep-seconds "${ZETTA_POLYCOP_WALLET_SIGNAL_SLEEP_SECONDS:-0.1}" \
       --timeout-seconds "${ZETTA_POLYCOP_WALLET_SIGNAL_TIMEOUT_SECONDS:-20}" \
-      --limit "${ZETTA_POLYCOP_WALLET_SIGNAL_LIMIT:-500}" \
+      --limit "${ZETTA_POLYCOP_WALLET_SIGNAL_LIMIT:-2000}" \
       --trigger-reason "${ZETTA_POLYCOP_WALLET_SIGNAL_TRIGGER_REASON:-scheduled}"
     ;;
   wallet-rollup)

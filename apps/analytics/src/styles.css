@@ -362,6 +362,16 @@ input {
   background: #202020;
 }
 
+.smart-segmented {
+  max-width: 100%;
+  overflow-x: auto;
+}
+
+.smart-segmented button {
+  min-width: 48px;
+  white-space: nowrap;
+}
+
 .list-search,
 .leader-search {
   height: 34px;
@@ -585,6 +595,40 @@ tbody tr:hover td {
   font-size: 14px;
   font-weight: 850;
   line-height: 1.12;
+}
+
+.wallet-segment {
+  display: inline-flex;
+  align-items: center;
+  height: 20px;
+  border-radius: 5px;
+  background: var(--chip);
+  color: var(--muted-2);
+  padding: 0 6px;
+  font-size: 11px;
+  font-weight: 780;
+}
+
+.wallet-segment.strict-smart,
+.wallet-segment.smart {
+  background: var(--brand-soft);
+  color: var(--brand);
+}
+
+.wallet-segment.candidate-smart {
+  background: var(--success-soft);
+  color: var(--green);
+}
+
+.wallet-segment.whale {
+  background: var(--warning-soft);
+  color: var(--amber);
+}
+
+.wallet-segment.watch,
+.wallet-segment.recent-flow {
+  background: var(--panel-2);
+  color: var(--muted-2);
 }
 
 .wallet-name {

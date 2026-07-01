@@ -624,14 +624,67 @@ class MartBuilder:
     def build_wallet_fifa_24h_pnl(self, *, window_hours: int = 24) -> MartBuildResult:
         if window_hours <= 0:
             raise ValueError("window_hours must be positive")
-        self.build_fifa_trades(window_hours=max(72, window_hours * 2))
+        self.build_fifa_trades(window_hours=max(192, window_hours * 2))
+        self.build_wallet_fifa_chain_cashflow(window_days=max(7, (window_hours + 23) // 24))
         self.clickhouse.execute("truncate table mart_wallet_fifa_24h_pnl_next")
         self.clickhouse.execute(
             f"""
             insert into mart_wallet_fifa_24h_pnl_next
+            (
+              user_address,
+              trade_count,
+              buy_count,
+              sell_count,
+              traded_size,
+              traded_notional,
+              buy_notional,
+              sell_notional,
+              trade_count_24h,
+              buy_notional_24h,
+              sell_notional_24h,
+              traded_notional_24h,
+              net_notional_24h,
+              event_count,
+              market_count,
+              event_count_24h,
+              market_count_24h,
+              token_count,
+              open_position_count,
+              open_position_value_now,
+              open_position_value_24h_ago,
+              open_position_value_7d_ago,
+              equity_now,
+              equity_24h_ago,
+              equity_7d_ago,
+              total_pnl,
+              total_pnl_roi,
+              pnl_24h,
+              pnl_base_24h,
+              pnl_roi_24h,
+              pnl_7d,
+              pnl_base_7d,
+              pnl_roi_7d,
+              profitable_token_count,
+              losing_token_count,
+              win_rate,
+              profitable_token_count_24h,
+              losing_token_count_24h,
+              win_rate_24h,
+              profitable_token_count_7d,
+              losing_token_count_7d,
+              win_rate_7d,
+              first_trade_at,
+              last_trade_at,
+              latest_action,
+              missing_mark_count,
+              negative_position_count,
+              data_quality,
+              updated_at
+            )
             with
               now64(3) as as_of,
               as_of - toIntervalHour({window_hours}) as since,
+              as_of - toIntervalDay(7) as since_7d,
               fifa_tokens as
               (
                 select
@@ -640,6 +693,20 @@ class MartBuilder:
                 from mart_fifa_trade final
                 where token_id != ''
                 group by token_id
+              ),
+              chain_cashflows as
+              (
+                select
+                  user_address,
+                  token_id,
+                  anyLast(redeemed_value_now) as redeemed_value_now,
+                  anyLast(redeemed_value_24h_ago) as redeemed_value_24h_ago,
+                  anyLast(redeemed_value_7d_ago) as redeemed_value_7d_ago,
+                  anyLast(fee_now) as fee_now,
+                  anyLast(fee_24h_ago) as fee_24h_ago,
+                  anyLast(fee_7d_ago) as fee_7d_ago
+                from mart_wallet_fifa_chain_cashflow final
+                group by user_address, token_id
               ),
               final_prices_now as
               (
@@ -706,6 +773,39 @@ class MartBuilder:
                   on tokens.market_id = resolved.market_id
                  and tokens.outcome_index = resolved.outcome_index
               ),
+              final_prices_7d_ago as
+              (
+                select
+                  resolved.market_id as market_id,
+                  tokens.token_id as token_id,
+                  resolved.final_price as final_price
+                from
+                (
+                  select
+                    market_id,
+                    condition_id,
+                    price_index - 1 as outcome_index,
+                    toFloat64OrZero(JSONExtractString(price_raw)) as final_price
+                  from
+                  (
+                    select
+                      market_id,
+                      condition_id,
+                      JSONExtractString(raw_json, 'outcomePrices') as prices
+                    from dim_market as markets final
+                    where market_id in (select market_id from fifa_tokens)
+                      and closed = true
+                      and end_time <= since_7d
+                      and JSONExtractString(raw_json, 'outcomePrices') != ''
+                  )
+                  array join
+                    JSONExtractArrayRaw(prices) as price_raw,
+                    arrayEnumerate(JSONExtractArrayRaw(prices)) as price_index
+                ) as resolved
+                inner join dim_outcome_token as tokens final
+                  on tokens.market_id = resolved.market_id
+                 and tokens.outcome_index = resolved.outcome_index
+              ),
               marks as
               (
                 select
@@ -727,12 +827,23 @@ class MartBuilder:
                     price_marks.price_ago_count > 0,
                       cast(price_marks.price_ago, 'Nullable(Float64)'),
                     cast(null, 'Nullable(Float64)')
-                  ) as mark_price_24h_ago
+                  ) as mark_price_24h_ago,
+                  multiIf(
+                    final_7d.final_price is not null,
+                      cast(final_7d.final_price, 'Nullable(Float64)'),
+                    book_marks.book_7d_count > 0,
+                      cast((book_marks.book_best_bid_7d + book_marks.book_best_ask_7d) / 2, 'Nullable(Float64)'),
+                    price_marks.price_7d_count > 0,
+                      cast(price_marks.price_7d, 'Nullable(Float64)'),
+                    cast(null, 'Nullable(Float64)')
+                  ) as mark_price_7d_ago
                 from fifa_tokens as token_ids
                 left join final_prices_now as final_now
                   on token_ids.token_id = final_now.token_id
                 left join final_prices_ago as final_ago
                   on token_ids.token_id = final_ago.token_id
+                left join final_prices_7d_ago as final_7d
+                  on token_ids.token_id = final_7d.token_id
                 left join
                 (
                   select
@@ -741,7 +852,9 @@ class MartBuilder:
                       as price_now,
                     countIf(timestamp <= as_of + toIntervalMinute(10)) as price_now_count,
                     argMaxIf(price, timestamp, timestamp <= since) as price_ago,
-                    countIf(timestamp <= since) as price_ago_count
+                    countIf(timestamp <= since) as price_ago_count,
+                    argMaxIf(price, timestamp, timestamp <= since_7d) as price_7d,
+                    countIf(timestamp <= since_7d) as price_7d_count
                   from fact_price_history
                   where token_id in (select token_id from fifa_tokens)
                     and timestamp <= as_of + toIntervalMinute(10)
@@ -758,7 +871,10 @@ class MartBuilder:
                     countIf(captured_at <= as_of + toIntervalMinute(10)) as book_now_count,
                     argMaxIf(best_bid, captured_at, captured_at <= since) as book_best_bid_ago,
                     argMaxIf(best_ask, captured_at, captured_at <= since) as book_best_ask_ago,
-                    countIf(captured_at <= since) as book_ago_count
+                    countIf(captured_at <= since) as book_ago_count,
+                    argMaxIf(best_bid, captured_at, captured_at <= since_7d) as book_best_bid_7d,
+                    argMaxIf(best_ask, captured_at, captured_at <= since_7d) as book_best_ask_7d,
+                    countIf(captured_at <= since_7d) as book_7d_count
                   from fact_orderbook_snapshot
                   where token_id in (select token_id from fifa_tokens)
                     and best_bid is not null
@@ -789,8 +905,12 @@ class MartBuilder:
               open_position_count,
               open_position_value_now,
               open_position_value_24h_ago,
+              open_position_value_7d_ago,
               equity_now,
               equity_24h_ago,
+              equity_7d_ago,
+              equity_now as total_pnl,
+              if(buy_notional = 0, 0.0, equity_now / buy_notional) as total_pnl_roi,
               equity_now - equity_24h_ago as pnl_24h,
               open_position_value_24h_ago + buy_notional_24h as pnl_base_24h,
               if(
@@ -799,6 +919,37 @@ class MartBuilder:
                 (equity_now - equity_24h_ago)
                   / (open_position_value_24h_ago + buy_notional_24h)
               ) as pnl_roi_24h,
+              equity_now - equity_7d_ago as pnl_7d,
+              open_position_value_7d_ago + buy_notional_7d as pnl_base_7d,
+              if(
+                open_position_value_7d_ago + buy_notional_7d = 0,
+                0.0,
+                (equity_now - equity_7d_ago)
+                  / (open_position_value_7d_ago + buy_notional_7d)
+              ) as pnl_roi_7d,
+              profitable_token_count,
+              losing_token_count,
+              if(
+                profitable_token_count + losing_token_count = 0,
+                0.0,
+                profitable_token_count / (profitable_token_count + losing_token_count)
+              ) as win_rate,
+              profitable_token_count_24h,
+              losing_token_count_24h,
+              if(
+                profitable_token_count_24h + losing_token_count_24h = 0,
+                0.0,
+                profitable_token_count_24h
+                  / (profitable_token_count_24h + losing_token_count_24h)
+              ) as win_rate_24h,
+              profitable_token_count_7d,
+              losing_token_count_7d,
+              if(
+                profitable_token_count_7d + losing_token_count_7d = 0,
+                0.0,
+                profitable_token_count_7d
+                  / (profitable_token_count_7d + losing_token_count_7d)
+              ) as win_rate_7d,
               first_trade_at,
               last_trade_at,
               latest_action,
@@ -825,6 +976,9 @@ class MartBuilder:
                 sum(token_buy_notional_24h) as buy_notional_24h,
                 sum(token_sell_notional_24h) as sell_notional_24h,
                 sum(token_traded_notional_24h) as traded_notional_24h,
+                sum(token_buy_notional_7d) as buy_notional_7d,
+                sum(token_sell_notional_7d) as sell_notional_7d,
+                sum(token_traded_notional_7d) as traded_notional_7d,
                 uniqExact(event_id) as event_count,
                 uniqExact(market_id) as market_count,
                 uniqExactIf(event_id, token_trade_count_24h > 0) as event_count_24h,
@@ -833,8 +987,20 @@ class MartBuilder:
                 countIf(position_size_now > 0.000001) as open_position_count,
                 sum(token_open_position_value_now) as open_position_value_now,
                 sum(token_open_position_value_24h_ago) as open_position_value_24h_ago,
+                sum(token_open_position_value_7d_ago) as open_position_value_7d_ago,
                 sum(net_cashflow_now + token_open_position_value_now) as equity_now,
                 sum(net_cashflow_24h_ago + token_open_position_value_24h_ago) as equity_24h_ago,
+                sum(net_cashflow_7d_ago + token_open_position_value_7d_ago) as equity_7d_ago,
+                countIf(token_pnl_now > 0.000001) as profitable_token_count,
+                countIf(token_pnl_now < -0.000001) as losing_token_count,
+                countIf(token_trade_count_24h > 0 and token_pnl_now > 0.000001)
+                  as profitable_token_count_24h,
+                countIf(token_trade_count_24h > 0 and token_pnl_now < -0.000001)
+                  as losing_token_count_24h,
+                countIf(token_trade_count_7d > 0 and token_pnl_now > 0.000001)
+                  as profitable_token_count_7d,
+                countIf(token_trade_count_7d > 0 and token_pnl_now < -0.000001)
+                  as losing_token_count_7d,
                 min(first_trade_at) as first_trade_at,
                 max(last_trade_at) as last_trade_at,
                 argMax(token_latest_action, token_last_trade_at) as latest_action,
@@ -843,53 +1009,115 @@ class MartBuilder:
               from
               (
                 select
-                  positions.event_id,
-                  positions.market_id,
-                  positions.user_address,
-                  positions.trade_count,
-                  positions.buy_count,
-                  positions.sell_count,
-                  positions.traded_size,
-                  positions.traded_notional,
-                  positions.buy_notional,
-                  positions.sell_notional,
+                  positions.event_id as event_id,
+                  positions.market_id as market_id,
+                  positions.user_address as user_address,
+                  positions.trade_count as trade_count,
+                  positions.buy_count as buy_count,
+                  positions.sell_count as sell_count,
+                  positions.traded_size as traded_size,
+                  positions.traded_notional as traded_notional,
+                  positions.buy_notional as buy_notional,
+                  positions.sell_notional as sell_notional,
                   positions.trade_count_24h as token_trade_count_24h,
                   positions.buy_notional_24h as token_buy_notional_24h,
                   positions.sell_notional_24h as token_sell_notional_24h,
                   positions.traded_notional_24h as token_traded_notional_24h,
-                  positions.position_size_now,
-                  positions.position_size_24h_ago,
-                  positions.net_cashflow_now,
-                  positions.net_cashflow_24h_ago,
+                  positions.trade_count_7d as token_trade_count_7d,
+                  positions.buy_notional_7d as token_buy_notional_7d,
+                  positions.sell_notional_7d as token_sell_notional_7d,
+                  positions.traded_notional_7d as token_traded_notional_7d,
+                  positions.position_size_now - ifNull(chain_cashflows.redeemed_value_now, 0.0)
+                    as position_size_now,
+                  positions.position_size_24h_ago
+                    - ifNull(chain_cashflows.redeemed_value_24h_ago, 0.0)
+                    as position_size_24h_ago,
+                  positions.position_size_7d_ago
+                    - ifNull(chain_cashflows.redeemed_value_7d_ago, 0.0)
+                    as position_size_7d_ago,
+                  positions.net_cashflow_now
+                    + ifNull(chain_cashflows.redeemed_value_now, 0.0)
+                    - ifNull(chain_cashflows.fee_now, 0.0)
+                    as net_cashflow_now,
+                  positions.net_cashflow_24h_ago
+                    + ifNull(chain_cashflows.redeemed_value_24h_ago, 0.0)
+                    - ifNull(chain_cashflows.fee_24h_ago, 0.0)
+                    as net_cashflow_24h_ago,
+                  positions.net_cashflow_7d_ago
+                    + ifNull(chain_cashflows.redeemed_value_7d_ago, 0.0)
+                    - ifNull(chain_cashflows.fee_7d_ago, 0.0)
+                    as net_cashflow_7d_ago,
+                  (
+                    positions.net_cashflow_now
+                    + ifNull(chain_cashflows.redeemed_value_now, 0.0)
+                    - ifNull(chain_cashflows.fee_now, 0.0)
+                  )
+                    + if(
+                      positions.position_size_now
+                        - ifNull(chain_cashflows.redeemed_value_now, 0.0) > 0.000001,
+                      (
+                        positions.position_size_now
+                        - ifNull(chain_cashflows.redeemed_value_now, 0.0)
+                      ) * ifNull(marks.mark_price_now, 0.0),
+                      0.0
+                    ) as token_pnl_now,
                   if(
-                    positions.position_size_now > 0.000001,
-                    positions.position_size_now * ifNull(marks.mark_price_now, 0.0),
+                    positions.position_size_now
+                      - ifNull(chain_cashflows.redeemed_value_now, 0.0) > 0.000001,
+                    (
+                      positions.position_size_now
+                      - ifNull(chain_cashflows.redeemed_value_now, 0.0)
+                    ) * ifNull(marks.mark_price_now, 0.0),
                     0.0
                   ) as token_open_position_value_now,
                   if(
-                    positions.position_size_24h_ago > 0.000001,
-                    positions.position_size_24h_ago * ifNull(marks.mark_price_24h_ago, 0.0),
+                    positions.position_size_24h_ago
+                      - ifNull(chain_cashflows.redeemed_value_24h_ago, 0.0) > 0.000001,
+                    (
+                      positions.position_size_24h_ago
+                      - ifNull(chain_cashflows.redeemed_value_24h_ago, 0.0)
+                    ) * ifNull(marks.mark_price_24h_ago, 0.0),
                     0.0
                   ) as token_open_position_value_24h_ago,
-                  positions.first_trade_at,
-                  positions.last_trade_at,
+                  if(
+                    positions.position_size_7d_ago
+                      - ifNull(chain_cashflows.redeemed_value_7d_ago, 0.0) > 0.000001,
+                    (
+                      positions.position_size_7d_ago
+                      - ifNull(chain_cashflows.redeemed_value_7d_ago, 0.0)
+                    ) * ifNull(marks.mark_price_7d_ago, 0.0),
+                    0.0
+                  ) as token_open_position_value_7d_ago,
+                  positions.first_trade_at as first_trade_at,
+                  positions.last_trade_at as last_trade_at,
                   positions.last_trade_at as token_last_trade_at,
                   positions.latest_action as token_latest_action,
                   if(
                     (
-                      positions.position_size_now > 0.000001
+                      positions.position_size_now
+                        - ifNull(chain_cashflows.redeemed_value_now, 0.0) > 0.000001
                       and marks.mark_price_now is null
                     )
                     or (
-                      positions.position_size_24h_ago > 0.000001
+                      positions.position_size_24h_ago
+                        - ifNull(chain_cashflows.redeemed_value_24h_ago, 0.0) > 0.000001
                       and marks.mark_price_24h_ago is null
+                    )
+                    or (
+                      positions.position_size_7d_ago
+                        - ifNull(chain_cashflows.redeemed_value_7d_ago, 0.0) > 0.000001
+                      and marks.mark_price_7d_ago is null
                     ),
                     1,
                     0
                   ) as missing_mark,
                   if(
-                    positions.position_size_now < -0.000001
-                    or positions.position_size_24h_ago < -0.000001,
+                    positions.position_size_now
+                      - ifNull(chain_cashflows.redeemed_value_now, 0.0) < -0.000001
+                    or positions.position_size_24h_ago
+                      - ifNull(chain_cashflows.redeemed_value_24h_ago, 0.0) < -0.000001
+                    or positions.position_size_7d_ago
+                      - ifNull(chain_cashflows.redeemed_value_7d_ago, 0.0) < -0.000001,
                     1,
                     0
                   ) as negative_position
@@ -918,18 +1146,36 @@ class MartBuilder:
                       trades.side = 'SELL' and trades.timestamp >= since
                     ) as sell_notional_24h,
                     sumIf(trades.notional, trades.timestamp >= since) as traded_notional_24h,
+                    countIf(trades.timestamp >= since_7d) as trade_count_7d,
+                    sumIf(
+                      trades.notional,
+                      trades.side = 'BUY' and trades.timestamp >= since_7d
+                    ) as buy_notional_7d,
+                    sumIf(
+                      trades.notional,
+                      trades.side = 'SELL' and trades.timestamp >= since_7d
+                    ) as sell_notional_7d,
+                    sumIf(trades.notional, trades.timestamp >= since_7d) as traded_notional_7d,
                     sum(if(trades.side = 'BUY', trades.size, -trades.size))
                       as position_size_now,
                     sumIf(
                       if(trades.side = 'BUY', trades.size, -trades.size),
                       trades.timestamp < since
                     ) as position_size_24h_ago,
+                    sumIf(
+                      if(trades.side = 'BUY', trades.size, -trades.size),
+                      trades.timestamp < since_7d
+                    ) as position_size_7d_ago,
                     sum(if(trades.side = 'SELL', trades.notional, -trades.notional))
                       as net_cashflow_now,
                     sumIf(
                       if(trades.side = 'SELL', trades.notional, -trades.notional),
                       trades.timestamp < since
                     ) as net_cashflow_24h_ago,
+                    sumIf(
+                      if(trades.side = 'SELL', trades.notional, -trades.notional),
+                      trades.timestamp < since_7d
+                    ) as net_cashflow_7d_ago,
                     min(trades.timestamp) as first_trade_at,
                     max(trades.timestamp) as last_trade_at,
                     argMax(trades.side, trades.timestamp) as latest_action
@@ -945,6 +1191,9 @@ class MartBuilder:
                     trades.user_address
                 ) as positions
                 left join marks on positions.token_id = marks.token_id
+                left join chain_cashflows
+                  on positions.token_id = chain_cashflows.token_id
+                 and positions.user_address = chain_cashflows.user_address
               )
               group by user_address
             )
@@ -963,9 +1212,135 @@ class MartBuilder:
         )
         return MartBuildResult(mart="wallet_fifa_24h_pnl", rows=rows)
 
+    def build_wallet_fifa_chain_cashflow(self, *, window_days: int = 7) -> MartBuildResult:
+        if window_days <= 0:
+            raise ValueError("window_days must be positive")
+        block_window = window_days * 24 * 1800
+        day_block_window = 24 * 1800
+        self.clickhouse.execute("truncate table mart_wallet_fifa_chain_cashflow")
+        self.clickhouse.execute(
+            f"""
+            insert into mart_wallet_fifa_chain_cashflow
+            with
+              now64(3) as as_of,
+              chain_bounds as
+              (
+                select
+                  max_block,
+                  toUInt64(greatest(toInt64(max_block) - {day_block_window}, 0))
+                    as since_block,
+                  toUInt64(greatest(toInt64(max_block) - {block_window}, 0))
+                    as since_window_block
+                from
+                (
+                  select toUInt64(ifNull(max(block_number), 0)) as max_block
+                  from fact_ctf_balance_movement
+                )
+              ),
+              recent_fifa_tokens as
+              (
+                select token_id
+                from mart_fifa_trade final
+                where token_id != ''
+                  and timestamp >= as_of - toIntervalDay({window_days})
+                group by token_id
+              ),
+              redeemed_positions as
+              (
+                select
+                  lower(from_address) as user_address,
+                  token_id,
+                  sum(amount) as redeemed_value_now,
+                  sumIf(amount, block_number < (select since_block from chain_bounds))
+                    as redeemed_value_24h_ago,
+                  0.0 as redeemed_value_7d_ago
+                from fact_ctf_balance_movement final
+                prewhere block_number >= (select since_window_block from chain_bounds)
+                where token_id in (select token_id from recent_fifa_tokens)
+                  and to_address = '0xada100db00ca00073811820692005400218fce1f'
+                  and from_address not in ('', '0x0000000000000000000000000000000000000000')
+                  and amount > 0.000001
+                group by user_address, token_id
+              ),
+              chain_fees as
+              (
+                select
+                  lower(maker) as user_address,
+                  token_id,
+                  sum(decoded_fee) as fee_now,
+                  sumIf(decoded_fee, block_number < (select since_block from chain_bounds))
+                    as fee_24h_ago,
+                  0.0 as fee_7d_ago
+                from
+                (
+                  select
+                    block_number,
+                    token_id,
+                    maker,
+                    JSONExtractFloat(JSONExtractRaw(raw_json, 'decoded'), 'fee')
+                      / 1000000.0 as decoded_fee
+                  from fact_exchange_fill final
+                  prewhere block_number >= (select since_window_block from chain_bounds)
+                  where token_id in (select token_id from recent_fifa_tokens)
+                    and maker not in ('', '0x0000000000000000000000000000000000000000')
+                )
+                where decoded_fee > 0.0
+                group by user_address, token_id
+              )
+            select
+              user_address,
+              token_id,
+              sum(redeemed_value_now) as redeemed_value_now,
+              sum(redeemed_value_24h_ago) as redeemed_value_24h_ago,
+              sum(redeemed_value_7d_ago) as redeemed_value_7d_ago,
+              sum(fee_now) as fee_now,
+              sum(fee_24h_ago) as fee_24h_ago,
+              sum(fee_7d_ago) as fee_7d_ago,
+              as_of as updated_at
+            from
+            (
+              select
+                user_address,
+                token_id,
+                redeemed_value_now,
+                redeemed_value_24h_ago,
+                redeemed_value_7d_ago,
+                0.0 as fee_now,
+                0.0 as fee_24h_ago,
+                0.0 as fee_7d_ago
+              from redeemed_positions
+              union all
+              select
+                user_address,
+                token_id,
+                0.0 as redeemed_value_now,
+                0.0 as redeemed_value_24h_ago,
+                0.0 as redeemed_value_7d_ago,
+                fee_now,
+                fee_24h_ago,
+                fee_7d_ago
+              from chain_fees
+            )
+            group by user_address, token_id
+            """
+        )
+        rows = int(
+            self.clickhouse.query_text(
+                "select count() from mart_wallet_fifa_chain_cashflow final"
+            ).strip()
+            or "0"
+        )
+        return MartBuildResult(mart="wallet_fifa_chain_cashflow", rows=rows)
+
     def build_fifa_trades(self, *, window_hours: int = 72) -> MartBuildResult:
         if window_hours <= 0:
             raise ValueError("window_hours must be positive")
+        self.clickhouse.execute(
+            f"""
+            alter table mart_fifa_trade
+            delete where timestamp >= now64(3) - toIntervalHour({window_hours})
+            """
+        )
         self.clickhouse.execute(
             f"""
             insert into mart_fifa_trade
@@ -1006,14 +1381,15 @@ class MartBuilder:
               (
                 select
                   raw_condition_id as condition_id,
-                  anyLast(raw_market_id) as market_id,
-                  anyLast(raw_event_id) as event_id
+                  argMax(raw_market_id, raw_priority) as market_id,
+                  argMax(raw_event_id, raw_priority) as event_id
                 from
                 (
                   select
                     markets.condition_id as raw_condition_id,
                     markets.market_id as raw_market_id,
-                    markets.event_id as raw_event_id
+                    markets.event_id as raw_event_id,
+                    2 as raw_priority
                   from dim_market as markets final
                   left join dim_event as events final on markets.event_id = events.event_id
                   where markets.condition_id != ''
@@ -1022,23 +1398,103 @@ class MartBuilder:
                       startsWith(markets.slug, 'fifwc-')
                       or startsWith(ifNull(events.slug, ''), 'fifwc-')
                     )
+                  union all
+                  select
+                    condition_id as raw_condition_id,
+                    if(
+                      raw_market_slug != '',
+                      raw_market_slug,
+                      condition_id
+                    ) as raw_market_id,
+                    raw_event_slug as raw_event_id,
+                    1 as raw_priority
+                  from
+                  (
+                    select
+                      condition_id,
+                      argMax(raw_market_slug, raw_ingested_at) as raw_market_slug,
+                      argMax(raw_event_slug, raw_ingested_at) as raw_event_slug
+                    from
+                    (
+                      select
+                        condition_id,
+                        JSONExtractString(JSONExtractRaw(raw_json, 'trade'), 'market_slug')
+                          as raw_market_slug,
+                        JSONExtractString(JSONExtractRaw(raw_json, 'trade'), 'event_slug')
+                          as raw_event_slug,
+                        ingested_at as raw_ingested_at
+                      from fact_trade_by_time
+                      where condition_id != ''
+                        and timestamp >= refresh_since
+                        and (
+                          startsWith(
+                            JSONExtractString(JSONExtractRaw(raw_json, 'trade'), 'market_slug'),
+                            'fifwc-'
+                          )
+                          or startsWith(
+                            JSONExtractString(JSONExtractRaw(raw_json, 'trade'), 'event_slug'),
+                            'fifwc-'
+                          )
+                        )
+                    )
+                    group by condition_id
+                  )
                 )
                 group by raw_condition_id
               ),
               fifa_tokens as
               (
                 select
-                  tokens.token_id as token_id,
-                  anyLast(tokens.market_id) as market_id
-                from dim_outcome_token as tokens final
-                inner join
+                  raw_token_id as token_id,
+                  anyLast(raw_market_id) as market_id
+                from
                 (
-                  select market_id
-                  from fifa_markets
-                  group by market_id
-                ) as markets on tokens.market_id = markets.market_id
-                where tokens.token_id != ''
-                group by tokens.token_id
+                  select
+                    tokens.token_id as raw_token_id,
+                    tokens.market_id as raw_market_id
+                  from dim_outcome_token as tokens final
+                  inner join
+                  (
+                    select market_id
+                    from fifa_markets
+                    group by market_id
+                  ) as markets on tokens.market_id = markets.market_id
+                  where tokens.token_id != ''
+                  union all
+                  select
+                    token_id as raw_token_id,
+                    anyLast(
+                      if(
+                        raw_market_slug != '',
+                        raw_market_slug,
+                        condition_id
+                      )
+                    ) as raw_market_id
+                  from
+                  (
+                    select
+                      token_id,
+                      condition_id,
+                      JSONExtractString(JSONExtractRaw(raw_json, 'trade'), 'market_slug')
+                        as raw_market_slug
+                    from fact_trade_by_time
+                    where token_id != ''
+                      and condition_id != ''
+                      and timestamp >= refresh_since
+                      and (
+                        startsWith(
+                          JSONExtractString(JSONExtractRaw(raw_json, 'trade'), 'market_slug'),
+                          'fifwc-'
+                        )
+                        or startsWith(
+                          JSONExtractString(JSONExtractRaw(raw_json, 'trade'), 'event_slug'),
+                          'fifwc-'
+                        )
+                      )
+                  )
+                  group by token_id
+                )
+                group by raw_token_id
               )
             select
               dedup.trade_key as trade_key,
@@ -1074,8 +1530,7 @@ class MartBuilder:
                     toString(timestamp), ':', condition_id, ':', token_id, ':',
                     lower(user_address), ':', side, ':',
                     toString(round(price, 12)), ':',
-                    toString(round(size, 6)), ':',
-                    toString(round(notional, 6))
+                    toString(round(size, 6))
                   ) as trade_key,
                   timestamp as raw_timestamp,
                   condition_id as raw_condition_id,

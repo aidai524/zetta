@@ -66,7 +66,7 @@ def test_build_polycop_wallet_signal_result_contains_summary_segments() -> None:
 
     result = build_polycop_wallet_signal_result(
         rows,
-        metadata={"page_size": 50, "max_pages": 1, "pages_fetched": 1},
+        metadata={"page_size": 15, "max_pages": 1, "pages_fetched": 1},
         limit=10,
     )
 

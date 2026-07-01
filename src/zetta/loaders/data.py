@@ -3,7 +3,7 @@ from __future__ import annotations
 import hashlib
 import json
 from dataclasses import dataclass
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any
 
@@ -18,8 +18,14 @@ from zetta.loaders.incremental import (
 )
 from zetta.loaders.parallel import load_in_parallel, raw_paths
 from zetta.models.normalize import as_float, as_str, parse_dt
+from zetta.official_trade_feed import (
+    WALLET_CACHE_DIR,
+    load_recent_trade_messages,
+    load_recent_wallet_trade_messages,
+)
 from zetta.storage.clickhouse import ClickHouseWriter
 from zetta.storage.raw_reader import iter_raw_records, iter_raw_records_from_paths
+from zetta.storage.state import LocalStateStore
 
 
 @dataclass(frozen=True)
@@ -130,6 +136,139 @@ class DataRawLoader:
             ),
             batch_size=batch_size,
             skip_loaded=True,
+        )
+
+    def load_official_trade_feed_cache(
+        self,
+        *,
+        state_dir: Path,
+        since_hours: int = 24,
+        batch_size: int = 10_000,
+        wallet_scan_limit: int = 5_000,
+        per_wallet_limit: int = 50,
+        recent_limit: int = 5_000,
+        fifa_only: bool = True,
+        state_dedupe: bool = True,
+        loaded_key_limit: int = 500_000,
+    ) -> DataLoadResult:
+        if since_hours <= 0:
+            raise ValueError("since_hours must be positive")
+        if batch_size <= 0:
+            raise ValueError("batch_size must be positive")
+        if wallet_scan_limit < 0:
+            raise ValueError("wallet_scan_limit must not be negative")
+        if per_wallet_limit <= 0:
+            raise ValueError("per_wallet_limit must be positive")
+        if recent_limit <= 0:
+            raise ValueError("recent_limit must be positive")
+        if loaded_key_limit <= 0:
+            raise ValueError("loaded_key_limit must be positive")
+
+        cutoff = datetime.now(UTC) - timedelta(hours=since_hours)
+        state_store = LocalStateStore(state_dir)
+        state_key = "loader_checkpoints/official_trade_feed_cache"
+        loaded_state = state_store.get(state_key, {}) if state_dedupe else {}
+        loaded_keys = set(loaded_state.get("keys") or []) if isinstance(loaded_state, dict) else set()
+        selected_messages: dict[str, dict[str, Any]] = {}
+        raw_records = 0
+        skipped = 0
+
+        def keep_message(message: dict[str, Any]) -> None:
+            nonlocal raw_records, skipped
+            raw_records += 1
+            trade = message.get("trade")
+            if not isinstance(trade, dict):
+                skipped += 1
+                return
+            if fifa_only:
+                market_slug = str(trade.get("market_slug") or "")
+                event_slug = str(trade.get("event_slug") or "")
+                if not (market_slug.startswith("fifwc-") or event_slug.startswith("fifwc-")):
+                    skipped += 1
+                    return
+            timestamp = official_trade_timestamp(trade.get("timestamp"))
+            if timestamp is None or timestamp < cutoff:
+                skipped += 1
+                return
+            key = official_trade_message_dedupe_key(message)
+            if not key:
+                skipped += 1
+                return
+            if key in loaded_keys:
+                skipped += 1
+                return
+            current = selected_messages.get(key)
+            if current is None or official_trade_message_rank(message) > official_trade_message_rank(
+                current
+            ):
+                selected_messages[key] = message
+            else:
+                skipped += 1
+
+        for message in load_recent_trade_messages(state_dir, limit=recent_limit):
+            keep_message(message)
+
+        wallet_cache_dir = state_dir / WALLET_CACHE_DIR
+        wallet_files: list[tuple[float, Path]] = []
+        cutoff_ts = cutoff.timestamp()
+        try:
+            for path in wallet_cache_dir.glob("*.json"):
+                mtime = path.stat().st_mtime
+                if mtime >= cutoff_ts:
+                    wallet_files.append((mtime, path))
+        except OSError:
+            wallet_files = []
+        wallet_files.sort(reverse=True)
+        if wallet_scan_limit:
+            wallet_files = wallet_files[:wallet_scan_limit]
+        for _mtime, path in wallet_files:
+            for message in load_recent_wallet_trade_messages(
+                state_dir,
+                path.stem,
+                limit=per_wallet_limit,
+            ):
+                keep_message(message)
+
+        trade_rows: list[dict[str, Any]] = []
+        inserted_keys: list[str] = []
+        trades = 0
+        for key, message in sorted(
+            selected_messages.items(),
+            key=lambda item: official_trade_row_timestamp_text(item[1]),
+            reverse=True,
+        ):
+            row = official_trade_feed_trade_row(message, dedupe_key=key)
+            if row is None:
+                skipped += 1
+                continue
+            trade_rows.append(row)
+            inserted_keys.append(key)
+            if len(trade_rows) >= batch_size:
+                inserted_trades, _inserted_logs = self.flush(trade_rows, [])
+                trades += inserted_trades
+        inserted_trades, _inserted_logs = self.flush(trade_rows, [])
+        trades += inserted_trades
+        if state_dedupe and inserted_keys:
+            next_keys = list(dict.fromkeys([*inserted_keys, *loaded_keys]))[:loaded_key_limit]
+            state_store.set(
+                state_key,
+                {
+                    "updated_at": datetime.now(UTC).strftime("%Y-%m-%d %H:%M:%S.%f")[:-3],
+                    "keys": next_keys,
+                },
+            )
+
+        return DataLoadResult(
+            raw_records=raw_records,
+            skipped_raw_records=skipped,
+            trades=trades,
+            activities=0,
+            holders=0,
+            market_positions=0,
+            wallet_portfolios=0,
+            wallet_pnls=0,
+            open_interest=0,
+            ingest_logs=0,
         )
 
     def _load_trades_records(
@@ -566,6 +705,115 @@ def without_last_raw_path(result: DataLoadStateResult) -> DataLoadResult:
         open_interest=result.open_interest,
         ingest_logs=result.ingest_logs,
     )
+
+
+def official_trade_feed_trade_row(
+    message: dict[str, Any],
+    *,
+    dedupe_key: str | None = None,
+) -> dict[str, Any] | None:
+    trade = message.get("trade")
+    if not isinstance(trade, dict):
+        return None
+    timestamp = official_trade_timestamp(trade.get("timestamp"))
+    if timestamp is None:
+        return None
+    transaction_hash = as_str(trade.get("transaction_hash"))
+    token_id = as_str(trade.get("token_id"))
+    user_address = as_str(trade.get("user_address")).lower()
+    condition_id = as_str(trade.get("condition_id"))
+    side = as_str(trade.get("side")).upper()
+    price = as_float(trade.get("price"))
+    size = as_float(trade.get("size"))
+    notional = as_float(trade.get("notional"))
+    if notional == 0.0 and price and size:
+        notional = price * size
+    if not user_address or not token_id or not condition_id:
+        return None
+    key = dedupe_key or official_trade_message_dedupe_key(message)
+    return {
+        "trade_id": key or trade_id(transaction_hash, token_id, timestamp, 0),
+        "transaction_hash": transaction_hash,
+        "log_index": official_trade_log_index(key),
+        "timestamp": timestamp,
+        "market_id": as_str(trade.get("market_id")),
+        "condition_id": condition_id,
+        "token_id": token_id,
+        "user_address": user_address,
+        "side": side,
+        "price": price,
+        "size": size,
+        "notional": notional,
+        "source": as_str(trade.get("source")) or as_str(message.get("source")) or "official-trade-feed",
+        "raw_json": json.dumps(message, ensure_ascii=False, separators=(",", ":")),
+        "ingested_at": datetime.now(UTC),
+    }
+
+
+def official_trade_message_dedupe_key(message: dict[str, Any]) -> str:
+    trade = message.get("trade")
+    if not isinstance(trade, dict):
+        return ""
+    timestamp = official_trade_timestamp(trade.get("timestamp"))
+    if timestamp is None:
+        return ""
+    transaction_hash = as_str(trade.get("transaction_hash"))
+    token_id = as_str(trade.get("token_id"))
+    user_address = as_str(trade.get("user_address")).lower()
+    side = as_str(trade.get("side")).upper()
+    price = as_float(trade.get("price"))
+    size = as_float(trade.get("size"))
+    raw = "|".join(
+        [
+            transaction_hash,
+            token_id,
+            user_address,
+            side,
+            f"{price:.12f}",
+            f"{size:.6f}",
+            timestamp.astimezone(UTC).strftime("%Y-%m-%d %H:%M:%S.%f")[:-3],
+        ]
+    )
+    return hashlib.sha1(raw.encode("utf-8")).hexdigest()
+
+
+def official_trade_message_rank(message: dict[str, Any]) -> tuple[int, int]:
+    trade = message.get("trade")
+    if not isinstance(trade, dict):
+        return (0, 0)
+    source = as_str(trade.get("source")) or as_str(message.get("source"))
+    has_notional = 1 if as_float(trade.get("notional")) > 0 else 0
+    source_rank = 2 if source == "polymarket-data-api" else 1
+    return (has_notional, source_rank)
+
+
+def official_trade_timestamp(value: Any) -> datetime | None:
+    if isinstance(value, str):
+        cleaned = value.strip()
+        if cleaned and "T" not in cleaned and "+" not in cleaned and not cleaned.endswith("Z"):
+            try:
+                return datetime.fromisoformat(cleaned.replace(" ", "T")).replace(tzinfo=UTC)
+            except ValueError:
+                return None
+    return parse_dt(value)
+
+
+def official_trade_row_timestamp_text(message: dict[str, Any]) -> str:
+    trade = message.get("trade")
+    if isinstance(trade, dict):
+        timestamp = official_trade_timestamp(trade.get("timestamp"))
+        if timestamp is not None:
+            return timestamp.astimezone(UTC).isoformat()
+    return ""
+
+
+def official_trade_log_index(key: str) -> int:
+    if not key:
+        return 0
+    try:
+        return int(key[:8], 16)
+    except ValueError:
+        return int(hashlib.sha1(key.encode("utf-8")).hexdigest()[:8], 16)
 
 
 def trade_id(transaction_hash: str, token_id: str, timestamp: datetime, index: int) -> str:

@@ -60,7 +60,9 @@ under the same `fifwc-*` namespace.
 The mart uses an equity-delta definition:
 
 ```text
+fifa_total_pnl = fifa_equity_now
 fifa_pnl_24h = fifa_equity_now - fifa_equity_24h_ago
+fifa_pnl_7d = fifa_equity_now - fifa_equity_7d_ago
 ```
 
 Token equity at a cutoff is:
@@ -79,6 +81,16 @@ positions from:
 Negative token balances are flagged as `needs_chain_balance` because Data API
 trades alone can miss chain-level split/merge/redeem balance effects.
 
+Win rate is token-position based:
+
+```text
+win_rate = profitable FIFA token positions / non-flat FIFA token positions
+win_rate_24h = same calculation, restricted to tokens traded in the last 24h
+win_rate_7d = same calculation, restricted to tokens traded in the last 7d
+```
+
+This avoids counting split fills as many separate wins or losses.
+
 ## Endpoint
 
 ```http
@@ -91,18 +103,50 @@ Production example:
 https://discovery.prophet.zone/api/wallets/fifa-24h-pnl?limit=50&sort=pnl_24h&direction=desc&min_notional_24h=100
 ```
 
+Query one wallet exactly:
+
+```text
+https://discovery.prophet.zone/api/wallets/fifa-24h-pnl?user=0xb56db5215443706244b0af76b3daaad3066ad621&limit=1
+```
+
+The single-wallet response row exposes these PnL and win-rate fields:
+
+- `total_pnl`: FIFA total/current PnL.
+- `total_pnl_roi`: FIFA total/current ROI.
+- `pnl_24h`: FIFA 24 hour PnL.
+- `pnl_roi_24h`: FIFA 24 hour ROI.
+- `traded_notional_24h`: FIFA 24 hour traded notional.
+- `win_rate_24h`: FIFA 24 hour token-position win rate.
+- `pnl_7d`: FIFA 7 day PnL.
+- `pnl_roi_7d`: FIFA 7 day ROI.
+- `win_rate_7d`: FIFA 7 day token-position win rate.
+- `win_rate`: FIFA total token-position win rate.
+
 ## Query Parameters
 
 | Name | Type | Default | Notes |
 | --- | --- | --- | --- |
 | `limit` | integer | `50` | Maximum `500`. |
 | `offset` | integer | `0` | Pagination offset. |
+| `user` | string | empty | Exact wallet address lookup. |
 | `q` | string | empty | Case-insensitive wallet address search. |
 | `min_notional_24h` | number | `0` | Minimum FIFA traded notional in the last 24h. |
 | `min_trades_24h` | integer | `0` | Minimum FIFA trade count in the last 24h. |
+| `active_24h` | boolean | `false` | When `true`, only return wallets with at least one FIFA trade in the last 24h. |
 | `data_quality` | string | empty | Filter by `estimate`, `missing_mark_price`, or `needs_chain_balance`. |
-| `sort` | string | `pnl_24h` | One of `pnl_24h`, `roi_24h`, `notional_24h`, `volume_24h`, `trades_24h`, `equity`, `last_trade`, `updated_at`. |
+| `sort` | string | `pnl_24h` | One of `pnl_24h`, `roi_24h`, `notional_24h`, `volume_24h`, `trades_24h`, `pnl_7d`, `roi_7d`, `win_rate`, `win_rate_24h`, `win_rate_7d`, `total_pnl`, `equity`, `last_trade`, `updated_at`. |
 | `direction` | string | `desc` | `desc` or `asc`. |
+
+For 24h sort fields (`pnl_24h`, `roi_24h`, `notional_24h`,
+`volume_24h`, `trades_24h`, `win_rate_24h`), list responses prioritize wallets
+with `trade_count_24h > 0` before inactive wallets. This prevents inactive zero
+PnL rows from hiding active losing wallets when sorting by `pnl_24h desc`.
+
+Only active 24h wallets:
+
+```text
+https://discovery.prophet.zone/api/wallets/fifa-24h-pnl?limit=50&sort=pnl_24h&direction=desc&active_24h=1
+```
 
 ## Response Shape
 
@@ -114,12 +158,20 @@ https://discovery.prophet.zone/api/wallets/fifa-24h-pnl?limit=50&sort=pnl_24h&di
   "offset": 0,
   "sort": "pnl_24h",
   "direction": "desc",
+  "active_24h": false,
   "summary": {
     "total": 1234,
+    "active_wallets_24h": 777,
+    "nonzero_pnl_wallets_24h": 654,
     "profitable_wallets": 321,
     "losing_wallets": 456,
     "traded_notional_24h": 987654.32,
     "pnl_24h": 12345.67,
+    "pnl_7d": 45678.9,
+    "total_pnl": 99999.0,
+    "avg_win_rate": 0.55,
+    "avg_win_rate_24h": 0.5,
+    "avg_win_rate_7d": 0.58,
     "updated_at": "2026-06-26 15:40:01.690"
   },
   "wallets": [
@@ -145,11 +197,27 @@ https://discovery.prophet.zone/api/wallets/fifa-24h-pnl?limit=50&sort=pnl_24h&di
       "open_position_count": 3,
       "open_position_value_now": 1800.0,
       "open_position_value_24h_ago": 900.0,
+      "open_position_value_7d_ago": 500.0,
       "equity_now": 2800.0,
       "equity_24h_ago": 2100.0,
+      "equity_7d_ago": 1200.0,
+      "total_pnl": 2800.0,
+      "total_pnl_roi": 0.7,
       "pnl_24h": 700.0,
       "pnl_base_24h": 1900.0,
       "pnl_roi_24h": 0.368421,
+      "pnl_7d": 1600.0,
+      "pnl_base_7d": 2500.0,
+      "pnl_roi_7d": 0.64,
+      "profitable_token_count": 10,
+      "losing_token_count": 5,
+      "win_rate": 0.666667,
+      "profitable_token_count_24h": 2,
+      "losing_token_count_24h": 2,
+      "win_rate_24h": 0.5,
+      "profitable_token_count_7d": 5,
+      "losing_token_count_7d": 2,
+      "win_rate_7d": 0.714286,
       "first_trade_at": "2026-06-12 01:00:00.000",
       "last_trade_at": "2026-06-26 15:20:00.000",
       "latest_action": "BUY",
@@ -159,8 +227,8 @@ https://discovery.prophet.zone/api/wallets/fifa-24h-pnl?limit=50&sort=pnl_24h&di
       "updated_at": "2026-06-26 15:40:01.690",
       "is_whale": true,
       "is_smart": false,
-      "total_pnl": 1234.0,
-      "pnl_roi": 0.12,
+      "all_site_total_pnl": 1234.0,
+      "all_site_pnl_roi": 0.12,
       "portfolio_value": 5000.0,
       "max_single_trade_notional": 100000.0
     }

@@ -388,6 +388,24 @@ def test_product_api_wallet_screener_smart_mode_uses_roi_definition() -> None:
     assert "screener.pnl_roi desc" in query
 
 
+def test_product_api_wallet_screener_candidate_mode_uses_looser_roi_definition() -> None:
+    fake = FakeClickHouse(
+        '{"user_address":"0xabc","wallet_segment":"candidate_smart",'
+        '"is_candidate_smart":true,"pnl_roi":0.2}\n'
+    )
+    api = ProductApi(clickhouse=fake)
+
+    response = api.handle("/wallets/screener", {"mode": ["candidate_smart"], "limit": ["5"]})
+
+    assert response.status == 200
+    assert response.body["wallets"][0]["wallet_segment"] == "candidate_smart"
+    query = fake.queries[0]
+    assert "screener.traded_notional >= 5000.0" in query
+    assert "screener.pnl_captured_at is not null" in query
+    assert "screener.pnl_roi >= 0.1" in query
+    assert "is_candidate_smart" in query
+
+
 def test_product_api_wallet_screener_filters_by_category_and_range() -> None:
     fake = FakeClickHouse("")
     api = ProductApi(clickhouse=fake)
@@ -410,7 +428,8 @@ def test_product_api_wallet_screener_fifa_scope_recomputes_segments() -> None:
     fake = FakeClickHouse(
         '{"scope":"fifa","user_address":"0xabc","traded_notional":1500000,'
         '"max_single_trade_notional":90000,"pnl_roi":0.62,"is_whale":true,'
-        '"is_smart":true,"whale_reason":"fifa_total_volume"}\n'
+        '"is_smart":true,"whale_reason":"fifa_total_volume",'
+        '"fifa_total_pnl":1200,"fifa_pnl_7d":300,"fifa_win_rate_7d":0.75}\n'
     )
     api = ProductApi(clickhouse=fake)
 
@@ -422,37 +441,174 @@ def test_product_api_wallet_screener_fifa_scope_recomputes_segments() -> None:
     assert response.status == 200
     assert response.body["wallets"][0]["scope"] == "fifa"
     assert response.body["wallets"][0]["is_smart"] is True
+    assert response.body["wallets"][0]["fifa_total_pnl"] == 1200
+    assert response.body["wallets"][0]["fifa_pnl_7d"] == 300
+    assert response.body["wallets"][0]["fifa_win_rate_7d"] == 0.75
     query = fake.queries[0]
     assert "mart_wallet_fifa_24h_pnl" in query
     assert "mart_fifa_trade" in query
     assert "fifa.buy_notional >= 10000.0" in query
     assert "fifa.data_quality = 'estimate'" in query
     assert "fifa.equity_now / fifa.buy_notional" in query
+    assert "fifa.total_pnl as fifa_total_pnl" in query
+    assert "fifa.pnl_7d as fifa_pnl_7d" in query
+    assert "fifa.win_rate_7d as fifa_win_rate_7d" in query
     assert "mart_wallet_screener" not in query
+
+
+def test_product_api_wallet_screener_fifa_1d_filters_to_24h_activity() -> None:
+    fake = FakeClickHouse('{"scope":"fifa","user_address":"0xabc","trade_count_24h":2}\n')
+    api = ProductApi(clickhouse=fake)
+
+    response = api.handle(
+        "/wallets/screener",
+        {"scope": ["fifa"], "mode": ["watch"], "range": ["1d"], "limit": ["5"]},
+    )
+
+    assert response.status == 200
+    assert response.body["wallets"][0]["trade_count_24h"] == 2
+    query = fake.queries[0]
+    assert "fifa.trade_count_24h > 0" in query
+    assert "order by fifa.traded_notional_24h desc" in query
+
+
+def test_product_api_wallet_screener_fifa_candidate_mode_is_wider_than_strict_smart() -> None:
+    fake = FakeClickHouse(
+        '{"scope":"fifa","user_address":"0xabc","wallet_segment":"candidate_smart",'
+        '"is_candidate_smart":true,"is_smart":false,"pnl_roi":0.2}\n'
+    )
+    api = ProductApi(clickhouse=fake)
+
+    response = api.handle(
+        "/wallets/screener",
+        {"scope": ["fifa"], "mode": ["candidate_smart"], "limit": ["5"]},
+    )
+
+    assert response.status == 200
+    assert response.body["wallets"][0]["wallet_segment"] == "candidate_smart"
+    query = fake.queries[0]
+    assert "fifa.buy_notional >= 1000.0" in query
+    assert "fifa.data_quality = 'estimate'" in query
+    assert "fifa.equity_now / fifa.buy_notional" in query
+    assert "is_candidate_smart" in query
+
+
+def test_product_api_wallet_screener_fifa_whale_includes_fifa_performance_fields() -> None:
+    fake = FakeClickHouse(
+        '{"scope":"fifa","user_address":"0xabc","wallet_segment":"whale",'
+        '"is_whale":true,"fifa_total_pnl":5000,"fifa_pnl_24h":100,'
+        '"fifa_pnl_7d":700,"fifa_win_rate":0.6,"fifa_win_rate_24h":0.5,'
+        '"fifa_win_rate_7d":0.75,"fifa_traded_notional_24h":1200}\n'
+    )
+    api = ProductApi(clickhouse=fake)
+
+    response = api.handle(
+        "/wallets/screener",
+        {"scope": ["fifa"], "mode": ["whale"], "limit": ["5"]},
+    )
+
+    assert response.status == 200
+    row = response.body["wallets"][0]
+    assert row["wallet_segment"] == "whale"
+    assert row["fifa_total_pnl"] == 5000
+    assert row["fifa_pnl_24h"] == 100
+    assert row["fifa_pnl_7d"] == 700
+    assert row["fifa_win_rate"] == 0.6
+    assert row["fifa_win_rate_24h"] == 0.5
+    assert row["fifa_win_rate_7d"] == 0.75
+    assert row["fifa_traded_notional_24h"] == 1200
+    query = fake.queries[0]
+    assert "fifa.traded_notional >= 1000000.0" in query
+    assert "fifa.total_pnl as fifa_total_pnl" in query
+    assert "fifa.pnl_24h as fifa_pnl_24h" in query
+    assert "fifa.pnl_7d as fifa_pnl_7d" in query
+    assert "fifa.win_rate as fifa_win_rate" in query
+    assert "fifa.win_rate_24h as fifa_win_rate_24h" in query
+    assert "fifa.win_rate_7d as fifa_win_rate_7d" in query
 
 
 def test_product_api_wallet_fifa_24h_pnl_reads_cached_mart() -> None:
     fake = FakeClickHouse(
         outputs=[
-            '{"user_address":"0xabc","pnl_24h":123.4,"traded_notional_24h":1000}\n',
-            '{"total":1,"profitable_wallets":1,"pnl_24h":123.4}\n',
+            '{"user_address":"0xabc0000000000000000000000000000000000000",'
+            '"total_pnl":500.0,"pnl_24h":123.4,"pnl_7d":456.7,'
+            '"win_rate":0.6,"win_rate_24h":0.5,"win_rate_7d":0.75,'
+            '"traded_notional_24h":1000}\n',
+            '{"total":1,"profitable_wallets":1,"pnl_24h":123.4,'
+            '"pnl_7d":456.7,"total_pnl":500.0}\n',
         ]
     )
     api = ProductApi(clickhouse=fake)
 
     response = api.handle(
         "/wallets/fifa-24h-pnl",
-        {"limit": ["5"], "min_notional_24h": ["100"], "sort": ["pnl_24h"]},
+        {
+            "limit": ["5"],
+            "min_notional_24h": ["100"],
+            "sort": ["pnl_24h"],
+            "user": ["0xabc0000000000000000000000000000000000000"],
+        },
     )
 
     assert response.status == 200
     assert response.body["scope"] == "fifa"
-    assert response.body["wallets"][0]["user_address"] == "0xabc"
+    assert response.body["wallets"][0]["user_address"] == "0xabc0000000000000000000000000000000000000"
+    assert response.body["wallets"][0]["total_pnl"] == 500.0
+    assert response.body["wallets"][0]["pnl_7d"] == 456.7
+    assert response.body["wallets"][0]["win_rate_7d"] == 0.75
     query = fake.queries[0]
     assert "mart_wallet_fifa_24h_pnl" in query
     assert "fifa.traded_notional_24h >= 100.0" in query
+    assert "fifa.user_address = '0xabc0000000000000000000000000000000000000'" in query
+    assert "fifa.total_pnl as total_pnl" in query
+    assert "fifa.pnl_7d as pnl_7d" in query
+    assert "fifa.win_rate_7d as win_rate_7d" in query
     assert "order by fifa.pnl_24h desc" in query
     assert "summary" in response.body
+
+
+def test_product_api_wallet_fifa_24h_pnl_prioritizes_active_wallets_for_24h_sort() -> None:
+    fake = FakeClickHouse(
+        outputs=[
+            '{"user_address":"0xactive","trade_count_24h":3,"pnl_24h":-100.0}\n',
+            '{"total":2,"active_wallets_24h":1,"nonzero_pnl_wallets_24h":1,'
+            '"profitable_wallets":0,"losing_wallets":1,"pnl_24h":-100.0}\n',
+        ]
+    )
+    api = ProductApi(clickhouse=fake)
+
+    response = api.handle(
+        "/wallets/fifa-24h-pnl",
+        {"limit": ["5"], "sort": ["pnl_24h"], "direction": ["desc"]},
+    )
+
+    assert response.status == 200
+    assert response.body["active_24h"] is False
+    assert response.body["summary"]["active_wallets_24h"] == 1
+    query = fake.queries[0]
+    assert "order by fifa.trade_count_24h > 0 desc, fifa.pnl_24h desc" in query
+
+
+def test_product_api_wallet_fifa_24h_pnl_can_filter_to_active_wallets() -> None:
+    fake = FakeClickHouse(
+        outputs=[
+            '{"user_address":"0xactive","trade_count_24h":3,"pnl_24h":-100.0}\n',
+            '{"total":1,"active_wallets_24h":1,"nonzero_pnl_wallets_24h":1,'
+            '"profitable_wallets":0,"losing_wallets":1,"pnl_24h":-100.0}\n',
+        ]
+    )
+    api = ProductApi(clickhouse=fake)
+
+    response = api.handle(
+        "/wallets/fifa-24h-pnl",
+        {"limit": ["5"], "active_24h": ["1"]},
+    )
+
+    assert response.status == 200
+    assert response.body["active_24h"] is True
+    query = fake.queries[0]
+    assert "fifa.trade_count_24h > 0" in query
+    assert "order by fifa.trade_count_24h > 0 desc" not in query
 
 
 def test_product_api_polycop_wallet_signals_reads_cache_and_filters() -> None:
@@ -506,6 +662,126 @@ def test_product_api_polycop_wallet_signals_reads_cache_and_filters() -> None:
     assert response.body["total"] == 1
     assert response.body["wallets"][0]["user_name"] == "steady"
     assert response.body["cache"]["hit"] is True
+
+
+def test_product_api_polycop_fifa_signals_intersects_polycop_cache_with_fifa_mart() -> None:
+    class FakePolycopCacheStore:
+        def get(self, *, max_age_seconds=None):
+            return {
+                "cache_key": "latest",
+                "status": "ok",
+                "source": "polycop",
+                "refreshed_at": "2026-06-22T00:00:00+00:00",
+                "generated_at": "2026-06-22T00:00:00+00:00",
+                "age_seconds": 3.0,
+                "trigger_reason": "scheduled",
+                "error": None,
+                "parameters": {"page_size": 15},
+                "summary": {"wallet_count": 2},
+                "detail": {
+                    "wallets": [],
+                    "segments": {
+                        "ai_top": [
+                            {
+                                "rank": 1,
+                                "address": "0x1111111111111111111111111111111111111111",
+                                "user_name": "steady",
+                                "ai_score": 88.5,
+                                "source_score": 99.0,
+                                "segments": ["stable"],
+                                "primary_segment": "stable",
+                                "metrics": {"actual_total_pnl": 50000},
+                            },
+                            {
+                                "rank": 2,
+                                "address": "0x2222222222222222222222222222222222222222",
+                                "user_name": "nofifa",
+                                "ai_score": 80.0,
+                                "segments": ["watch"],
+                                "primary_segment": "watch",
+                            },
+                        ],
+                    },
+                },
+            }
+
+    fake = FakeClickHouse(
+        '{"user_address":"0x1111111111111111111111111111111111111111",'
+        '"fifa_traded_notional":12000,"fifa_total_pnl":2400,'
+        '"fifa_trade_count_24h":2,"fifa_pnl_24h":100,'
+        '"fifa_pnl_7d":700,"fifa_win_rate":0.6,"fifa_win_rate_7d":0.75,'
+        '"fifa_equity_now":2400,"fifa_pnl_roi":0.4,"fifa_data_quality":"estimate"}\n'
+    )
+    api = ProductApi(clickhouse=fake)
+    api._polycop_wallet_signal_cache_store = FakePolycopCacheStore()
+
+    response = api.handle(
+        "/wallets/polycop-fifa-signals",
+        {"limit": ["100"], "min_fifa_notional": ["1000"]},
+    )
+
+    assert response.status == 200
+    assert response.body["source"] == "polycop_fifa"
+    assert response.body["summary"]["polycop_wallet_count"] == 2
+    assert response.body["summary"]["fifa_wallet_count"] == 1
+    assert response.body["summary"]["active_wallets_24h"] == 1
+    assert response.body["wallets"][0]["user_name"] == "steady"
+    assert response.body["wallets"][0]["fifa_traded_notional"] == 12000
+    assert response.body["wallets"][0]["fifa_trade_count_24h"] == 2
+    assert response.body["wallets"][0]["fifa_pnl_24h"] == 100
+    assert response.body["wallets"][0]["fifa_total_pnl"] == 2400
+    assert response.body["wallets"][0]["fifa_pnl_7d"] == 700
+    assert response.body["wallets"][0]["fifa_win_rate_7d"] == 0.75
+    assert "fifa" not in response.body["wallets"][0]
+    query = fake.queries[0]
+    assert "mart_wallet_fifa_24h_pnl" in query
+    assert "mart_fifa_trade" in query
+    assert "fifa.traded_notional >= 1000.0" in query
+    assert "fifa.trade_count_24h as fifa_trade_count_24h" in query
+    assert "fifa.total_pnl as fifa_total_pnl" in query
+    assert "fifa.pnl_7d as fifa_pnl_7d" in query
+    assert "fifa.win_rate_7d as fifa_win_rate_7d" in query
+    assert "0x1111111111111111111111111111111111111111" in query
+
+
+def test_product_api_polycop_fifa_signals_can_filter_to_24h_activity() -> None:
+    class FakePolycopCacheStore:
+        def get(self, *, max_age_seconds=None):
+            return {
+                "cache_key": "latest",
+                "status": "ok",
+                "source": "polycop",
+                "detail": {
+                    "segments": {
+                        "ai_top": [
+                            {
+                                "rank": 1,
+                                "address": "0x1111111111111111111111111111111111111111",
+                                "user_name": "steady",
+                                "ai_score": 88.5,
+                            },
+                        ],
+                    },
+                },
+            }
+
+    fake = FakeClickHouse(
+        '{"user_address":"0x1111111111111111111111111111111111111111",'
+        '"fifa_trade_count_24h":3,"fifa_pnl_24h":50,'
+        '"fifa_traded_notional":12000,"fifa_equity_now":2400}\n'
+    )
+    api = ProductApi(clickhouse=fake)
+    api._polycop_wallet_signal_cache_store = FakePolycopCacheStore()
+
+    response = api.handle(
+        "/wallets/polycop-fifa-signals",
+        {"limit": ["10"], "active_24h": ["1"]},
+    )
+
+    assert response.status == 200
+    assert response.body["parameters"]["active_24h"] is True
+    query = fake.queries[0]
+    assert "fifa.trade_count_24h > 0" in query
 
 
 def test_product_api_wallet_detail_returns_portfolio_pnl_and_activity() -> None:
@@ -1257,7 +1533,8 @@ def worldcup_positive_wallet_outputs() -> list[str]:
 def test_product_api_wallet_summary_counts_screened_wallets() -> None:
     fake = FakeClickHouse(
         '{"total_wallets":2191819,"wallets_over_10k":94792,'
-        '"smart_wallets":3219,"whale_wallets":2242}\n'
+        '"smart_wallets":3219,"candidate_smart_wallets":12000,'
+        '"whale_wallets":2242,"watch_wallets":18000}\n'
     )
     api = ProductApi(clickhouse=fake)
 
@@ -1266,16 +1543,21 @@ def test_product_api_wallet_summary_counts_screened_wallets() -> None:
     assert response.status == 200
     assert response.body["summary"]["total_wallets"] == 2191819
     assert response.body["summary"]["smart_wallets"] == 3219
+    assert response.body["summary"]["candidate_smart_wallets"] == 12000
     query = fake.queries[0]
     assert "mart_wallet_screener final" in query
-    assert "traded_notional >= 10000.0" in query
-    assert "pnl_roi >= 0.55" in query
-    assert "max_single_trade_notional >= 100000.0" in query
+    assert "screener.traded_notional >= 10000.0" in query
+    assert "screener.pnl_roi >= 0.55" in query
+    assert "screener.traded_notional >= 5000.0" in query
+    assert "candidate_smart_wallets" in query
+    assert "watch_wallets" in query
+    assert "screener.max_single_trade_notional >= 100000.0" in query
 
 
 def test_product_api_wallet_summary_fifa_scope_counts_fifa_segments() -> None:
     fake = FakeClickHouse(
-        '{"scope":"fifa","total_wallets":100,"smart_wallets":7,"whale_wallets":2,'
+        '{"scope":"fifa","total_wallets":100,"smart_wallets":7,'
+        '"candidate_smart_wallets":25,"whale_wallets":2,"watch_wallets":40,'
         '"traded_notional":12345.6}\n'
     )
     api = ProductApi(clickhouse=fake)
@@ -1285,11 +1567,15 @@ def test_product_api_wallet_summary_fifa_scope_counts_fifa_segments() -> None:
     assert response.status == 200
     assert response.body["summary"]["scope"] == "fifa"
     assert response.body["summary"]["smart_wallets"] == 7
+    assert response.body["summary"]["candidate_smart_wallets"] == 25
     query = fake.queries[0]
     assert "mart_wallet_fifa_24h_pnl" in query
     assert "mart_fifa_trade" in query
     assert "fifa.buy_notional >= 10000.0" in query
+    assert "fifa.buy_notional >= 1000.0" in query
     assert "fifa.data_quality = 'estimate'" in query
+    assert "candidate_smart_wallets" in query
+    assert "watch_wallets" in query
     assert "max_single_trade_notional" in query
     assert "mart_wallet_screener" not in query
 
