@@ -1079,6 +1079,97 @@ def test_product_api_wallet_detail_live_uses_polymarket_wallet_apis(monkeypatch)
     assert "mart_wallet_reputation" in fake.queries[0]
 
 
+def test_product_api_wallet_detail_live_realtime_uses_rtds_and_cache(monkeypatch) -> None:
+    def page(items):
+        return SimpleNamespace(response=SimpleNamespace(body=items, url="https://example.test"), items=items)
+
+    calls = {"positions": 0, "value": 0, "pnl": 0, "activity": 0}
+
+    class FakePolymarketClient:
+        def __init__(self, settings) -> None:
+            self.settings = settings
+
+        def data_positions(self, *, user):
+            calls["positions"] += 1
+            return page(
+                [
+                    {
+                        "proxyWallet": user,
+                        "asset": "asset-1",
+                        "conditionId": "c1",
+                        "title": "Will Belgium win?",
+                        "slug": "fifwc-bel-egy-win",
+                        "eventSlug": "fifwc-bel-egy",
+                        "outcome": "Yes",
+                        "size": 100,
+                        "avgPrice": 0.5,
+                        "curPrice": 0.7,
+                        "initialValue": 50,
+                        "currentValue": 70,
+                        "cashPnl": 20,
+                    }
+                ]
+            )
+
+        def data_value(self, *, user):
+            calls["value"] += 1
+            return page([{"user": user, "value": 70}])
+
+        def user_pnl(self, *, user, interval, fidelity):
+            calls["pnl"] += 1
+            return page([{"t": 1781481600, "p": -636.8}, {"t": 1781568000, "p": -500.0}])
+
+        def data_activity(self, *, user, limit, offset):
+            calls["activity"] += 1
+            raise AssertionError("realtime live detail should use RTDS activity cache")
+
+    def rtds_rows(_self, user, _captured_at, *, limit=500):
+        return [
+            {
+                "timestamp": "2026-06-15 20:00:00.000",
+                "activity_type": "TRADE",
+                "side": "BUY",
+                "price": 0.5,
+                "size": 10,
+                "notional": 5,
+                "condition_id": "c1",
+                "token_id": "asset-1",
+                "transaction_hash": "0xrtds",
+                "title": "RTDS trade",
+                "slug": "rtds-trade",
+                "event_slug": "event-rtds",
+                "outcome": "Yes",
+                "user_address": user,
+                "source": "polymarket-rtds",
+            }
+        ]
+
+    monkeypatch.setattr("zetta.api.PolymarketClient", FakePolymarketClient)
+    monkeypatch.setattr(ProductApi, "live_pusd_balance", lambda _self, _user: 12.5)
+    monkeypatch.setattr(ProductApi, "wallet_rtds_activity_rows", rtds_rows)
+    fake = FakeClickHouse(outputs=[""])
+    api = ProductApi(clickhouse=fake, settings=Settings())
+
+    query = {
+        "user": ["0xABC"],
+        "live": ["1"],
+        "realtime": ["1"],
+        "activity_limit": ["20"],
+    }
+    first = api.handle("/wallets/detail", query)
+    second = api.handle("/wallets/detail", query)
+
+    assert first.status == 200
+    assert second.status == 200
+    assert first.body["wallet"]["data_source"] == "live"
+    assert first.body["recent_activity"][0]["source"] == "polymarket-rtds"
+    assert first.body["recent_activity"][0]["transaction_hash"] == "0xrtds"
+    assert calls["activity"] == 0
+    assert calls["positions"] == 1
+    assert calls["value"] == 1
+    assert calls["pnl"] == 1
+
+
 def test_product_api_wallet_detail_realtime_uses_rtds_wallet_cache(tmp_path) -> None:
     user = "0xabc"
     cache_path = tmp_path / "official_trade_feed" / "wallets" / f"{user}.json"

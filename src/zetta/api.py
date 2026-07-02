@@ -55,7 +55,10 @@ class ProductApi:
         self._market_search_cache: dict[tuple[str, str, int], tuple[float, list[dict[str, Any]]]] = {}
         self._live_trades_cache: dict[tuple[Any, ...], tuple[float, dict[str, Any]]] = {}
         self._unusual_betting_cache: dict[tuple[Any, ...], tuple[float, dict[str, Any]]] = {}
+        self._wallet_detail_cache: dict[tuple[Any, ...], tuple[float, dict[str, Any]]] = {}
+        self._wallet_detail_locks: dict[tuple[Any, ...], Lock] = {}
         self._live_trades_lock = Lock()
+        self._wallet_detail_cache_lock = Lock()
         self._unusual_betting_cache_store: UnusualBettingCacheStore | None = (
             UnusualBettingCacheStore(dsn=settings.postgres_dsn) if settings is not None else None
         )
@@ -4106,19 +4109,35 @@ class ProductApi:
                 position_sort=position_sort,
             )
 
+        realtime = truthy_param(query, "realtime")
         if truthy_param(query, "live"):
-            live_detail = self.wallet_detail_live(
+            cache_key = (
+                "wallet_detail_live",
                 user,
-                position_limit=position_limit,
-                activity_limit=activity_limit,
-                pnl_points_limit=pnl_points_limit,
-                position_scope=position_scope,
-                position_sort=position_sort,
+                position_limit,
+                activity_limit,
+                pnl_points_limit,
+                position_scope,
+                position_sort,
+                realtime,
+            )
+            live_detail = self.cached_wallet_detail(
+                cache_key,
+                ttl_seconds=5.0 if realtime else 10.0,
+                builder=lambda: self.wallet_detail_live(
+                    user,
+                    position_limit=position_limit,
+                    activity_limit=activity_limit,
+                    pnl_points_limit=pnl_points_limit,
+                    position_scope=position_scope,
+                    position_sort=position_sort,
+                    use_realtime_activity=realtime,
+                ),
             )
             if live_detail is not None:
                 return live_detail
 
-        if truthy_param(query, "realtime"):
+        if realtime:
             return self.wallet_detail_realtime(
                 user,
                 position_limit=position_limit,
@@ -4161,6 +4180,41 @@ class ProductApi:
             data_scope="all",
         )
         return detail
+
+    def cached_wallet_detail(
+        self,
+        cache_key: tuple[Any, ...],
+        *,
+        ttl_seconds: float,
+        builder: Any,
+    ) -> dict[str, Any] | None:
+        now = time.monotonic()
+        with self._wallet_detail_cache_lock:
+            cached = self._wallet_detail_cache.get(cache_key)
+            if cached is not None and now - cached[0] <= ttl_seconds:
+                return cached[1]
+            lock = self._wallet_detail_locks.get(cache_key)
+            if lock is None:
+                lock = Lock()
+                self._wallet_detail_locks[cache_key] = lock
+
+        with lock:
+            now = time.monotonic()
+            with self._wallet_detail_cache_lock:
+                cached = self._wallet_detail_cache.get(cache_key)
+                if cached is not None and now - cached[0] <= ttl_seconds:
+                    return cached[1]
+            detail = builder()
+            if detail is not None:
+                with self._wallet_detail_cache_lock:
+                    self._wallet_detail_cache[cache_key] = (time.monotonic(), detail)
+                    if len(self._wallet_detail_cache) > 512:
+                        oldest_key = min(
+                            self._wallet_detail_cache,
+                            key=lambda key: self._wallet_detail_cache[key][0],
+                        )
+                        self._wallet_detail_cache.pop(oldest_key, None)
+            return detail
 
     def wallet_detail_fifa(
         self,
@@ -4280,6 +4334,7 @@ class ProductApi:
         pnl_points_limit: int,
         position_scope: str,
         position_sort: str,
+        use_realtime_activity: bool = False,
     ) -> dict[str, Any] | None:
         if self.settings is None:
             return None
@@ -4290,17 +4345,21 @@ class ProductApi:
                 positions_future = executor.submit(client.data_positions, user=user)
                 value_future = executor.submit(client.data_value, user=user)
                 pnl_future = executor.submit(client.user_pnl, user=user, interval="all", fidelity="1h")
-                activity_future = executor.submit(
-                    client.data_activity,
-                    user=user,
-                    limit=live_activity_limit,
-                    offset=0,
+                activity_future = (
+                    None
+                    if use_realtime_activity
+                    else executor.submit(
+                        client.data_activity,
+                        user=user,
+                        limit=live_activity_limit,
+                        offset=0,
+                    )
                 )
                 balance_future = executor.submit(self.live_pusd_balance, user)
                 positions_page = positions_future.result()
                 value_page = value_future.result()
                 pnl_page = pnl_future.result()
-                activity_page = activity_future.result()
+                activity_items = activity_future.result().items if activity_future is not None else []
                 available_balance = balance_future.result()
         except Exception:
             return None
@@ -4323,14 +4382,18 @@ class ProductApi:
             {"user": user, "points": pnl_points_payload},
             captured_at,
         )
-        live_activity_rows = activity_rows(activity_page.items, captured_at)
+        live_activity_rows = activity_rows(activity_items, captured_at)
         live_activity_rows = [
             {**row, "user_address": str(row.get("user_address") or user).lower()}
             for row in live_activity_rows
         ]
         live_activity_rows = merge_wallet_rtds_activity_rows(
             live_activity_rows,
-            self.wallet_rtds_activity_rows(user, captured_at),
+            self.wallet_rtds_activity_rows(
+                user,
+                captured_at,
+                limit=max(activity_limit, 100) if use_realtime_activity else 500,
+            ),
         )
         live_activity_rows = dedupe_wallet_activity_rows(live_activity_rows)
 
@@ -5512,7 +5575,10 @@ def serve_api(*, settings: Settings, host: str, port: int) -> None:
             self.send_header("Access-Control-Allow-Origin", "*")
             self.send_header("Content-Length", str(len(encoded)))
             self.end_headers()
-            self.wfile.write(encoded)
+            try:
+                self.wfile.write(encoded)
+            except BrokenPipeError:
+                return
 
         def read_json_body(self) -> dict[str, Any]:
             length = int(self.headers.get("Content-Length") or "0")
