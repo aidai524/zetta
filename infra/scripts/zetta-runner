@@ -8,6 +8,8 @@ source /etc/zetta/zetta.env
 cd "$ZETTA_HOME"
 
 COMMON_ARGS=(
+  --env "${ZETTA_ENV:-stg}"
+  --serving-mode "${ZETTA_SERVING_MODE:-compute}"
   --postgres-dsn "$ZETTA_POSTGRES_DSN"
   --clickhouse-host "$ZETTA_CLICKHOUSE_HOST"
   --clickhouse-port "$ZETTA_CLICKHOUSE_PORT"
@@ -17,9 +19,22 @@ COMMON_ARGS=(
   --polygon-rpc-url "$ZETTA_POLYGON_RPC_URL"
   --raw-data-dir "$ZETTA_RAW_DIR"
   --state-dir "$ZETTA_STATE_DIR"
+  --publish-data-dir "${ZETTA_PUBLISH_DATA_DIR:-/var/lib/zetta/publish}"
   --raw-chunk-records "${ZETTA_RAW_CHUNK_RECORDS:-1}"
   --raw-chunk-seconds "${ZETTA_RAW_CHUNK_SECONDS:-60}"
 )
+
+if [[ "${ZETTA_DISABLE_HEAVY_JOBS:-0}" =~ ^(1|true|yes|on)$ ]]; then
+  COMMON_ARGS+=(--disable-heavy-jobs)
+else
+  COMMON_ARGS+=(--no-disable-heavy-jobs)
+fi
+
+if [[ "${ZETTA_ENABLE_CLICKHOUSE_HEAVY_QUERIES:-1}" =~ ^(1|true|yes|on)$ ]]; then
+  COMMON_ARGS+=(--enable-clickhouse-heavy-queries)
+else
+  COMMON_ARGS+=(--no-enable-clickhouse-heavy-queries)
+fi
 
 if [[ -n "${ZETTA_HTTP_RESOLVE_OVERRIDES:-}" ]]; then
   COMMON_ARGS+=(--http-resolve-overrides "$ZETTA_HTTP_RESOLVE_OVERRIDES")

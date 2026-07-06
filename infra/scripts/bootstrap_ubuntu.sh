@@ -43,7 +43,10 @@ rsync -a --delete \
   "$SOURCE_DIR/" "$ZETTA_HOME/"
 chown -R "$ZETTA_USER:$ZETTA_GROUP" "$ZETTA_HOME"
 
-install -d -o "$ZETTA_USER" -g "$ZETTA_GROUP" /var/lib/zetta/raw /var/lib/zetta/state
+install -d -o "$ZETTA_USER" -g "$ZETTA_GROUP" \
+  /var/lib/zetta/raw \
+  /var/lib/zetta/state \
+  /var/lib/zetta/publish
 install -d -m 0755 /etc/zetta
 if [[ ! -f /etc/zetta/zetta.env ]]; then
   install -m 0640 -o root -g "$ZETTA_GROUP" "$ZETTA_HOME/infra/systemd/zetta.env.example" /etc/zetta/zetta.env
