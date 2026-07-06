@@ -74,9 +74,10 @@ net_cashflow_up_to_cutoff + positive_position_size_up_to_cutoff * mark_price_at_
 The current implementation uses deduplicated Data API trades and marks open
 positions from:
 
-- resolved final price, when the market is closed and outcome prices are present
+- Gamma `outcomePrices`, including active markets when current prices are present
 - latest orderbook mid, when available
 - latest CLOB price history, as fallback
+- latest FIFA trade price, as last fallback
 
 Negative token balances are flagged as `needs_chain_balance` because Data API
 trades alone can miss chain-level split/merge/redeem balance effects.
@@ -230,11 +231,18 @@ https://discovery.prophet.zone/api/wallets/fifa-24h-pnl?limit=50&sort=pnl_24h&di
       "all_site_total_pnl": 1234.0,
       "all_site_pnl_roi": 0.12,
       "portfolio_value": 5000.0,
-      "max_single_trade_notional": 100000.0
+      "max_single_trade_notional": 100000.0,
+      "all_site_max_single_trade_notional": 150000.0
     }
   ]
 }
 ```
+
+In this endpoint, `total_pnl`, `pnl_24h`, `pnl_7d`,
+`max_single_trade_notional`, and win-rate fields are FIFA scoped.
+`all_site_total_pnl`, `all_site_pnl_roi`, `portfolio_value`, and
+`all_site_max_single_trade_notional` come from the whole-site wallet screener and
+are included only for comparison/display.
 
 ## Data Quality
 
@@ -342,6 +350,12 @@ Important distinction:
 - With `scope=fifa`, `is_smart` and `is_whale` are recomputed from FIFA-only
   trades and FIFA-only PnL. A wallet can be a whole-site whale but not a FIFA
   whale, or the reverse.
+- In `/api/wallets/screener?scope=fifa`, `fifa_total_pnl`, `fifa_pnl_24h`,
+  `fifa_pnl_7d`, `fifa_win_rate`, and `fifa_traded_notional` are the FIFA-only
+  fields. `total_pnl`, `all_site_total_pnl`, `portfolio_value`, and
+  `available_balance` keep the whole-site snapshot meaning when such a snapshot
+  exists. `total_pnl_scope` tells whether `total_pnl` came from
+  `all_site_snapshot`, `all_site_screener`, or `fifa_fallback`.
 - FIFA smart excludes `missing_mark_price` and `needs_chain_balance` rows by
   default because those rows can have incomplete mark or balance data. FIFA whale
   is still based on volume and keeps the data quality flag for display.

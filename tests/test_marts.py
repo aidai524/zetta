@@ -111,6 +111,8 @@ def test_build_wallet_fifa_24h_pnl_uses_equity_delta_scope() -> None:
     assert "equity_now - equity_7d_ago as pnl_7d" in joined_sql
     assert "win_rate_7d" in joined_sql
     assert "mart_wallet_fifa_chain_cashflow final" in joined_sql
+    assert "trade_marks.trade_price_now" in joined_sql
+    assert "from mart_fifa_trade final" in joined_sql
     assert "countIf(token_pnl_now > 0.000001) as profitable_token_count" in joined_sql
     assert "position_size_24h_ago" in joined_sql
     assert "position_size_7d_ago" in joined_sql
@@ -139,8 +141,18 @@ def test_build_fifa_trades_uses_time_indexed_fact_trade_cache() -> None:
 
     assert result.mart == "fifa_trade"
     joined_sql = "\n".join(fake.executed)
-    assert "insert into mart_fifa_trade" in joined_sql
+    assert "insert into mart_fifa_chain_trade" in joined_sql
+    assert "create table if not exists mart_fifa_trade_next as mart_fifa_trade" in joined_sql
+    assert "insert into mart_fifa_trade_next" in joined_sql
+    assert "exchange tables mart_fifa_trade and mart_fifa_trade_next" in joined_sql
+    assert "truncate table mart_fifa_trade_by_user_next" in joined_sql
+    assert "insert into mart_fifa_trade_by_user_next" in joined_sql
+    assert "exchange tables mart_fifa_trade_by_user and mart_fifa_trade_by_user_next" in joined_sql
     assert "from fact_trade_by_time" in joined_sql
+    assert "from mart_fifa_chain_trade" in joined_sql
+    assert "from fact_exchange_fill as fills" in joined_sql
+    assert "lower(fills.maker) != '0x0000000000000000000000000000000000000000'" in joined_sql
+    assert "'tx:', fills.transaction_hash" in joined_sql
     assert "startsWith(markets.slug, 'fifwc-')" in joined_sql
     assert "existing_max" in joined_sql
     assert "round(price, 12)" in joined_sql
@@ -148,6 +160,29 @@ def test_build_fifa_trades_uses_time_indexed_fact_trade_cache() -> None:
     assert "raw_market_slug" in joined_sql
     assert "JSONExtractString(JSONExtractRaw(raw_json, 'trade'), 'market_slug')" in joined_sql
     assert "condition_id in (select condition_id from fifa_markets)" in joined_sql
+
+
+def test_build_fifa_chain_trades_builds_maker_side_supplement() -> None:
+    fake = FakeClickHouse()
+
+    result = MartBuilder(clickhouse=fake).build_fifa_chain_trades(
+        from_block=100,
+        to_block=200,
+    )
+
+    assert result.mart == "fifa_chain_trade"
+    joined_sql = "\n".join(fake.executed)
+    assert "create table if not exists mart_fifa_chain_trade" in joined_sql
+    assert "insert into mart_fifa_chain_trade" in joined_sql
+    assert "fills.block_number >= 100 and fills.block_number <= 200" in joined_sql
+    assert "from fact_exchange_fill as fills" in joined_sql
+    assert "lower(fills.maker) as user_address" in joined_sql
+    assert "0xe111180000d2663c0091e4f400237545b87b996b" in joined_sql
+    assert "0xe2222d279d744050d28e00520010520000310f59" in joined_sql
+    assert "fills.token_id in (select token_id from fifa_tokens)" in joined_sql
+    assert "blockTimestamp" in joined_sql
+    assert "fromUnixTimestamp64Milli" in joined_sql
+    assert "inner join fifa_tokens as tokens on fills.token_id = tokens.token_id" in joined_sql
 
 
 def test_build_event_anomaly_signals_are_evidence_signals() -> None:

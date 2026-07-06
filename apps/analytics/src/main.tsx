@@ -258,6 +258,10 @@ type SmartWallet = {
   losing_event_count?: number;
   active_unrealized_pnl_estimate?: number;
   favorite_category?: string;
+  scope?: string;
+  all_site_total_pnl?: number | null;
+  all_site_pnl_roi?: number | null;
+  total_pnl_scope?: string | null;
   fifa_total_pnl?: number | null;
   fifa_total_pnl_roi?: number | null;
   fifa_pnl_24h?: number | null;
@@ -1863,18 +1867,22 @@ function SmartTable({ rows }: { rows: SmartWallet[] }) {
         </colgroup>
         <thead><tr><th>#</th><th>钱包</th><th className="sortable">总盈亏</th><th className="sortable">胜率 / 平均投注</th><th className="sortable">现金</th><th className="sortable">交易量 / 交易次数</th><th>最后活跃</th><th className="right">操作</th></tr></thead>
         <tbody>
-          {rows.map((row, index) => (
-            <tr key={row.user_address}>
-              <td>{medal(index + 1)}</td>
-              <td><button className="smart-wallet" type="button" onClick={() => navigateAddress(row.user_address)}>{walletBadgeColor(index, "large-ish")}<div><div className="smart-name">{shortAddress(row.user_address)} <WalletSegmentPill row={row} /></div><div className="wallet-meta">{walletAge(row.first_trade_at)} | {shortAddress(row.user_address)} <Copy size={12} /></div></div></button></td>
-              <td><div className="cell-stack"><strong className={tone(row.total_pnl)}>{formatSignedCurrency(row.total_pnl)}</strong><span className={tone(row.pnl_roi)}>{formatRatioPercent(row.pnl_roi)}</span></div></td>
-              <td><div className="cell-stack"><strong>{formatRatioPercent(row.win_rate)}</strong><span className="small-muted">{formatCurrency(avgTrade(row))}</span></div></td>
-              <td><span className="currency"><span className="money-icon" /><strong className="value-main">{formatCurrency(row.available_balance ?? row.portfolio_value)}</strong></span></td>
-              <td><div className="cell-stack"><strong>{formatCurrency(row.traded_notional)}</strong><span className="small-muted">{formatCount(row.trade_count)} ( <span className="positive">{formatCount(row.buy_count)}</span> / <span className="negative">{formatCount(row.sell_count)}</span>)</span></div></td>
-              <td><span className="small-muted">{formatRelativeTime(row.last_trade_at || row.updated_at)}</span></td>
-              <td className="right"><button className="external" type="button" onClick={() => navigateAddress(row.user_address)}><ExternalLink size={15} /></button></td>
-            </tr>
-          ))}
+          {rows.map((row, index) => {
+            const pnlValue = smartWalletPnl(row);
+            const roiValue = smartWalletRoi(row);
+            return (
+              <tr key={row.user_address}>
+                <td>{medal(index + 1)}</td>
+                <td><button className="smart-wallet" type="button" onClick={() => navigateAddress(row.user_address)}>{walletBadgeColor(index, "large-ish")}<div><div className="smart-name">{shortAddress(row.user_address)} <WalletSegmentPill row={row} /></div><div className="wallet-meta">{walletAge(row.first_trade_at)} | {shortAddress(row.user_address)} <Copy size={12} /></div></div></button></td>
+                <td><div className="cell-stack"><strong className={tone(pnlValue)}>{formatSignedCurrency(pnlValue)}</strong><span className={tone(roiValue)}>{formatRatioPercent(roiValue)}</span></div></td>
+                <td><div className="cell-stack"><strong>{formatRatioPercent(row.scope === "fifa" ? row.fifa_win_rate : row.win_rate)}</strong><span className="small-muted">{formatCurrency(avgTrade(row))}</span></div></td>
+                <td><span className="currency"><span className="money-icon" /><strong className="value-main">{formatCurrency(row.available_balance ?? row.portfolio_value)}</strong></span></td>
+                <td><div className="cell-stack"><strong>{formatCurrency(row.traded_notional)}</strong><span className="small-muted">{formatCount(row.trade_count)} ( <span className="positive">{formatCount(row.buy_count)}</span> / <span className="negative">{formatCount(row.sell_count)}</span>)</span></div></td>
+                <td><span className="small-muted">{formatRelativeTime(row.last_trade_at || row.updated_at)}</span></td>
+                <td className="right"><button className="external" type="button" onClick={() => navigateAddress(row.user_address)}><ExternalLink size={15} /></button></td>
+              </tr>
+            );
+          })}
           {!rows.length ? <tr><td colSpan={8}><div className="empty-state">暂无聪明钱数据。</div></td></tr> : null}
         </tbody>
       </table>
@@ -2513,6 +2521,14 @@ function avgTrade(row: SmartWallet) {
   const notional = Number(row.traded_notional || 0);
   const count = Number(row.trade_count || 0);
   return count > 0 ? notional / count : null;
+}
+
+function smartWalletPnl(row: SmartWallet) {
+  return row.scope === "fifa" ? firstNumber(row.fifa_total_pnl, row.total_pnl) : row.total_pnl;
+}
+
+function smartWalletRoi(row: SmartWallet) {
+  return row.scope === "fifa" ? firstNumber(row.fifa_total_pnl_roi, row.pnl_roi) : row.pnl_roi;
 }
 
 function unusualWalletRows(rows: UnusualWallet[], largeThreshold: number) {

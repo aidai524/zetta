@@ -786,6 +786,15 @@ def build_parser() -> argparse.ArgumentParser:
     fifa_trades.add_argument("--window-hours", type=int, default=72)
     fifa_trades.set_defaults(func=cmd_build_fifa_trades)
 
+    fifa_chain_trades = build_subparsers.add_parser(
+        "fifa-chain-trades", help="Build FIFA scoped maker-side chain fill trade supplement."
+    )
+    fifa_chain_trades.add_argument("--from-block", type=int, default=None)
+    fifa_chain_trades.add_argument("--to-block", type=int, default=None)
+    fifa_chain_trades.add_argument("--bootstrap-blocks", type=int, default=5_000)
+    fifa_chain_trades.add_argument("--force", action="store_true")
+    fifa_chain_trades.set_defaults(func=cmd_build_fifa_chain_trades)
+
     event_anomaly_signals = build_subparsers.add_parser(
         "event-anomaly-signals", help="Build event anomaly signal mart."
     )
@@ -2997,6 +3006,15 @@ def cmd_build_wallet_fifa_chain_cashflow(args: argparse.Namespace, app_settings:
 def cmd_build_fifa_trades(args: argparse.Namespace, app_settings: Settings) -> Any:
     return MartBuilder(clickhouse=ClickHouseWriter(app_settings)).build_fifa_trades(
         window_hours=args.window_hours,
+    )
+
+
+def cmd_build_fifa_chain_trades(args: argparse.Namespace, app_settings: Settings) -> Any:
+    return MartBuilder(clickhouse=ClickHouseWriter(app_settings)).build_fifa_chain_trades(
+        from_block=args.from_block,
+        to_block=args.to_block,
+        bootstrap_blocks=args.bootstrap_blocks,
+        force=args.force,
     )
 
 

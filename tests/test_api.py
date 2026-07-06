@@ -429,6 +429,7 @@ def test_product_api_wallet_screener_fifa_scope_recomputes_segments() -> None:
         '{"scope":"fifa","user_address":"0xabc","traded_notional":1500000,'
         '"max_single_trade_notional":90000,"pnl_roi":0.62,"is_whale":true,'
         '"is_smart":true,"whale_reason":"fifa_total_volume",'
+        '"all_site_total_pnl":9000,"total_pnl":9000,"total_pnl_scope":"all_site_snapshot",'
         '"fifa_total_pnl":1200,"fifa_pnl_7d":300,"fifa_win_rate_7d":0.75}\n'
     )
     api = ProductApi(clickhouse=fake)
@@ -441,19 +442,25 @@ def test_product_api_wallet_screener_fifa_scope_recomputes_segments() -> None:
     assert response.status == 200
     assert response.body["wallets"][0]["scope"] == "fifa"
     assert response.body["wallets"][0]["is_smart"] is True
+    assert response.body["wallets"][0]["total_pnl"] == 9000
+    assert response.body["wallets"][0]["all_site_total_pnl"] == 9000
+    assert response.body["wallets"][0]["total_pnl_scope"] == "all_site_snapshot"
     assert response.body["wallets"][0]["fifa_total_pnl"] == 1200
     assert response.body["wallets"][0]["fifa_pnl_7d"] == 300
     assert response.body["wallets"][0]["fifa_win_rate_7d"] == 0.75
     query = fake.queries[0]
     assert "mart_wallet_fifa_24h_pnl" in query
-    assert "mart_fifa_trade" in query
+    assert "mart_fifa_trade" not in query
     assert "fifa.buy_notional >= 10000.0" in query
     assert "fifa.data_quality = 'estimate'" in query
     assert "fifa.equity_now / fifa.buy_notional" in query
+    assert "fact_wallet_pnl_snapshot" in query
+    assert "fact_wallet_portfolio_snapshot" in query
+    assert "mart_wallet_screener" in query
+    assert "all_site_total_pnl" in query
     assert "fifa.total_pnl as fifa_total_pnl" in query
     assert "fifa.pnl_7d as fifa_pnl_7d" in query
     assert "fifa.win_rate_7d as fifa_win_rate_7d" in query
-    assert "mart_wallet_screener" not in query
 
 
 def test_product_api_wallet_screener_fifa_1d_filters_to_24h_activity() -> None:
@@ -496,7 +503,8 @@ def test_product_api_wallet_screener_fifa_candidate_mode_is_wider_than_strict_sm
 def test_product_api_wallet_screener_fifa_whale_includes_fifa_performance_fields() -> None:
     fake = FakeClickHouse(
         '{"scope":"fifa","user_address":"0xabc","wallet_segment":"whale",'
-        '"is_whale":true,"fifa_total_pnl":5000,"fifa_pnl_24h":100,'
+        '"is_whale":true,"all_site_total_pnl":9000,"total_pnl":9000,'
+        '"fifa_total_pnl":5000,"fifa_pnl_24h":100,'
         '"fifa_pnl_7d":700,"fifa_win_rate":0.6,"fifa_win_rate_24h":0.5,'
         '"fifa_win_rate_7d":0.75,"fifa_traded_notional_24h":1200}\n'
     )
@@ -510,6 +518,8 @@ def test_product_api_wallet_screener_fifa_whale_includes_fifa_performance_fields
     assert response.status == 200
     row = response.body["wallets"][0]
     assert row["wallet_segment"] == "whale"
+    assert row["total_pnl"] == 9000
+    assert row["all_site_total_pnl"] == 9000
     assert row["fifa_total_pnl"] == 5000
     assert row["fifa_pnl_24h"] == 100
     assert row["fifa_pnl_7d"] == 700
@@ -563,6 +573,8 @@ def test_product_api_wallet_fifa_24h_pnl_reads_cached_mart() -> None:
     assert "fifa.total_pnl as total_pnl" in query
     assert "fifa.pnl_7d as pnl_7d" in query
     assert "fifa.win_rate_7d as win_rate_7d" in query
+    assert "fifa.max_single_trade_notional as max_single_trade_notional" in query
+    assert "all_site_max_single_trade_notional" in query
     assert "order by fifa.pnl_24h desc" in query
     assert "summary" in response.body
 
@@ -735,12 +747,13 @@ def test_product_api_polycop_fifa_signals_intersects_polycop_cache_with_fifa_mar
     assert "fifa" not in response.body["wallets"][0]
     query = fake.queries[0]
     assert "mart_wallet_fifa_24h_pnl" in query
-    assert "mart_fifa_trade" in query
+    assert "mart_fifa_trade" not in query
     assert "fifa.traded_notional >= 1000.0" in query
     assert "fifa.trade_count_24h as fifa_trade_count_24h" in query
     assert "fifa.total_pnl as fifa_total_pnl" in query
     assert "fifa.pnl_7d as fifa_pnl_7d" in query
     assert "fifa.win_rate_7d as fifa_win_rate_7d" in query
+    assert "fifa.max_single_trade_notional as fifa_max_single_trade_notional" in query
     assert "0x1111111111111111111111111111111111111111" in query
 
 
@@ -906,6 +919,86 @@ def test_product_api_wallet_detail_returns_portfolio_pnl_and_activity() -> None:
     assert "from fact_user_activity" in fake.queries[2]
 
 
+def test_product_api_wallet_detail_overrides_worldcup_positions_from_fifa_mart() -> None:
+    portfolio_raw = {"positions": []}
+    fake = FakeClickHouse(
+        outputs=[
+            (
+                '{"user_address":"0xabc","captured_at":"2026-07-03 02:00:00.000",'
+                '"position_count":0,"positions_value":0,"portfolio_value":0,'
+                '"available_balance":0,"total_pnl":0,'
+                f'"raw_json":{json.dumps(json.dumps(portfolio_raw))}}}\n'
+            ),
+            '{"user_address":"0xabc","captured_at":"2026-07-03 02:00:00.000","total_pnl":0,"raw_json":"[]"}\n',
+            (
+                '{"user_address":"0xabc","activity_count":2,"trade_activity_count":2,'
+                '"buy_count":1,"sell_count":1,"traded_size":402211.618962,'
+                '"traded_notional":372256.440333,"buy_notional":148670.488358,'
+                '"sell_notional":223585.951975,"activity_count_24h":2,'
+                '"trade_activity_count_24h":2,"traded_notional_24h":372256.440333,'
+                '"trade_activity_count_7d":2,"traded_notional_7d":372256.440333,'
+                '"avg_bet":186128.2201665,"latest_activity_type":"TRADE",'
+                '"latest_side":"SELL","first_activity_at":"2026-07-02 21:44:46.000",'
+                '"last_activity_at":"2026-07-03 01:11:55.000"}\n'
+            ),
+            '{"activity_type":"TRADE","count":2,"notional":372256.440333}\n',
+            (
+                '{"timestamp":"2026-07-02 21:44:46.000","activity_type":"TRADE",'
+                '"side":"BUY","price":0.835,"size":178048.488962,'
+                '"notional":148670.488358,"condition_id":"c-croatia",'
+                '"token_id":"asset-no","transaction_hash":"0xbuy",'
+                '"title":"Will Croatia win on 2026-07-02?",'
+                '"slug":"fifwc-fra-hrv-2026-07-02-hrv",'
+                '"event_slug":"fifwc-fra-hrv-2026-07-02","outcome":"No"}\n'
+                '{"timestamp":"2026-07-03 01:11:55.000","activity_type":"TRADE",'
+                '"side":"SELL","price":0.9974,"size":224163.13,'
+                '"notional":223585.951975,"condition_id":"c-croatia",'
+                '"token_id":"asset-no","transaction_hash":"0xsell",'
+                '"title":"Will Croatia win on 2026-07-02?",'
+                '"slug":"fifwc-fra-hrv-2026-07-02-hrv",'
+                '"event_slug":"fifwc-fra-hrv-2026-07-02","outcome":"No"}\n'
+            ),
+            "",
+            (
+                '{"asset":"asset-no","condition_id":"c-croatia",'
+                '"title":"Will Croatia win on 2026-07-02?",'
+                '"slug":"fifwc-fra-hrv-2026-07-02-hrv","event_id":"event-1",'
+                '"event_slug":"fifwc-fra-hrv-2026-07-02","outcome":"No",'
+                '"size":0.005598,"avg_price":0.8350000004,"cur_price":0,'
+                '"initial_value":187176.218317,"current_value":0,'
+                '"sell_notional":223602.722175,"buy_notional":187176.218317,'
+                '"buy_size":224163.135598,"sell_size":224163.13,'
+                '"buy_count":148,"sell_count":1,"trade_count":149,'
+                '"first_activity_at":"2026-07-02 21:44:46.000",'
+                '"last_activity_at":"2026-07-03 01:11:55.000",'
+                '"market_closed":true,"missing_mark":false}\n'
+            ),
+        ]
+    )
+    api = ProductApi(clickhouse=fake)
+
+    response = api.handle(
+        "/wallets/detail",
+        {"user": ["0xABC"], "position_limit": ["20"], "activity_limit": ["20"]},
+    )
+
+    assert response.status == 200
+    body = response.body
+    croatia = next(
+        position
+        for position in body["closed_positions"]
+        if position["title"] == "Will Croatia win on 2026-07-02?"
+    )
+    assert croatia["initial_value"] == 187176.218317
+    assert croatia["buy_notional"] == 187176.218317
+    assert croatia["sell_notional"] == 223602.722175
+    assert round(croatia["cash_pnl"], 6) == 36426.503858
+    assert round(croatia["percent_pnl"], 4) == 19.4611
+
+    joined_queries = "\n".join(fake.queries)
+    assert "mart_fifa_trade_by_user" in joined_queries
+
+
 def test_product_api_wallet_detail_fifa_scope_reads_fifa_marts() -> None:
     fake = FakeClickHouse(
         outputs=[
@@ -917,9 +1010,16 @@ def test_product_api_wallet_detail_fifa_scope_reads_fifa_marts() -> None:
                 '"net_notional_24h":-25,"event_count":1,"market_count":1,'
                 '"event_count_24h":1,"market_count_24h":1,"token_count":1,'
                 '"open_position_count":1,"open_position_value_now":120,'
-                '"open_position_value_24h_ago":80,"equity_now":65,'
-                '"equity_24h_ago":10,"pnl_24h":55,"pnl_base_24h":150,'
-                '"pnl_roi_24h":0.3667,"first_trade_at":"2026-06-14 00:00:00.000",'
+                '"open_position_value_24h_ago":80,"open_position_value_7d_ago":10,'
+                '"equity_now":65,"equity_24h_ago":10,"equity_7d_ago":10,'
+                '"total_pnl":65,"total_pnl_roi":0.65,'
+                '"pnl_24h":55,"pnl_base_24h":150,"pnl_roi_24h":0.3667,'
+                '"pnl_7d":55,"pnl_base_7d":110,"pnl_roi_7d":0.5,'
+                '"profitable_token_count":1,"losing_token_count":0,"win_rate":1,'
+                '"profitable_token_count_24h":1,"losing_token_count_24h":0,'
+                '"win_rate_24h":1,"profitable_token_count_7d":1,'
+                '"losing_token_count_7d":0,"win_rate_7d":1,'
+                '"first_trade_at":"2026-06-14 00:00:00.000",'
                 '"last_trade_at":"2026-06-15 03:03:13.000","latest_action":"SELL",'
                 '"missing_mark_count":0,"negative_position_count":0,'
                 '"data_quality":"estimate","updated_at":"2026-06-15 04:00:00.000"}\n'
@@ -980,7 +1080,7 @@ def test_product_api_wallet_detail_fifa_scope_reads_fifa_marts() -> None:
     assert body["recent_activity"][0]["source"] == "fifa-mart"
     joined_queries = "\n".join(fake.queries)
     assert "mart_wallet_fifa_24h_pnl" in joined_queries
-    assert joined_queries.count("mart_fifa_trade") >= 2
+    assert joined_queries.count("mart_fifa_trade_by_user") >= 3
     assert "fact_wallet_portfolio_snapshot" not in joined_queries
     assert "fact_wallet_pnl_snapshot" not in joined_queries
 
@@ -1230,6 +1330,58 @@ def test_product_api_wallet_detail_realtime_uses_rtds_wallet_cache(tmp_path) -> 
     assert body["activity_summary"]["traded_notional"] == 42.0
     assert body["recent_activity"][0]["title"] == "RTDS trade"
     assert body["recent_activity"][0]["source"] == "polymarket-rtds"
+
+
+def test_product_api_wallet_detail_realtime_enriches_rtds_token_metadata(tmp_path) -> None:
+    user = "0xabc"
+    cache_path = tmp_path / "official_trade_feed" / "wallets" / f"{user}.json"
+    cache_path.parent.mkdir(parents=True)
+    cache_path.write_text(
+        json.dumps(
+            {
+                "messages": [
+                    {
+                        "type": "trade",
+                        "source": "polymarket-rtds",
+                        "trade": {
+                            "trade_id": "rtds-1",
+                            "transaction_hash": "0xrtds",
+                            "timestamp": "2026-07-03 07:18:59.000",
+                            "condition_id": "",
+                            "token_id": "token-1",
+                            "user_address": user,
+                            "side": "BUY",
+                            "price": 0.14,
+                            "size": 28.571427,
+                            "notional": 3.999999,
+                        },
+                    }
+                ]
+            }
+        ),
+        encoding="utf-8",
+    )
+    fake = FakeClickHouse(
+        (
+            '{"token_id":"token-1","condition_id":"cond-1","title":"RTDS market",'
+            '"slug":"rtds-market","event_slug":"rtds-event","outcome":"Yes"}\n'
+        )
+    )
+    api = ProductApi(clickhouse=fake, settings=Settings(state_dir=tmp_path))
+
+    response = api.handle(
+        "/wallets/detail",
+        {"user": ["0xABC"], "realtime": ["1"], "activity_limit": ["5"]},
+    )
+
+    assert response.status == 200
+    body = response.body
+    assert "from dim_outcome_token as tokens final" in fake.queries[0]
+    assert body["recent_activity"][0]["condition_id"] == "cond-1"
+    assert body["recent_activity"][0]["title"] == "RTDS market"
+    assert body["recent_activity"][0]["slug"] == "rtds-market"
+    assert body["recent_activity"][0]["event_slug"] == "rtds-event"
+    assert body["recent_activity"][0]["outcome"] == "Yes"
 
 
 def test_product_api_live_trades_uses_polymarket_data_api(monkeypatch) -> None:
@@ -1661,7 +1813,7 @@ def test_product_api_wallet_summary_fifa_scope_counts_fifa_segments() -> None:
     assert response.body["summary"]["candidate_smart_wallets"] == 25
     query = fake.queries[0]
     assert "mart_wallet_fifa_24h_pnl" in query
-    assert "mart_fifa_trade" in query
+    assert "mart_fifa_trade" not in query
     assert "fifa.buy_notional >= 10000.0" in query
     assert "fifa.buy_notional >= 1000.0" in query
     assert "fifa.data_quality = 'estimate'" in query

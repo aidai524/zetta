@@ -605,6 +605,54 @@ engine = ReplacingMergeTree(updated_at)
 partition by toYYYYMM(timestamp)
 order by (timestamp, condition_id, token_id, user_address, trade_key);
 
+create table if not exists zetta.mart_fifa_trade_next as zetta.mart_fifa_trade;
+
+create table if not exists zetta.mart_fifa_trade_by_user
+(
+  trade_key String,
+  timestamp DateTime64(3, 'UTC'),
+  event_id String,
+  market_id String,
+  condition_id String,
+  token_id String,
+  user_address String,
+  side LowCardinality(String),
+  price Float64,
+  size Float64,
+  notional Float64,
+  ingested_at DateTime64(3, 'UTC'),
+  updated_at DateTime64(3, 'UTC')
+)
+engine = MergeTree
+partition by toYYYYMM(timestamp)
+order by (user_address, timestamp, condition_id, token_id, trade_key);
+
+create table if not exists zetta.mart_fifa_trade_by_user_next
+as zetta.mart_fifa_trade_by_user;
+
+create table if not exists zetta.mart_fifa_chain_trade
+(
+  trade_key String,
+  timestamp DateTime64(3, 'UTC'),
+  event_id String,
+  market_id String,
+  condition_id String,
+  token_id String,
+  user_address String,
+  side LowCardinality(String),
+  price Float64,
+  size Float64,
+  notional Float64,
+  block_number UInt64,
+  transaction_hash String,
+  log_index UInt64,
+  ingested_at DateTime64(3, 'UTC'),
+  updated_at DateTime64(3, 'UTC')
+)
+engine = ReplacingMergeTree(updated_at)
+partition by toYYYYMM(timestamp)
+order by (timestamp, condition_id, token_id, user_address, trade_key);
+
 create table if not exists zetta.mart_wallet_fifa_chain_cashflow
 (
   user_address String,
@@ -628,6 +676,7 @@ create table if not exists zetta.mart_wallet_fifa_24h_pnl
   sell_count UInt64,
   traded_size Float64,
   traded_notional Float64,
+  max_single_trade_notional Float64,
   buy_notional Float64,
   sell_notional Float64,
   trade_count_24h UInt64,
@@ -683,6 +732,7 @@ create table if not exists zetta.mart_wallet_fifa_24h_pnl_next
   sell_count UInt64,
   traded_size Float64,
   traded_notional Float64,
+  max_single_trade_notional Float64,
   buy_notional Float64,
   sell_notional Float64,
   trade_count_24h UInt64,
@@ -731,6 +781,7 @@ engine = ReplacingMergeTree(updated_at)
 order by user_address;
 
 alter table zetta.mart_wallet_fifa_24h_pnl add column if not exists open_position_value_7d_ago Float64 after open_position_value_24h_ago;
+alter table zetta.mart_wallet_fifa_24h_pnl add column if not exists max_single_trade_notional Float64 after traded_notional;
 alter table zetta.mart_wallet_fifa_24h_pnl add column if not exists equity_7d_ago Float64 after equity_24h_ago;
 alter table zetta.mart_wallet_fifa_24h_pnl add column if not exists total_pnl Float64 after equity_7d_ago;
 alter table zetta.mart_wallet_fifa_24h_pnl add column if not exists total_pnl_roi Float64 after total_pnl;
@@ -747,6 +798,7 @@ alter table zetta.mart_wallet_fifa_24h_pnl add column if not exists profitable_t
 alter table zetta.mart_wallet_fifa_24h_pnl add column if not exists losing_token_count_7d UInt64 after profitable_token_count_7d;
 alter table zetta.mart_wallet_fifa_24h_pnl add column if not exists win_rate_7d Float64 after losing_token_count_7d;
 alter table zetta.mart_wallet_fifa_24h_pnl_next add column if not exists open_position_value_7d_ago Float64 after open_position_value_24h_ago;
+alter table zetta.mart_wallet_fifa_24h_pnl_next add column if not exists max_single_trade_notional Float64 after traded_notional;
 alter table zetta.mart_wallet_fifa_24h_pnl_next add column if not exists equity_7d_ago Float64 after equity_24h_ago;
 alter table zetta.mart_wallet_fifa_24h_pnl_next add column if not exists total_pnl Float64 after equity_7d_ago;
 alter table zetta.mart_wallet_fifa_24h_pnl_next add column if not exists total_pnl_roi Float64 after total_pnl;

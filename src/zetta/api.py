@@ -6,13 +6,14 @@ import math
 import os
 import shutil
 import time
+from copy import deepcopy
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, replace
 from datetime import UTC, datetime
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
-from threading import Lock
+from threading import Lock, Thread
 from typing import Any
 from urllib.parse import parse_qs, urlparse
 
@@ -57,8 +58,14 @@ class ProductApi:
         self._unusual_betting_cache: dict[tuple[Any, ...], tuple[float, dict[str, Any]]] = {}
         self._wallet_detail_cache: dict[tuple[Any, ...], tuple[float, dict[str, Any]]] = {}
         self._wallet_detail_locks: dict[tuple[Any, ...], Lock] = {}
+        self._wallet_reputation_cache: dict[str, tuple[float, dict[str, Any] | None]] = {}
+        self._rtds_token_metadata_cache: dict[str, dict[str, Any]] = {}
+        self._critical_endpoint_cache: dict[tuple[Any, ...], tuple[float, Any]] = {}
         self._live_trades_lock = Lock()
         self._wallet_detail_cache_lock = Lock()
+        self._wallet_reputation_cache_lock = Lock()
+        self._rtds_token_metadata_lock = Lock()
+        self._critical_endpoint_cache_lock = Lock()
         self._unusual_betting_cache_store: UnusualBettingCacheStore | None = (
             UnusualBettingCacheStore(dsn=settings.postgres_dsn) if settings is not None else None
         )
@@ -146,6 +153,14 @@ class ProductApi:
         if path == "/wallets/summary":
             return ApiResponse(HTTPStatus.OK, {"summary": self.wallet_summary(query)})
         if path == "/wallets/screener":
+            if wallet_detail_scope(param(query, "scope", "all")) == "fifa":
+                output = self.cached_critical_endpoint(
+                    ("wallets_screener_fifa", normalized_query_cache_key(query)),
+                    ttl_seconds=30.0,
+                    stale_seconds=10 * 60.0,
+                    builder=lambda: {"wallets": self.wallet_screener(query)},
+                )
+                return ApiResponse(HTTPStatus.OK, output)
             return ApiResponse(HTTPStatus.OK, {"wallets": self.wallet_screener(query)})
         if path == "/wallets/fifa-24h-pnl":
             return ApiResponse(HTTPStatus.OK, self.wallet_fifa_24h_pnl(query))
@@ -166,7 +181,12 @@ class ProductApi:
             )
             return ApiResponse(status, output)
         if path == "/wallets/polycop-fifa-signals":
-            output = self.polycop_fifa_signals(query)
+            output = self.cached_critical_endpoint(
+                ("wallets_polycop_fifa_signals", normalized_query_cache_key(query)),
+                ttl_seconds=60.0,
+                stale_seconds=15 * 60.0,
+                builder=lambda: self.polycop_fifa_signals(query),
+            )
             status = (
                 HTTPStatus.SERVICE_UNAVAILABLE
                 if output.get("status") == "store_unavailable"
@@ -193,6 +213,37 @@ class ProductApi:
         if path == "/alerts":
             return ApiResponse(HTTPStatus.OK, {"alerts": self.alerts(query)})
         return ApiResponse(HTTPStatus.NOT_FOUND, {"error": "not_found"})
+
+    def cached_critical_endpoint(
+        self,
+        cache_key: tuple[Any, ...],
+        *,
+        ttl_seconds: float,
+        stale_seconds: float,
+        builder: Any,
+    ) -> Any:
+        now = time.monotonic()
+        with self._critical_endpoint_cache_lock:
+            cached = self._critical_endpoint_cache.get(cache_key)
+            if cached is not None and now - cached[0] <= ttl_seconds:
+                return deepcopy(cached[1])
+        try:
+            output = builder()
+        except Exception:
+            with self._critical_endpoint_cache_lock:
+                cached = self._critical_endpoint_cache.get(cache_key)
+                if cached is not None and now - cached[0] <= stale_seconds:
+                    return deepcopy(cached[1])
+            raise
+        with self._critical_endpoint_cache_lock:
+            self._critical_endpoint_cache[cache_key] = (time.monotonic(), deepcopy(output))
+            if len(self._critical_endpoint_cache) > 128:
+                oldest_key = min(
+                    self._critical_endpoint_cache,
+                    key=lambda key: self._critical_endpoint_cache[key][0],
+                )
+                self._critical_endpoint_cache.pop(oldest_key, None)
+        return output
 
     def stats_overview(self) -> dict[str, Any]:
         sql = """
@@ -3369,7 +3420,7 @@ class ProductApi:
             query, "watch_min_notional_24h", 1_000.0, minimum=0.0
         )
         fifa_roi = "if(fifa.buy_notional = 0, 0.0, fifa.equity_now / fifa.buy_notional)"
-        max_single = "ifNull(trade_max.max_single_trade_notional, 0.0)"
+        max_single = "fifa.max_single_trade_notional"
         strict_smart_expr = (
             f"fifa.buy_notional >= {min_smart_notional} "
             f"and fifa.data_quality = 'estimate' "
@@ -3385,15 +3436,6 @@ class ProductApi:
             f"or {max_single} >= {whale_min_single_trade}"
         )
         sql = f"""
-            with trade_max as
-            (
-              select
-                user_address,
-                max(notional) as max_single_trade_notional
-              from mart_fifa_trade final
-              where user_address != ''
-              group by user_address
-            )
             select
               'fifa' as scope,
               count() as total_wallets,
@@ -3415,7 +3457,6 @@ class ProductApi:
               sum(fifa.equity_now) as total_pnl,
               max(fifa.updated_at) as updated_at
             from mart_wallet_fifa_24h_pnl as fifa final
-            left join trade_max on fifa.user_address = trade_max.user_address
             where fifa.user_address != ''
             format JSONEachRow
         """
@@ -3448,7 +3489,7 @@ class ProductApi:
             query, "watch_min_notional_24h", 1_000.0, minimum=0.0
         )
         fifa_roi = "if(fifa.buy_notional = 0, 0.0, fifa.equity_now / fifa.buy_notional)"
-        max_single = "ifNull(trade_max.max_single_trade_notional, 0.0)"
+        max_single = "fifa.max_single_trade_notional"
         strict_smart_expr = (
             f"(fifa.buy_notional >= {min_smart_notional} "
             f"and fifa.data_quality = 'estimate' "
@@ -3513,13 +3554,51 @@ class ProductApi:
             order_by = f"fifa.traded_notional_24h desc, {order_by}"
 
         sql = f"""
-            with trade_max as
+            with selected_users as
+            (
+              select
+                fifa.user_address as user_address
+              from mart_wallet_fifa_24h_pnl as fifa final
+              where {" and ".join(where)}
+              order by {order_by}
+              limit {limit}
+            ),
+            screener_snapshot as
             (
               select
                 user_address,
-                max(notional) as max_single_trade_notional
-              from mart_fifa_trade final
-              where user_address != ''
+                position_count,
+                positions_value,
+                portfolio_value,
+                available_balance,
+                total_pnl,
+                portfolio_captured_at,
+                pnl_captured_at,
+                pnl_roi
+              from mart_wallet_screener final
+              where user_address in (select user_address from selected_users)
+            ),
+            pnl_snapshot as
+            (
+              select
+                user_address,
+                argMax(total_pnl, captured_at) as total_pnl,
+                max(captured_at) as pnl_captured_at
+              from fact_wallet_pnl_snapshot final
+              where user_address in (select user_address from selected_users)
+              group by user_address
+            ),
+            portfolio_snapshot as
+            (
+              select
+                user_address,
+                argMax(position_count, captured_at) as position_count,
+                argMax(positions_value, captured_at) as positions_value,
+                argMax(portfolio_value, captured_at) as portfolio_value,
+                argMax(available_balance, captured_at) as available_balance,
+                max(captured_at) as portfolio_captured_at
+              from fact_wallet_portfolio_snapshot final
+              where user_address in (select user_address from selected_users)
               group by user_address
             )
             select
@@ -3544,15 +3623,66 @@ class ProductApi:
               fifa.sell_notional as category_sell_notional,
               if(fifa.trade_count = 0, cast(null, 'Nullable(Float64)'), fifa.traded_notional / fifa.trade_count)
                 as avg_bet,
-              {max_single} as max_single_trade_notional,
-              fifa.open_position_count as position_count,
-              fifa.open_position_value_now as positions_value,
-              fifa.open_position_value_now as portfolio_value,
-              0.0 as available_balance,
-              fifa.equity_now as total_pnl,
-              fifa.updated_at as portfolio_captured_at,
-              fifa.updated_at as pnl_captured_at,
-              {fifa_roi} as pnl_roi,
+              fifa.max_single_trade_notional as max_single_trade_notional,
+              multiIf(
+                portfolio_snapshot.user_address != '', portfolio_snapshot.position_count,
+                screener.user_address != '', screener.position_count,
+                fifa.open_position_count
+              ) as position_count,
+              multiIf(
+                portfolio_snapshot.user_address != '', portfolio_snapshot.positions_value,
+                screener.user_address != '', screener.positions_value,
+                fifa.open_position_value_now
+              ) as positions_value,
+              multiIf(
+                portfolio_snapshot.user_address != '', portfolio_snapshot.portfolio_value,
+                screener.user_address != '', screener.portfolio_value,
+                fifa.open_position_value_now
+              ) as portfolio_value,
+              multiIf(
+                portfolio_snapshot.user_address != '', portfolio_snapshot.available_balance,
+                screener.user_address != '', screener.available_balance,
+                0.0
+              ) as available_balance,
+              multiIf(
+                pnl_snapshot.user_address != '', pnl_snapshot.total_pnl,
+                screener.user_address != '', screener.total_pnl,
+                fifa.equity_now
+              ) as total_pnl,
+              multiIf(
+                portfolio_snapshot.user_address != '', portfolio_snapshot.portfolio_captured_at,
+                screener.user_address != '', screener.portfolio_captured_at,
+                fifa.updated_at
+              ) as portfolio_captured_at,
+              multiIf(
+                pnl_snapshot.user_address != '', pnl_snapshot.pnl_captured_at,
+                screener.user_address != '', screener.pnl_captured_at,
+                fifa.updated_at
+              ) as pnl_captured_at,
+              if(screener.user_address != '', screener.pnl_roi, cast(null, 'Nullable(Float64)'))
+                as pnl_roi,
+              multiIf(
+                pnl_snapshot.user_address != '', cast(pnl_snapshot.total_pnl, 'Nullable(Float64)'),
+                screener.user_address != '', cast(screener.total_pnl, 'Nullable(Float64)'),
+                cast(null, 'Nullable(Float64)')
+              ) as all_site_total_pnl,
+              if(screener.user_address != '', cast(screener.pnl_roi, 'Nullable(Float64)'), cast(null, 'Nullable(Float64)'))
+                as all_site_pnl_roi,
+              multiIf(
+                portfolio_snapshot.user_address != '', cast(portfolio_snapshot.portfolio_value, 'Nullable(Float64)'),
+                screener.user_address != '', cast(screener.portfolio_value, 'Nullable(Float64)'),
+                cast(null, 'Nullable(Float64)')
+              ) as all_site_portfolio_value,
+              multiIf(
+                portfolio_snapshot.user_address != '', cast(portfolio_snapshot.available_balance, 'Nullable(Float64)'),
+                screener.user_address != '', cast(screener.available_balance, 'Nullable(Float64)'),
+                cast(null, 'Nullable(Float64)')
+              ) as all_site_available_balance,
+              multiIf(
+                pnl_snapshot.user_address != '', 'all_site_snapshot',
+                screener.user_address != '', 'all_site_screener',
+                'fifa_fallback'
+              ) as total_pnl_scope,
               {whale_expr} as is_whale,
               {strict_smart_expr} as is_smart,
               {candidate_smart_expr} as is_candidate_smart,
@@ -3600,6 +3730,11 @@ class ProductApi:
               fifa.market_count as fifa_market_count,
               fifa.event_count_24h as fifa_event_count_24h,
               fifa.market_count_24h as fifa_market_count_24h,
+              fifa.traded_notional as fifa_traded_notional,
+              fifa.buy_notional as fifa_buy_notional,
+              fifa.sell_notional as fifa_sell_notional,
+              fifa.open_position_count as fifa_open_position_count,
+              fifa.open_position_value_now as fifa_open_position_value_now,
               fifa.total_pnl as fifa_total_pnl,
               fifa.total_pnl_roi as fifa_total_pnl_roi,
               fifa.pnl_24h as fifa_pnl_24h,
@@ -3619,8 +3754,12 @@ class ProductApi:
               fifa.data_quality as fifa_data_quality,
               fifa.updated_at as updated_at
             from mart_wallet_fifa_24h_pnl as fifa final
-            left join trade_max on fifa.user_address = trade_max.user_address
+            left join screener_snapshot as screener
+              on fifa.user_address = screener.user_address
+            left join pnl_snapshot on fifa.user_address = pnl_snapshot.user_address
+            left join portfolio_snapshot on fifa.user_address = portfolio_snapshot.user_address
             where {" and ".join(where)}
+              and fifa.user_address in (select user_address from selected_users)
             order by {order_by}
             limit {limit}
             format JSONEachRow
@@ -3633,7 +3772,9 @@ class ProductApi:
         min_notional_24h = float_param(query, "min_notional_24h", 0.0, minimum=0.0)
         min_trades_24h = bounded_int_param(query, "min_trades_24h", 0, minimum=0, maximum=1_000_000)
         data_quality = param(query, "data_quality").strip().lower()
-        user = normalize_wallet_address(param(query, "user"))
+        user = normalize_wallet_address(
+            param(query, "user") or param(query, "address") or param(query, "user_address")
+        )
         search = param(query, "q").strip().lower()
         sort = param(query, "sort", "pnl_24h").strip().lower()
         direction = param(query, "direction", "desc").strip().lower()
@@ -3738,7 +3879,8 @@ class ProductApi:
               ifNull(screener.total_pnl, 0.0) as all_site_total_pnl,
               ifNull(screener.pnl_roi, 0.0) as all_site_pnl_roi,
               ifNull(screener.portfolio_value, 0.0) as portfolio_value,
-              ifNull(screener.max_single_trade_notional, 0.0) as max_single_trade_notional
+              fifa.max_single_trade_notional as max_single_trade_notional,
+              ifNull(screener.max_single_trade_notional, 0.0) as all_site_max_single_trade_notional
             from mart_wallet_fifa_24h_pnl as fifa final
             left join mart_wallet_screener as screener final
               on fifa.user_address = screener.user_address
@@ -3946,15 +4088,6 @@ class ProductApi:
             if data_quality:
                 where.append(f"lower(fifa.data_quality) = {ch_string(data_quality)}")
             fifa_sql = f"""
-                with trade_max as
-                (
-                  select
-                    user_address,
-                    max(notional) as max_single_trade_notional
-                  from mart_fifa_trade final
-                  where user_address in ({address_values})
-                  group by user_address
-                )
                 select
                   fifa.user_address as user_address,
                   fifa.trade_count as fifa_trade_count,
@@ -3991,11 +4124,9 @@ class ProductApi:
                   fifa.last_trade_at as fifa_last_trade_at,
                   fifa.latest_action as fifa_latest_action,
                   fifa.data_quality as fifa_data_quality,
-                  ifNull(trade_max.max_single_trade_notional, 0.0)
-                    as fifa_max_single_trade_notional,
+                  fifa.max_single_trade_notional as fifa_max_single_trade_notional,
                   fifa.updated_at as fifa_updated_at
                 from mart_wallet_fifa_24h_pnl as fifa final
-                left join trade_max on fifa.user_address = trade_max.user_address
                 where {" and ".join(where)}
                 format JSONEachRow
             """
@@ -4121,18 +4252,40 @@ class ProductApi:
                 position_sort,
                 realtime,
             )
-            live_detail = self.cached_wallet_detail(
-                cache_key,
-                ttl_seconds=5.0 if realtime else 10.0,
-                builder=lambda: self.wallet_detail_live(
+            live_builder = lambda: self.wallet_detail_live(
+                user,
+                position_limit=position_limit,
+                activity_limit=activity_limit,
+                pnl_points_limit=pnl_points_limit,
+                position_scope=position_scope,
+                position_sort=position_sort,
+                use_realtime_activity=realtime,
+            )
+            if realtime:
+                cached_live_detail = self.cached_wallet_detail_value(
+                    cache_key,
+                    max_age_seconds=30.0,
+                )
+                if cached_live_detail is not None:
+                    return self.with_realtime_wallet_activity(
+                        cached_live_detail,
+                        user,
+                        activity_limit=activity_limit,
+                    )
+                return self.wallet_detail_realtime(
                     user,
                     position_limit=position_limit,
                     activity_limit=activity_limit,
                     pnl_points_limit=pnl_points_limit,
                     position_scope=position_scope,
                     position_sort=position_sort,
-                    use_realtime_activity=realtime,
-                ),
+                )
+            live_detail = self.cached_wallet_detail(
+                cache_key,
+                ttl_seconds=10.0,
+                builder=live_builder,
+                stale_seconds=30.0,
+                refresh_in_background=False,
             )
             if live_detail is not None:
                 return live_detail
@@ -4160,7 +4313,15 @@ class ProductApi:
             position for position in activity_positions if position.get("is_settled_or_redeemable")
         ]
         recent_activity = full_recent_activity[:activity_limit]
-        reputation = self.wallet_detail_reputation(user)
+        reputation = self.cached_wallet_detail_reputation(user)
+        positions_override, activity_positions, closed_positions = (
+            self.wallet_positions_with_fifa_overrides(
+                user,
+                portfolio,
+                activity_positions,
+                closed_positions,
+            )
+        )
         detail = self.wallet_detail_response(
             user,
             portfolio=portfolio,
@@ -4171,6 +4332,7 @@ class ProductApi:
             reputation=reputation,
             closed_positions=closed_positions,
             activity_positions=activity_positions,
+            positions_override=positions_override,
             position_limit=position_limit,
             activity_limit=activity_limit,
             pnl_points_limit=pnl_points_limit,
@@ -4187,6 +4349,8 @@ class ProductApi:
         *,
         ttl_seconds: float,
         builder: Any,
+        stale_seconds: float = 0.0,
+        refresh_in_background: bool = False,
     ) -> dict[str, Any] | None:
         now = time.monotonic()
         with self._wallet_detail_cache_lock:
@@ -4198,7 +4362,24 @@ class ProductApi:
                 lock = Lock()
                 self._wallet_detail_locks[cache_key] = lock
 
-        with lock:
+        if (
+            cached is not None
+            and stale_seconds > 0
+            and now - cached[0] <= ttl_seconds + stale_seconds
+        ):
+            if refresh_in_background:
+                if lock.acquire(blocking=False):
+                    Thread(
+                        target=self.refresh_cached_wallet_detail,
+                        args=(cache_key, lock, builder),
+                        daemon=True,
+                    ).start()
+                return cached[1]
+            if not lock.acquire(blocking=False):
+                return cached[1]
+        else:
+            lock.acquire()
+        try:
             now = time.monotonic()
             with self._wallet_detail_cache_lock:
                 cached = self._wallet_detail_cache.get(cache_key)
@@ -4215,6 +4396,134 @@ class ProductApi:
                         )
                         self._wallet_detail_cache.pop(oldest_key, None)
             return detail
+        finally:
+            lock.release()
+
+    def cached_wallet_detail_value(
+        self,
+        cache_key: tuple[Any, ...],
+        *,
+        max_age_seconds: float | None,
+    ) -> dict[str, Any] | None:
+        now = time.monotonic()
+        with self._wallet_detail_cache_lock:
+            cached = self._wallet_detail_cache.get(cache_key)
+        if cached is None:
+            return None
+        if max_age_seconds is not None and now - cached[0] > max_age_seconds:
+            return None
+        return cached[1]
+
+    def refresh_cached_wallet_detail_in_background(
+        self,
+        cache_key: tuple[Any, ...],
+        builder: Any,
+    ) -> None:
+        with self._wallet_detail_cache_lock:
+            lock = self._wallet_detail_locks.get(cache_key)
+            if lock is None:
+                lock = Lock()
+                self._wallet_detail_locks[cache_key] = lock
+        if not lock.acquire(blocking=False):
+            return
+        Thread(
+            target=self.refresh_cached_wallet_detail,
+            args=(cache_key, lock, builder),
+            daemon=True,
+        ).start()
+
+    def refresh_cached_wallet_detail(
+        self,
+        cache_key: tuple[Any, ...],
+        lock: Lock,
+        builder: Any,
+    ) -> None:
+        try:
+            try:
+                detail = builder()
+            except Exception:
+                return
+            if detail is not None:
+                with self._wallet_detail_cache_lock:
+                    self._wallet_detail_cache[cache_key] = (time.monotonic(), detail)
+                    if len(self._wallet_detail_cache) > 512:
+                        oldest_key = min(
+                            self._wallet_detail_cache,
+                            key=lambda key: self._wallet_detail_cache[key][0],
+                        )
+                        self._wallet_detail_cache.pop(oldest_key, None)
+        finally:
+            lock.release()
+
+    def with_realtime_wallet_activity(
+        self,
+        detail: dict[str, Any],
+        user: str,
+        *,
+        activity_limit: int,
+    ) -> dict[str, Any]:
+        captured_at = datetime.now(UTC)
+        realtime_rows = dedupe_wallet_activity_rows(
+            self.wallet_rtds_activity_rows(
+                user,
+                captured_at,
+                limit=max(activity_limit, 100),
+            )
+        )
+        if not realtime_rows:
+            return detail
+
+        activity_summary = summarize_activity_rows(user, realtime_rows)
+        activity_by_type = summarize_activity_rows_by_type(realtime_rows)
+        recent_activity = recent_activity_from_rows(realtime_rows, activity_limit)
+        output = deepcopy(detail)
+        output["activity_summary"] = activity_summary
+        output["activity_by_type"] = activity_by_type
+        output["recent_activity"] = recent_activity
+        output["realtime"] = {
+            "enabled": True,
+            "source": "polymarket-rtds",
+            "cache_status": "hit",
+            "activity_count": len(realtime_rows),
+            "activity_limit": activity_limit,
+            "captured_at": api_datetime(captured_at),
+            "last_activity_at": activity_summary.get("last_activity_at"),
+        }
+        wallet = output.get("wallet")
+        if isinstance(wallet, dict):
+            wallet["realtime_activity_count"] = len(realtime_rows)
+            wallet["realtime_last_activity_at"] = activity_summary.get("last_activity_at")
+            wallet["activity_count"] = int_value(activity_summary.get("activity_count"))
+            wallet["trade_activity_count"] = int_value(
+                activity_summary.get("trade_activity_count")
+            )
+            wallet["first_activity_at"] = activity_summary.get("first_activity_at")
+            wallet["last_activity_at"] = activity_summary.get("last_activity_at")
+            wallet["avg_bet"] = float_value(activity_summary.get("avg_bet"))
+            wallet["trade_volume_7d"] = float_value(activity_summary.get("traded_notional_7d"))
+            wallet["trade_count_7d"] = int_value(activity_summary.get("trade_activity_count_7d"))
+        return output
+
+    def wallet_positions_with_fifa_overrides(
+        self,
+        user: str,
+        portfolio: dict[str, Any] | None,
+        activity_positions: list[dict[str, Any]],
+        closed_positions: list[dict[str, Any]],
+    ) -> tuple[list[dict[str, Any]], list[dict[str, Any]], list[dict[str, Any]]]:
+        positions = wallet_positions_from_snapshot(portfolio)
+        try:
+            fifa_positions = self.wallet_fifa_positions(user)
+        except Exception:
+            return positions, activity_positions, closed_positions
+        if not fifa_positions:
+            return positions, activity_positions, closed_positions
+        return merge_fifa_position_overrides(
+            positions,
+            activity_positions,
+            closed_positions,
+            fifa_positions,
+        )
 
     def wallet_detail_fifa(
         self,
@@ -4294,35 +4603,29 @@ class ProductApi:
         if detail is not None and summary:
             wallet = detail.get("wallet")
             if isinstance(wallet, dict):
-                wallet.update(
-                    {
-                        "total_pnl": float_value(summary.get("total_pnl")),
-                        "total_pnl_roi": float_value(summary.get("total_pnl_roi")),
-                        "pnl_24h": float_value(summary.get("pnl_24h")),
-                        "pnl_roi_24h": float_value(summary.get("pnl_roi_24h")),
-                        "pnl_7d": float_value(summary.get("pnl_7d")),
-                        "pnl_roi_7d": float_value(summary.get("pnl_roi_7d")),
-                        "win_rate": float_value(summary.get("win_rate")),
-                        "win_rate_24h": float_value(summary.get("win_rate_24h")),
-                        "win_rate_7d": float_value(summary.get("win_rate_7d")),
-                        "profitable_token_count": int_value(
-                            summary.get("profitable_token_count")
-                        ),
-                        "losing_token_count": int_value(summary.get("losing_token_count")),
-                        "profitable_token_count_24h": int_value(
-                            summary.get("profitable_token_count_24h")
-                        ),
-                        "losing_token_count_24h": int_value(
-                            summary.get("losing_token_count_24h")
-                        ),
-                        "profitable_token_count_7d": int_value(
-                            summary.get("profitable_token_count_7d")
-                        ),
-                        "losing_token_count_7d": int_value(
-                            summary.get("losing_token_count_7d")
-                        ),
-                    }
-                )
+                for key in (
+                    "total_pnl",
+                    "total_pnl_roi",
+                    "pnl_24h",
+                    "pnl_roi_24h",
+                    "pnl_7d",
+                    "pnl_roi_7d",
+                    "win_rate",
+                    "win_rate_24h",
+                    "win_rate_7d",
+                ):
+                    if key in summary:
+                        wallet[key] = float_value(summary.get(key))
+                for key in (
+                    "profitable_token_count",
+                    "losing_token_count",
+                    "profitable_token_count_24h",
+                    "losing_token_count_24h",
+                    "profitable_token_count_7d",
+                    "losing_token_count_7d",
+                ):
+                    if key in summary:
+                        wallet[key] = int_value(summary.get(key))
         return detail
 
     def wallet_detail_live(
@@ -4410,9 +4713,17 @@ class ProductApi:
         ]
         recent_activity = recent_activity_from_rows(live_activity_rows, activity_limit)
         try:
-            reputation = self.wallet_detail_reputation(user)
+            reputation = self.cached_wallet_detail_reputation(user)
         except Exception:
             reputation = None
+        positions_override, activity_positions, closed_positions = (
+            self.wallet_positions_with_fifa_overrides(
+                user,
+                portfolio,
+                activity_positions,
+                closed_positions,
+            )
+        )
 
         if not any((portfolio, pnl, live_activity_rows)):
             return None
@@ -4426,6 +4737,7 @@ class ProductApi:
             reputation=reputation,
             closed_positions=closed_positions,
             activity_positions=activity_positions,
+            positions_override=positions_override,
             position_limit=position_limit,
             activity_limit=activity_limit,
             pnl_points_limit=pnl_points_limit,
@@ -4447,7 +4759,11 @@ class ProductApi:
     ) -> dict[str, Any]:
         captured_at = datetime.now(UTC)
         realtime_rows = dedupe_wallet_activity_rows(
-            self.wallet_rtds_activity_rows(user, captured_at, limit=max(activity_limit, 100))
+            self.wallet_rtds_activity_rows(
+                user,
+                captured_at,
+                limit=max(activity_limit, 100),
+            )
         )
         activity_summary = summarize_activity_rows(user, realtime_rows)
         activity_by_type = summarize_activity_rows_by_type(realtime_rows)
@@ -4510,14 +4826,25 @@ class ProductApi:
         captured_at: datetime,
         *,
         limit: int = 500,
+        max_age_seconds: float | None = None,
+        include_backfill: bool = True,
     ) -> list[dict[str, Any]]:
         if self.settings is None:
             return []
-        messages = load_recent_wallet_trade_messages(
-            self.settings.state_dir,
-            user,
-            limit=limit,
-        )
+        messages = [
+            message
+            for message in load_recent_wallet_trade_messages(
+                self.settings.state_dir,
+                user,
+                limit=limit,
+            )
+            if rtds_message_allowed_for_realtime(
+                message,
+                captured_at,
+                max_age_seconds=max_age_seconds,
+                include_backfill=include_backfill,
+            )
+        ]
         if len(messages) < limit:
             seen_keys = {rtds_message_key(message) for message in messages}
             for message in load_recent_trade_messages(
@@ -4532,15 +4859,89 @@ class ProductApi:
                     continue
                 if str(trade.get("user_address") or "").lower() != user.lower():
                     continue
+                if not rtds_message_allowed_for_realtime(
+                    message,
+                    captured_at,
+                    max_age_seconds=max_age_seconds,
+                    include_backfill=include_backfill,
+                ):
+                    continue
                 messages.append(message)
                 seen_keys.add(key)
                 if len(messages) >= limit:
                     break
-        return wallet_rtds_activity_rows(
+        rows = wallet_rtds_activity_rows(
             user,
             messages,
             captured_at,
         )
+        token_ids = [
+            str(row.get("token_id") or "")
+            for row in rows
+            if wallet_activity_row_needs_token_metadata(row)
+        ]
+        if not token_ids:
+            return rows
+        metadata = self.wallet_rtds_token_metadata(token_ids)
+        return enrich_wallet_activity_rows_with_token_metadata(rows, metadata)
+
+    def wallet_rtds_token_metadata(self, token_ids: list[str]) -> dict[str, dict[str, Any]]:
+        unique_token_ids = sorted(
+            {str(token_id or "").strip() for token_id in token_ids if str(token_id or "").strip()}
+        )
+        if not unique_token_ids:
+            return {}
+        unique_token_ids = unique_token_ids[:500]
+        metadata: dict[str, dict[str, Any]] = {}
+        missing: list[str] = []
+        with self._rtds_token_metadata_lock:
+            for token_id in unique_token_ids:
+                cached = self._rtds_token_metadata_cache.get(token_id)
+                if cached is None:
+                    missing.append(token_id)
+                else:
+                    metadata[token_id] = cached
+        if missing:
+            token_values = ", ".join(ch_string(token_id) for token_id in missing)
+            try:
+                rows = rows_json(
+                    self.clickhouse.query_text(
+                        f"""
+                        select
+                          tokens.token_id as token_id,
+                          any(tokens.condition_id) as condition_id,
+                          any(tokens.outcome) as outcome,
+                          any(markets.question) as title,
+                          any(markets.slug) as slug,
+                          any(events.slug) as event_slug
+                        from dim_outcome_token as tokens final
+                        left join dim_market as markets final
+                          on tokens.market_id = markets.market_id
+                        left join dim_event as events final
+                          on markets.event_id = events.event_id
+                        where tokens.token_id in ({token_values})
+                        group by tokens.token_id
+                        format JSONEachRow
+                        """
+                    )
+                )
+            except Exception:
+                rows = []
+            fresh = {
+                str(row.get("token_id") or ""): {
+                    "condition_id": str(row.get("condition_id") or ""),
+                    "title": str(row.get("title") or ""),
+                    "slug": str(row.get("slug") or ""),
+                    "event_slug": str(row.get("event_slug") or ""),
+                    "outcome": str(row.get("outcome") or ""),
+                }
+                for row in rows
+                if str(row.get("token_id") or "")
+            }
+            with self._rtds_token_metadata_lock:
+                self._rtds_token_metadata_cache.update(fresh)
+            metadata.update(fresh)
+        return metadata
 
     def wallet_detail_response(
         self,
@@ -4770,8 +5171,9 @@ class ProductApi:
               argMax(side, timestamp) as latest_side,
               min(timestamp) as first_activity_at,
               max(timestamp) as last_activity_at
-            from mart_fifa_trade final
-            where user_address = {ch_string(user)}
+            from mart_fifa_trade_by_user
+            prewhere user_address = {ch_string(user)}
+            where 1
               and timestamp <= now64(3) + interval 10 minute
             group by user_address
             limit 1
@@ -4782,6 +5184,22 @@ class ProductApi:
 
     def wallet_fifa_recent_activity(self, user: str, limit: int) -> list[dict[str, Any]]:
         sql = f"""
+            with recent_trades as
+            (
+              select
+                timestamp,
+                side,
+                price,
+                size,
+                notional,
+                condition_id,
+                token_id
+              from mart_fifa_trade_by_user
+              prewhere user_address = {ch_string(user)}
+              where timestamp <= now64(3) + interval 10 minute
+              order by timestamp desc
+              limit {limit}
+            )
             select
               trades.timestamp as timestamp,
               'TRADE' as activity_type,
@@ -4797,17 +5215,14 @@ class ProductApi:
               ifNull(events.slug, '') as event_slug,
               ifNull(tokens.outcome, '') as outcome,
               'fifa-mart' as source
-            from mart_fifa_trade as trades final
+            from recent_trades as trades
             left join dim_market as markets final
               on trades.condition_id = markets.condition_id
             left join dim_event as events final
               on markets.event_id = events.event_id
             left join dim_outcome_token as tokens final
               on trades.token_id = tokens.token_id
-            where trades.user_address = {ch_string(user)}
-              and trades.timestamp <= now64(3) + interval 10 minute
             order by trades.timestamp desc
-            limit {limit}
             format JSONEachRow
         """
         return rows_json(self.clickhouse.query_text(sql))
@@ -4821,9 +5236,9 @@ class ProductApi:
                 select
                   token_id,
                   anyLast(market_id) as market_id
-                from mart_fifa_trade final
-                where user_address = {ch_string(user)}
-                  and token_id != ''
+                from mart_fifa_trade_by_user
+                prewhere user_address = {ch_string(user)}
+                where token_id != ''
                 group by token_id
               ),
               final_prices as
@@ -4844,7 +5259,6 @@ class ProductApi:
                       JSONExtractString(raw_json, 'outcomePrices') as prices
                     from dim_market as markets final
                     where market_id in (select market_id from user_tokens)
-                      and closed = true
                       and JSONExtractString(raw_json, 'outcomePrices') != ''
                   )
                   array join
@@ -4862,42 +5276,10 @@ class ProductApi:
                   multiIf(
                     final_prices.final_price is not null,
                       cast(final_prices.final_price, 'Nullable(Float64)'),
-                    book_marks.book_count > 0,
-                      cast(
-                        (book_marks.book_best_bid + book_marks.book_best_ask) / 2,
-                        'Nullable(Float64)'
-                      ),
-                    price_marks.price_count > 0,
-                      cast(price_marks.price, 'Nullable(Float64)'),
                     cast(null, 'Nullable(Float64)')
                   ) as mark_price
                 from user_tokens as token_ids
                 left join final_prices on token_ids.token_id = final_prices.token_id
-                left join
-                (
-                  select
-                    token_id,
-                    argMax(price, timestamp) as price,
-                    count() as price_count
-                  from fact_price_history
-                  where token_id in (select token_id from user_tokens)
-                    and timestamp <= as_of + toIntervalMinute(10)
-                  group by token_id
-                ) as price_marks on token_ids.token_id = price_marks.token_id
-                left join
-                (
-                  select
-                    token_id,
-                    argMax(best_bid, captured_at) as book_best_bid,
-                    argMax(best_ask, captured_at) as book_best_ask,
-                    count() as book_count
-                  from fact_orderbook_snapshot
-                  where token_id in (select token_id from user_tokens)
-                    and best_bid is not null
-                    and best_ask is not null
-                    and captured_at <= as_of + toIntervalMinute(10)
-                  group by token_id
-                ) as book_marks on token_ids.token_id = book_marks.token_id
               )
             select
               position_rows.token_id as asset,
@@ -4909,9 +5291,13 @@ class ProductApi:
               ifNull(tokens.outcome, '') as outcome,
               position_rows.position_size as size,
               position_rows.avg_price as avg_price,
-              ifNull(marks.mark_price, 0.0) as cur_price,
+              ifNull(marks.mark_price, position_rows.last_trade_price) as cur_price,
               position_rows.buy_notional as initial_value,
-              if(position_rows.position_size > 0.000001, position_rows.position_size * ifNull(marks.mark_price, 0.0), 0.0)
+              if(
+                position_rows.position_size > 0.000001,
+                position_rows.position_size * ifNull(marks.mark_price, position_rows.last_trade_price),
+                0.0
+              )
                 as current_value,
               position_rows.sell_notional,
               position_rows.buy_notional,
@@ -4923,7 +5309,8 @@ class ProductApi:
               position_rows.first_activity_at,
               position_rows.last_activity_at,
               ifNull(markets.closed, false) as market_closed,
-              if(marks.mark_price is null, true, false) as missing_mark
+              if(marks.mark_price is null and position_rows.last_trade_price = 0.0, true, false)
+                as missing_mark
             from
             (
               select
@@ -4940,11 +5327,12 @@ class ProductApi:
                 sum(if(side = 'BUY', size, -size)) as position_size,
                 if(sumIf(size, side = 'BUY') = 0, 0.0, sumIf(notional, side = 'BUY') / sumIf(size, side = 'BUY'))
                   as avg_price,
+                argMax(price, timestamp) as last_trade_price,
                 min(timestamp) as first_activity_at,
                 max(timestamp) as last_activity_at
-              from mart_fifa_trade final
-              where user_address = {ch_string(user)}
-                and timestamp <= as_of + toIntervalMinute(10)
+              from mart_fifa_trade_by_user
+              prewhere user_address = {ch_string(user)}
+              where timestamp <= as_of + toIntervalMinute(10)
               group by condition_id, token_id
             ) as position_rows
             left join marks on position_rows.token_id = marks.token_id
@@ -4954,7 +5342,15 @@ class ProductApi:
               on markets.event_id = events.event_id
             left join dim_outcome_token as tokens final
               on position_rows.token_id = tokens.token_id
-            order by abs(position_rows.sell_notional + if(position_rows.position_size > 0.000001, position_rows.position_size * ifNull(marks.mark_price, 0.0), 0.0) - position_rows.buy_notional) desc
+            order by abs(
+              position_rows.sell_notional
+              + if(
+                position_rows.position_size > 0.000001,
+                position_rows.position_size * ifNull(marks.mark_price, position_rows.last_trade_price),
+                0.0
+              )
+              - position_rows.buy_notional
+            ) desc
             limit 1000
             format JSONEachRow
         """
@@ -5136,6 +5532,28 @@ class ProductApi:
         """
         rows = rows_json(self.clickhouse.query_text(sql))
         return rows[0] if rows else None
+
+    def cached_wallet_detail_reputation(
+        self,
+        user: str,
+        *,
+        ttl_seconds: float = 300.0,
+    ) -> dict[str, Any] | None:
+        now = time.monotonic()
+        with self._wallet_reputation_cache_lock:
+            cached = self._wallet_reputation_cache.get(user)
+            if cached is not None and now - cached[0] <= ttl_seconds:
+                return cached[1]
+        reputation = self.wallet_detail_reputation(user)
+        with self._wallet_reputation_cache_lock:
+            self._wallet_reputation_cache[user] = (time.monotonic(), reputation)
+            if len(self._wallet_reputation_cache) > 2_000:
+                oldest_key = min(
+                    self._wallet_reputation_cache,
+                    key=lambda key: self._wallet_reputation_cache[key][0],
+                )
+                self._wallet_reputation_cache.pop(oldest_key, None)
+        return reputation
 
     def wallet_activity_by_type(self, user: str) -> list[dict[str, Any]]:
         sql = f"""
@@ -5540,6 +5958,10 @@ class ProductApi:
 def serve_api(*, settings: Settings, host: str, port: int) -> None:
     api = ProductApi(clickhouse=ClickHouseWriter(settings), settings=settings)
 
+    class ApiHTTPServer(ThreadingHTTPServer):
+        daemon_threads = True
+        request_queue_size = 128
+
     class Handler(BaseHTTPRequestHandler):
         def do_GET(self) -> None:
             self.handle_api_request("GET")
@@ -5593,7 +6015,7 @@ def serve_api(*, settings: Settings, host: str, port: int) -> None:
         def log_message(self, _format: str, *_args: Any) -> None:
             return
 
-    ThreadingHTTPServer((host, port), Handler).serve_forever()
+    ApiHTTPServer((host, port), Handler).serve_forever()
 
 
 def rows_json(text: str) -> list[dict[str, Any]]:
@@ -6515,6 +6937,32 @@ def rtds_message_key(message: dict[str, Any]) -> str:
     return json.dumps(message, sort_keys=True, default=str, separators=(",", ":"))
 
 
+def rtds_message_allowed_for_realtime(
+    message: dict[str, Any],
+    captured_at: datetime,
+    *,
+    max_age_seconds: float | None,
+    include_backfill: bool,
+) -> bool:
+    if include_backfill and max_age_seconds is None:
+        return True
+    trade = message.get("trade")
+    if not isinstance(trade, dict):
+        return False
+    source = str(trade.get("source") or message.get("source") or "")
+    if not include_backfill and source != "polymarket-rtds":
+        return False
+    if max_age_seconds is None:
+        return True
+    latency_seconds = message.get("latency_seconds")
+    if isinstance(latency_seconds, (int, float)) and latency_seconds > max_age_seconds:
+        return False
+    received_at = parse_clickhouse_datetime(message.get("received_at"))
+    if received_at is not None:
+        return (captured_at - received_at).total_seconds() <= max_age_seconds
+    return True
+
+
 def merge_wallet_rtds_activity_rows(
     activity_rows_payload: list[dict[str, Any]],
     rtds_rows: list[dict[str, Any]],
@@ -6543,11 +6991,14 @@ def wallet_rtds_activity_rows(
         if timestamp is None:
             continue
         raw_payload = payload if isinstance(payload, dict) else rtds_trade_raw_payload(trade)
+        received_at = parse_clickhouse_datetime(message.get("received_at"))
         rows.append(
             {
                 "activity_id": str(trade.get("trade_id") or ""),
                 "user_address": normalized_user,
                 "timestamp": timestamp,
+                "received_at": received_at,
+                "latency_seconds": float_value(message.get("latency_seconds")),
                 "activity_type": "TRADE",
                 "condition_id": str(trade.get("condition_id") or ""),
                 "token_id": str(trade.get("token_id") or ""),
@@ -6579,6 +7030,62 @@ def rtds_trade_raw_payload(trade: dict[str, Any]) -> dict[str, Any]:
         "size": float_value(trade.get("size")),
         "usdcSize": float_value(trade.get("notional")),
     }
+
+
+def wallet_activity_row_needs_token_metadata(row: dict[str, Any]) -> bool:
+    if not str(row.get("token_id") or ""):
+        return False
+    raw = activity_raw_json(row)
+    return not all(
+        (
+            str(row.get("condition_id") or raw.get("conditionId") or raw.get("condition_id") or ""),
+            str(row.get("title") or raw.get("title") or ""),
+            str(row.get("slug") or raw.get("slug") or ""),
+            str(row.get("event_slug") or raw.get("eventSlug") or raw.get("event_slug") or ""),
+            str(row.get("outcome") or raw.get("outcome") or ""),
+        )
+    )
+
+
+def enrich_wallet_activity_rows_with_token_metadata(
+    rows: list[dict[str, Any]],
+    metadata_by_token: dict[str, dict[str, Any]],
+) -> list[dict[str, Any]]:
+    if not metadata_by_token:
+        return rows
+    enriched_rows: list[dict[str, Any]] = []
+    for row in rows:
+        token_id = str(row.get("token_id") or "")
+        metadata = metadata_by_token.get(token_id)
+        if not metadata:
+            enriched_rows.append(row)
+            continue
+        next_row = dict(row)
+        raw = dict(activity_raw_json(row))
+        condition_id = str(metadata.get("condition_id") or "")
+        title = str(metadata.get("title") or "")
+        slug = str(metadata.get("slug") or "")
+        event_slug = str(metadata.get("event_slug") or "")
+        outcome = str(metadata.get("outcome") or "")
+        if condition_id and not str(next_row.get("condition_id") or ""):
+            next_row["condition_id"] = condition_id
+        if title and not str(next_row.get("title") or raw.get("title") or ""):
+            next_row["title"] = title
+            raw["title"] = title
+        if slug and not str(next_row.get("slug") or raw.get("slug") or ""):
+            next_row["slug"] = slug
+            raw["slug"] = slug
+        if event_slug and not str(next_row.get("event_slug") or raw.get("eventSlug") or raw.get("event_slug") or ""):
+            next_row["event_slug"] = event_slug
+            raw["eventSlug"] = event_slug
+        if outcome and not str(next_row.get("outcome") or raw.get("outcome") or ""):
+            next_row["outcome"] = outcome
+            raw["outcome"] = outcome
+        if condition_id and not str(raw.get("conditionId") or raw.get("condition_id") or ""):
+            raw["conditionId"] = condition_id
+        next_row["raw_json"] = json.dumps(raw, ensure_ascii=False, separators=(",", ":"))
+        enriched_rows.append(next_row)
+    return enriched_rows
 
 
 def summarize_activity_rows(user: str, rows: list[dict[str, Any]]) -> dict[str, Any]:
@@ -6661,18 +7168,20 @@ def recent_activity_from_rows(rows: list[dict[str, Any]], limit: int) -> list[di
         output.append(
             {
                 "timestamp": api_datetime(row.get("timestamp")),
+                "received_at": api_datetime(row.get("received_at")),
+                "latency_seconds": float_value(row.get("latency_seconds")),
                 "activity_type": str(row.get("activity_type") or ""),
                 "side": str(row.get("side") or ""),
                 "price": float_value(row.get("price")),
                 "size": float_value(row.get("size")),
                 "notional": float_value(row.get("notional")),
-                "condition_id": str(row.get("condition_id") or ""),
+                "condition_id": str(row.get("condition_id") or raw.get("conditionId") or raw.get("condition_id") or ""),
                 "token_id": str(row.get("token_id") or ""),
                 "transaction_hash": str(row.get("transaction_hash") or ""),
-                "title": str(raw.get("title") or ""),
-                "slug": str(raw.get("slug") or ""),
-                "event_slug": str(raw.get("eventSlug") or raw.get("event_slug") or ""),
-                "outcome": str(raw.get("outcome") or ""),
+                "title": str(row.get("title") or raw.get("title") or ""),
+                "slug": str(row.get("slug") or raw.get("slug") or ""),
+                "event_slug": str(row.get("event_slug") or raw.get("eventSlug") or raw.get("event_slug") or ""),
+                "outcome": str(row.get("outcome") or raw.get("outcome") or ""),
                 "source": str(row.get("source") or ""),
             }
         )
@@ -6972,12 +7481,76 @@ def merge_closed_positions(
     return sort_wallet_positions(merged, "abs_pnl")
 
 
+def merge_fifa_position_overrides(
+    snapshot_positions: list[dict[str, Any]],
+    activity_positions: list[dict[str, Any]],
+    closed_positions: list[dict[str, Any]],
+    fifa_positions: list[dict[str, Any]],
+) -> tuple[list[dict[str, Any]], list[dict[str, Any]], list[dict[str, Any]]]:
+    fifa_positions = [dict(position) for position in fifa_positions if position]
+    if not fifa_positions:
+        return snapshot_positions, activity_positions, closed_positions
+
+    closed_fifa_positions = [
+        position for position in fifa_positions if position.get("is_settled_or_redeemable")
+    ]
+    return (
+        replace_worldcup_positions(snapshot_positions, fifa_positions),
+        replace_worldcup_positions(activity_positions, fifa_positions),
+        replace_worldcup_positions(closed_positions, closed_fifa_positions),
+    )
+
+
+def replace_worldcup_positions(
+    positions: list[dict[str, Any]],
+    overrides: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    if not overrides:
+        return positions
+
+    override_keys = {wallet_position_key(position) for position in overrides}
+    override_conditions = {
+        str(position.get("condition_id") or "")
+        for position in overrides
+        if str(position.get("condition_id") or "")
+    }
+    merged: list[dict[str, Any]] = []
+    seen = set()
+    for position in positions:
+        key = wallet_position_key(position)
+        condition_id = str(position.get("condition_id") or "")
+        if key in override_keys:
+            continue
+        if (
+            condition_id
+            and condition_id in override_conditions
+            and wallet_position_is_worldcup(position)
+        ):
+            continue
+        merged.append(position)
+        seen.add(key)
+
+    for override in overrides:
+        key = wallet_position_key(override)
+        if key in seen:
+            continue
+        merged.append(override)
+        seen.add(key)
+    return merged
+
+
 def wallet_position_key(position: dict[str, Any]) -> tuple[str, str, str]:
     return (
         str(position.get("condition_id") or ""),
         str(position.get("asset") or ""),
         str(position.get("outcome") or ""),
     )
+
+
+def wallet_position_is_worldcup(position: dict[str, Any]) -> bool:
+    return bool(position.get("is_worldcup")) or str(position.get("slug") or "").startswith(
+        "fifwc-"
+    ) or str(position.get("event_slug") or "").startswith("fifwc-")
 
 
 def wallet_position_holding_seconds(position: dict[str, Any]) -> float | None:
@@ -7697,6 +8270,18 @@ def ratio_percent(value: float, total: float) -> float:
 def param(query: dict[str, list[str]], key: str, default: str = "") -> str:
     value = query.get(key, [default])[0]
     return str(value or default)
+
+
+def normalized_query_cache_key(query: dict[str, list[str]]) -> tuple[tuple[str, tuple[str, ...]], ...]:
+    return tuple(
+        sorted(
+            (
+                str(key),
+                tuple(str(value) for value in values),
+            )
+            for key, values in query.items()
+        )
+    )
 
 
 def truthy_param(query: dict[str, list[str]], key: str) -> bool:
