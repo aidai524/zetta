@@ -1,0 +1,9 @@
+[Unit]
+Description=Zetta export and sync prod publish snapshots
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+EnvironmentFile=-/etc/zetta/zetta-publish-sync.env
+ExecStart=/usr/local/bin/zetta-publish-sync

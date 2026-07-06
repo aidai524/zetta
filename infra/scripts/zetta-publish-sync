@@ -1,0 +1,39 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+ENV_FILE="${ZETTA_PUBLISH_SYNC_ENV_FILE:-/etc/zetta/zetta-publish-sync.env}"
+if [[ -f "$ENV_FILE" ]]; then
+  # shellcheck disable=SC1090
+  source "$ENV_FILE"
+fi
+
+SOURCE_DIR="${ZETTA_PUBLISH_SOURCE_DIR:-/root/zetta}"
+PYTHON_BIN="${ZETTA_PYTHON:-/opt/zetta/.venv/bin/python}"
+PUBLISH_DIR="${ZETTA_PUBLISH_DATA_DIR:-/var/lib/zetta/publish}"
+SYNC_TARGET="${ZETTA_PUBLISH_SYNC_TARGET:-}"
+SSH_OPTS="${ZETTA_PUBLISH_SSH_OPTS:--o BatchMode=yes -o ConnectTimeout=10 -o StrictHostKeyChecking=accept-new}"
+LOCK_FILE="${ZETTA_PUBLISH_SYNC_LOCK_FILE:-/run/zetta-publish-sync.lock}"
+
+mkdir -p "$PUBLISH_DIR"
+
+(
+  flock -n 9 || {
+    echo '{"status":"skipped","reason":"publish_sync_already_running"}'
+    exit 0
+  }
+
+  cd "$SOURCE_DIR"
+  PYTHONPATH="$SOURCE_DIR/src" "$PYTHON_BIN" -m zetta.cli \
+    --publish-data-dir "$PUBLISH_DIR" \
+    publish export-core
+
+  if [[ -z "$SYNC_TARGET" ]]; then
+    echo '{"status":"exported","sync":"skipped","reason":"missing_ZETTA_PUBLISH_SYNC_TARGET"}'
+    exit 0
+  fi
+
+  # Deliberately split SSH_OPTS to allow standard "-o Key=Value" entries from env.
+  # shellcheck disable=SC2086
+  rsync -az --delete -e "ssh $SSH_OPTS" "$PUBLISH_DIR/" "$SYNC_TARGET"
+  echo "{\"status\":\"synced\",\"target\":\"$SYNC_TARGET\"}"
+) 9>"$LOCK_FILE"

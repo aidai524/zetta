@@ -254,10 +254,39 @@ For automatic refresh, schedule the stg export and rsync every 1-5 minutes. The 
 reads the `current` pointer on each request, so no API restart is needed after a
 snapshot sync.
 
-Example stg cron:
+Preferred stg systemd timer:
 
-```cron
-* * * * * cd /opt/zetta && PYTHONPATH=/opt/zetta/src /opt/zetta/.venv/bin/python -m zetta.cli --publish-data-dir /var/lib/zetta/publish publish export-core >/var/log/zetta-publish-export.log 2>&1 && rsync -az --delete /var/lib/zetta/publish/ zetta@PROD_HOST:/var/lib/zetta/publish/ >/var/log/zetta-publish-rsync.log 2>&1
+```bash
+sudo install -m 0755 /opt/zetta/infra/scripts/zetta-publish-sync \
+  /usr/local/bin/zetta-publish-sync
+sudo install -m 0644 /opt/zetta/infra/systemd/zetta-publish-sync.service \
+  /etc/systemd/system/
+sudo install -m 0644 /opt/zetta/infra/systemd/zetta-publish-sync.timer \
+  /etc/systemd/system/
+sudo install -m 0640 /opt/zetta/infra/systemd/zetta-publish-sync.env.example \
+  /etc/zetta/zetta-publish-sync.env
+sudo systemctl daemon-reload
+sudo systemctl enable --now zetta-publish-sync.timer
+```
+
+Edit `/etc/zetta/zetta-publish-sync.env` on stg:
+
+```text
+ZETTA_PUBLISH_SOURCE_DIR=/opt/zetta
+ZETTA_PYTHON=/opt/zetta/.venv/bin/python
+ZETTA_PUBLISH_DATA_DIR=/var/lib/zetta/publish
+ZETTA_PUBLISH_SYNC_TARGET=zetta@PROD_HOST:/var/lib/zetta/publish/
+```
+
+The prod `zetta` user must allow the stg SSH public key. If the timer logs
+`Permission denied (publickey)`, add the stg key to
+`/home/zetta/.ssh/authorized_keys` on prod.
+
+Manual stg run:
+
+```bash
+sudo systemctl start zetta-publish-sync.service
+sudo journalctl -u zetta-publish-sync.service -n 100 --no-pager
 ```
 
 ## 9. Start API And Realtime Feed
