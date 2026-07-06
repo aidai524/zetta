@@ -295,10 +295,32 @@ The first two should include:
 ```json
 {
   "publish": {
-    "source": "publish_snapshot"
+    "source": "publish_snapshot",
+    "freshness_status": "fresh"
   }
 }
 ```
+
+Snapshot freshness health:
+
+```bash
+curl -sS 'http://127.0.0.1:8088/health/publish' | jq .
+curl -sS 'http://127.0.0.1:8088/health/publish?strict=1' | jq .
+```
+
+Default freshness thresholds:
+
+```text
+fresh    <= 180 seconds
+degraded <= 600 seconds
+stale    <= 1800 seconds
+expired  > 1800 seconds
+missing  no local snapshot
+```
+
+`strict=1` returns HTTP `503` when the overall status is `stale` or `critical`.
+Without `strict=1`, the endpoint returns HTTP `200` with the status in the JSON body,
+which is more convenient for frontend display.
 
 Wallet live detail is not a publish snapshot endpoint; it calls live Polymarket wallet
 APIs plus local realtime feed cache:
@@ -362,6 +384,7 @@ sudo -u zetta /opt/zetta/.venv/bin/python -m zetta.cli \
   --publish-data-dir /var/lib/zetta/publish \
   publish inspect --dataset wallets_screener_fifa
 curl -sS 'http://127.0.0.1:8088/wallets/screener?scope=fifa&mode=whale&limit=1' | jq '.publish'
+curl -sS 'http://127.0.0.1:8088/health/publish?strict=1' | jq .
 ```
 
 Expected:
@@ -370,6 +393,7 @@ Expected:
 - API and official feed are active.
 - publish snapshot is present and recent.
 - core list endpoints show `publish.source = publish_snapshot`.
+- `/health/publish` status is `ok` or `degraded`; `stale` / `critical` needs attention.
 - no heavy timers are active on prod.
 
 Check no heavy timers:

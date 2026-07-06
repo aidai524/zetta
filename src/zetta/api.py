@@ -24,7 +24,16 @@ from zetta.loaders.data import activity_rows, wallet_pnl_snapshot_rows, wallet_p
 from zetta.official_trade_feed import load_recent_trade_messages, load_recent_wallet_trade_messages
 from zetta.polymarket import PolymarketClient
 from zetta.polycop_wallets import PolycopWalletSignalCacheStore
-from zetta.publish import load_publish_snapshot, publish_age_seconds
+from zetta.publish import (
+    CORE_API_DATASETS,
+    PUBLISH_DEGRADED_SECONDS,
+    PUBLISH_FRESH_SECONDS,
+    PUBLISH_STALE_SECONDS,
+    load_publish_snapshot,
+    normalize_dataset_name,
+    publish_age_seconds,
+    publish_freshness_status,
+)
 from zetta.scheduler.tasks import PostgresTaskStore, Task
 from zetta.storage.clickhouse import ClickHouseWriter
 from zetta.tracked_wallets import TrackedWalletStore, normalize_wallet_address
@@ -88,6 +97,8 @@ class ProductApi:
     ) -> ApiResponse:
         if path == "/health":
             return ApiResponse(HTTPStatus.OK, {"ok": True})
+        if path == "/health/publish":
+            return self.publish_health_response(query)
         if path == "/stats/overview":
             return ApiResponse(HTTPStatus.OK, {"overview": self.stats_overview()})
         if path == "/stats/ingestion":
@@ -258,9 +269,81 @@ class ProductApi:
         return {
             "status": "missing_publish_snapshot",
             "dataset": dataset,
+            "freshness_status": "missing",
             "publish_data_dir": str(self.settings.publish_data_dir) if self.settings else "",
             "message": "prod/readonly mode requires a local publish snapshot for this endpoint",
         }
+
+    def publish_health_response(self, query: dict[str, list[str]]) -> ApiResponse:
+        if self.settings is None:
+            return ApiResponse(
+                HTTPStatus.SERVICE_UNAVAILABLE,
+                {"status": "settings_unavailable", "datasets": []},
+            )
+        requested_datasets = publish_health_dataset_names(query)
+        unknown_datasets = [
+            dataset for dataset in requested_datasets if dataset not in CORE_API_DATASETS
+        ]
+        if unknown_datasets:
+            return ApiResponse(
+                HTTPStatus.BAD_REQUEST,
+                {
+                    "status": "invalid_dataset",
+                    "unknown_datasets": unknown_datasets,
+                    "available_datasets": sorted(CORE_API_DATASETS),
+                },
+            )
+
+        thresholds = publish_health_thresholds(query)
+        datasets = []
+        for dataset in requested_datasets:
+            snapshot = load_publish_snapshot(self.settings.publish_data_dir, dataset)
+            if snapshot is None:
+                datasets.append(
+                    {
+                        "dataset": dataset,
+                        "status": "missing",
+                        "ok": False,
+                        "publish_data_dir": str(self.settings.publish_data_dir),
+                        "thresholds": thresholds,
+                    }
+                )
+                continue
+            age_seconds = publish_age_seconds(snapshot.manifest)
+            status = publish_freshness_status(age_seconds, **thresholds)
+            datasets.append(
+                {
+                    "dataset": snapshot.dataset,
+                    "status": status,
+                    "ok": status in {"fresh", "degraded"},
+                    "version": snapshot.version,
+                    "generated_at": snapshot.manifest.get("generated_at"),
+                    "age_seconds": age_seconds,
+                    "row_count": snapshot.manifest.get("row_count"),
+                    "schema_version": snapshot.manifest.get("schema_version"),
+                    "thresholds": thresholds,
+                }
+            )
+
+        overall_status = publish_overall_health_status(
+            [str(dataset.get("status") or "") for dataset in datasets]
+        )
+        body = {
+            "status": overall_status,
+            "ok": overall_status in {"ok", "degraded"},
+            "env": self.settings.env,
+            "serving_mode": self.settings.serving_mode,
+            "uses_publish_snapshots": self.settings.uses_publish_snapshots(),
+            "publish_data_dir": str(self.settings.publish_data_dir),
+            "datasets": datasets,
+        }
+        strict = truthy_param(query, "strict")
+        http_status = (
+            HTTPStatus.SERVICE_UNAVAILABLE
+            if strict and overall_status in {"stale", "critical"}
+            else HTTPStatus.OK
+        )
+        return ApiResponse(http_status, body)
 
     def published_api_payload(
         self,
@@ -287,14 +370,21 @@ class ProductApi:
             payload["limit"] = limit
             payload["offset"] = offset
             payload["total"] = len(rows)
+        age_seconds = publish_age_seconds(snapshot.manifest)
         payload["publish"] = {
             "source": "publish_snapshot",
             "dataset": snapshot.dataset,
             "version": snapshot.version,
             "generated_at": snapshot.manifest.get("generated_at"),
-            "age_seconds": publish_age_seconds(snapshot.manifest),
+            "age_seconds": age_seconds,
+            "freshness_status": publish_freshness_status(age_seconds),
             "row_count": snapshot.manifest.get("row_count"),
             "schema_version": snapshot.manifest.get("schema_version"),
+            "thresholds": {
+                "fresh_seconds": PUBLISH_FRESH_SECONDS,
+                "degraded_seconds": PUBLISH_DEGRADED_SECONDS,
+                "stale_seconds": PUBLISH_STALE_SECONDS,
+            },
         }
         return payload
 
@@ -8370,6 +8460,60 @@ def normalized_query_cache_key(query: dict[str, list[str]]) -> tuple[tuple[str, 
             for key, values in query.items()
         )
     )
+
+
+def publish_health_dataset_names(query: dict[str, list[str]]) -> list[str]:
+    raw_values = list(query.get("dataset", [])) + list(query.get("datasets", []))
+    datasets: list[str] = []
+    for raw_value in raw_values:
+        for part in str(raw_value).split(","):
+            dataset = normalize_dataset_name(part)
+            if dataset:
+                datasets.append(dataset)
+    if not datasets:
+        return sorted(CORE_API_DATASETS)
+    return list(dict.fromkeys(datasets))
+
+
+def publish_health_thresholds(query: dict[str, list[str]]) -> dict[str, int]:
+    fresh_seconds = bounded_int_param(
+        query,
+        "fresh_seconds",
+        PUBLISH_FRESH_SECONDS,
+        minimum=0,
+        maximum=86_400,
+    )
+    degraded_seconds = bounded_int_param(
+        query,
+        "degraded_seconds",
+        PUBLISH_DEGRADED_SECONDS,
+        minimum=fresh_seconds,
+        maximum=86_400,
+    )
+    stale_seconds = bounded_int_param(
+        query,
+        "stale_seconds",
+        PUBLISH_STALE_SECONDS,
+        minimum=degraded_seconds,
+        maximum=604_800,
+    )
+    return {
+        "fresh_seconds": fresh_seconds,
+        "degraded_seconds": degraded_seconds,
+        "stale_seconds": stale_seconds,
+    }
+
+
+def publish_overall_health_status(statuses: list[str]) -> str:
+    if not statuses:
+        return "critical"
+    if any(status in {"missing", "expired", "unknown"} for status in statuses):
+        return "critical"
+    if any(status == "stale" for status in statuses):
+        return "stale"
+    if any(status == "degraded" for status in statuses):
+        return "degraded"
+    return "ok"
 
 
 def publish_snapshot_query_compatible(

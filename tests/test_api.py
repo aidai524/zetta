@@ -1,5 +1,6 @@
 import json
 import re
+from datetime import UTC, datetime, timedelta
 from types import SimpleNamespace
 
 from zetta.api import (
@@ -26,6 +27,38 @@ class FakeClickHouse:
         if self.outputs:
             return self.outputs.pop(0)
         return self.output
+
+
+def write_core_publish_snapshots(tmp_path, *, generated_at: datetime) -> None:
+    specs = {
+        "wallets_screener_fifa": (
+            {"wallets": [{"user_address": "0xone"}]},
+            "wallets",
+            "/wallets/screener",
+            "scope=fifa&mode=whale&limit=500",
+        ),
+        "wallets_polycop_fifa_signals": (
+            {"status": "ok", "wallets": [{"address": "0xone"}]},
+            "wallets",
+            "/wallets/polycop-fifa-signals",
+            "limit=500&min_fifa_notional=1000&data_quality=estimate",
+        ),
+        "wallets_fifa_24h_pnl": (
+            {"wallets": [{"user_address": "0xone"}]},
+            "wallets",
+            "/wallets/fifa-24h-pnl",
+            "limit=500&sort=pnl_24h&direction=desc",
+        ),
+    }
+    for dataset, (payload, list_key, path, query) in specs.items():
+        write_publish_snapshot(
+            tmp_path,
+            dataset,
+            payload,
+            list_key=list_key,
+            generated_at=generated_at,
+            parameters={"path": path, "query": query},
+        )
 
 
 def test_rows_json_parses_jsoneachrow() -> None:
@@ -569,7 +602,57 @@ def test_product_api_prod_screener_reads_publish_snapshot(tmp_path) -> None:
     assert response.body["wallets"] == [{"user_address": "0xone", "rank": 1}]
     assert response.body["total"] == 2
     assert response.body["publish"]["dataset"] == "wallets_screener_fifa"
+    assert response.body["publish"]["freshness_status"] == "fresh"
     assert fake.queries == []
+
+
+def test_product_api_publish_health_reports_fresh_snapshots(tmp_path) -> None:
+    write_core_publish_snapshots(
+        tmp_path,
+        generated_at=datetime.now(UTC) - timedelta(seconds=30),
+    )
+    api = ProductApi(
+        clickhouse=FakeClickHouse(),
+        settings=Settings(env="prod", serving_mode="readonly", publish_data_dir=tmp_path),
+    )
+
+    response = api.handle("/health/publish", {})
+
+    assert response.status == 200
+    assert response.body["status"] == "ok"
+    assert response.body["ok"] is True
+    assert {dataset["status"] for dataset in response.body["datasets"]} == {"fresh"}
+
+
+def test_product_api_publish_health_reports_expired_snapshot_as_critical(tmp_path) -> None:
+    write_core_publish_snapshots(
+        tmp_path,
+        generated_at=datetime.now(UTC) - timedelta(seconds=2000),
+    )
+    api = ProductApi(
+        clickhouse=FakeClickHouse(),
+        settings=Settings(env="prod", serving_mode="readonly", publish_data_dir=tmp_path),
+    )
+
+    response = api.handle("/health/publish", {"strict": ["1"]})
+
+    assert response.status == 503
+    assert response.body["status"] == "critical"
+    assert response.body["ok"] is False
+    assert {dataset["status"] for dataset in response.body["datasets"]} == {"expired"}
+
+
+def test_product_api_publish_health_reports_missing_snapshot(tmp_path) -> None:
+    api = ProductApi(
+        clickhouse=FakeClickHouse(),
+        settings=Settings(env="prod", serving_mode="readonly", publish_data_dir=tmp_path),
+    )
+
+    response = api.handle("/health/publish", {"dataset": ["wallets_screener_fifa"]})
+
+    assert response.status == 200
+    assert response.body["status"] == "critical"
+    assert response.body["datasets"][0]["status"] == "missing"
 
 
 def test_product_api_prod_incompatible_publish_snapshot_returns_503(tmp_path) -> None:

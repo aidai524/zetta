@@ -11,6 +11,9 @@ from urllib.parse import parse_qs
 
 
 SCHEMA_VERSION = 1
+PUBLISH_FRESH_SECONDS = 180
+PUBLISH_DEGRADED_SECONDS = 600
+PUBLISH_STALE_SECONDS = 1800
 
 
 @dataclass(frozen=True)
@@ -194,3 +197,21 @@ def publish_age_seconds(manifest: dict[str, Any], *, now: datetime | None = None
     if parsed.tzinfo is None:
         parsed = parsed.replace(tzinfo=UTC)
     return max(0.0, ((now or datetime.now(UTC)) - parsed.astimezone(UTC)).total_seconds())
+
+
+def publish_freshness_status(
+    age_seconds: float | None,
+    *,
+    fresh_seconds: int = PUBLISH_FRESH_SECONDS,
+    degraded_seconds: int = PUBLISH_DEGRADED_SECONDS,
+    stale_seconds: int = PUBLISH_STALE_SECONDS,
+) -> str:
+    if age_seconds is None:
+        return "unknown"
+    if age_seconds <= fresh_seconds:
+        return "fresh"
+    if age_seconds <= degraded_seconds:
+        return "degraded"
+    if age_seconds <= stale_seconds:
+        return "stale"
+    return "expired"
