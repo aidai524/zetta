@@ -24,6 +24,7 @@ from zetta.loaders.data import activity_rows, wallet_pnl_snapshot_rows, wallet_p
 from zetta.official_trade_feed import load_recent_trade_messages, load_recent_wallet_trade_messages
 from zetta.polymarket import PolymarketClient
 from zetta.polycop_wallets import PolycopWalletSignalCacheStore
+from zetta.publish import load_publish_snapshot, publish_age_seconds
 from zetta.scheduler.tasks import PostgresTaskStore, Task
 from zetta.storage.clickhouse import ClickHouseWriter
 from zetta.tracked_wallets import TrackedWalletStore, normalize_wallet_address
@@ -154,6 +155,18 @@ class ProductApi:
             return ApiResponse(HTTPStatus.OK, {"summary": self.wallet_summary(query)})
         if path == "/wallets/screener":
             if wallet_detail_scope(param(query, "scope", "all")) == "fifa":
+                published = self.published_api_payload(
+                    "wallets_screener_fifa",
+                    query,
+                    list_key="wallets",
+                )
+                if published is not None:
+                    return ApiResponse(HTTPStatus.OK, published)
+                if self.uses_publish_snapshots():
+                    return ApiResponse(
+                        HTTPStatus.SERVICE_UNAVAILABLE,
+                        self.missing_publish_snapshot_response("wallets_screener_fifa"),
+                    )
                 output = self.cached_critical_endpoint(
                     ("wallets_screener_fifa", normalized_query_cache_key(query)),
                     ttl_seconds=30.0,
@@ -163,6 +176,18 @@ class ProductApi:
                 return ApiResponse(HTTPStatus.OK, output)
             return ApiResponse(HTTPStatus.OK, {"wallets": self.wallet_screener(query)})
         if path == "/wallets/fifa-24h-pnl":
+            published = self.published_api_payload(
+                "wallets_fifa_24h_pnl",
+                query,
+                list_key="wallets",
+            )
+            if published is not None:
+                return ApiResponse(HTTPStatus.OK, published)
+            if self.uses_publish_snapshots():
+                return ApiResponse(
+                    HTTPStatus.SERVICE_UNAVAILABLE,
+                    self.missing_publish_snapshot_response("wallets_fifa_24h_pnl"),
+                )
             return ApiResponse(HTTPStatus.OK, self.wallet_fifa_24h_pnl(query))
         if path == "/wallets/polycop-signals/summary":
             output = self.polycop_wallet_signals(query, include_wallets=False)
@@ -181,6 +206,18 @@ class ProductApi:
             )
             return ApiResponse(status, output)
         if path == "/wallets/polycop-fifa-signals":
+            published = self.published_api_payload(
+                "wallets_polycop_fifa_signals",
+                query,
+                list_key="wallets",
+            )
+            if published is not None:
+                return ApiResponse(HTTPStatus.OK, published)
+            if self.uses_publish_snapshots():
+                return ApiResponse(
+                    HTTPStatus.SERVICE_UNAVAILABLE,
+                    self.missing_publish_snapshot_response("wallets_polycop_fifa_signals"),
+                )
             output = self.cached_critical_endpoint(
                 ("wallets_polycop_fifa_signals", normalized_query_cache_key(query)),
                 ttl_seconds=60.0,
@@ -213,6 +250,53 @@ class ProductApi:
         if path == "/alerts":
             return ApiResponse(HTTPStatus.OK, {"alerts": self.alerts(query)})
         return ApiResponse(HTTPStatus.NOT_FOUND, {"error": "not_found"})
+
+    def uses_publish_snapshots(self) -> bool:
+        return self.settings is not None and self.settings.uses_publish_snapshots()
+
+    def missing_publish_snapshot_response(self, dataset: str) -> dict[str, Any]:
+        return {
+            "status": "missing_publish_snapshot",
+            "dataset": dataset,
+            "publish_data_dir": str(self.settings.publish_data_dir) if self.settings else "",
+            "message": "prod/readonly mode requires a local publish snapshot for this endpoint",
+        }
+
+    def published_api_payload(
+        self,
+        dataset: str,
+        query: dict[str, list[str]],
+        *,
+        list_key: str | None,
+    ) -> dict[str, Any] | None:
+        if not self.uses_publish_snapshots() or self.settings is None:
+            return None
+        snapshot = load_publish_snapshot(self.settings.publish_data_dir, dataset)
+        if snapshot is None:
+            return None
+        if not publish_snapshot_query_compatible(snapshot.manifest, query):
+            return None
+        payload = deepcopy(snapshot.payload)
+        if not isinstance(payload, dict):
+            payload = {"data": payload}
+        if list_key and isinstance(payload.get(list_key), list):
+            rows = list(payload[list_key])
+            offset = bounded_int_param(query, "offset", 0, minimum=0, maximum=100_000)
+            limit = int_param(query, "limit", len(rows), maximum=500)
+            payload[list_key] = rows[offset : offset + limit]
+            payload["limit"] = limit
+            payload["offset"] = offset
+            payload["total"] = len(rows)
+        payload["publish"] = {
+            "source": "publish_snapshot",
+            "dataset": snapshot.dataset,
+            "version": snapshot.version,
+            "generated_at": snapshot.manifest.get("generated_at"),
+            "age_seconds": publish_age_seconds(snapshot.manifest),
+            "row_count": snapshot.manifest.get("row_count"),
+            "schema_version": snapshot.manifest.get("schema_version"),
+        }
+        return payload
 
     def cached_critical_endpoint(
         self,
@@ -4712,18 +4796,22 @@ class ProductApi:
             position for position in activity_positions if position.get("is_settled_or_redeemable")
         ]
         recent_activity = recent_activity_from_rows(live_activity_rows, activity_limit)
-        try:
-            reputation = self.cached_wallet_detail_reputation(user)
-        except Exception:
+        if self.uses_publish_snapshots():
             reputation = None
-        positions_override, activity_positions, closed_positions = (
-            self.wallet_positions_with_fifa_overrides(
-                user,
-                portfolio,
-                activity_positions,
-                closed_positions,
+            positions_override = wallet_positions_from_snapshot(portfolio)
+        else:
+            try:
+                reputation = self.cached_wallet_detail_reputation(user)
+            except Exception:
+                reputation = None
+            positions_override, activity_positions, closed_positions = (
+                self.wallet_positions_with_fifa_overrides(
+                    user,
+                    portfolio,
+                    activity_positions,
+                    closed_positions,
+                )
             )
-        )
 
         if not any((portfolio, pnl, live_activity_rows)):
             return None
@@ -8282,6 +8370,30 @@ def normalized_query_cache_key(query: dict[str, list[str]]) -> tuple[tuple[str, 
             for key, values in query.items()
         )
     )
+
+
+def publish_snapshot_query_compatible(
+    manifest: dict[str, Any],
+    query: dict[str, list[str]],
+) -> bool:
+    parameters = manifest.get("parameters")
+    if not isinstance(parameters, dict):
+        return True
+    published_query_text = str(parameters.get("query") or "")
+    if not published_query_text:
+        return True
+    published = parse_qs(published_query_text, keep_blank_values=True)
+    ignored = {"limit", "offset", "ttl", "pages"}
+    for key, values in query.items():
+        if key in ignored:
+            continue
+        published_values = tuple(str(value) for value in published.get(key, []))
+        requested_values = tuple(str(value) for value in values)
+        if requested_values and not published_values:
+            return False
+        if requested_values != published_values:
+            return False
+    return True
 
 
 def truthy_param(query: dict[str, list[str]], key: str) -> bool:

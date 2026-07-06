@@ -12,6 +12,7 @@ from zetta.api import (
     unusual_betting_cache_key,
 )
 from zetta.config import Settings
+from zetta.publish import write_publish_snapshot
 
 
 class FakeClickHouse:
@@ -537,6 +538,67 @@ def test_product_api_wallet_screener_fifa_whale_includes_fifa_performance_fields
     assert "fifa.win_rate_7d as fifa_win_rate_7d" in query
 
 
+def test_product_api_prod_screener_reads_publish_snapshot(tmp_path) -> None:
+    write_publish_snapshot(
+        tmp_path,
+        "wallets_screener_fifa",
+        {
+            "wallets": [
+                {"user_address": "0xone", "rank": 1},
+                {"user_address": "0xtwo", "rank": 2},
+            ]
+        },
+        list_key="wallets",
+        parameters={
+            "path": "/wallets/screener",
+            "query": "scope=fifa&mode=whale&limit=500",
+        },
+    )
+    fake = FakeClickHouse('{"user_address":"0xshould-not-query"}\n')
+    api = ProductApi(
+        clickhouse=fake,
+        settings=Settings(env="prod", serving_mode="readonly", publish_data_dir=tmp_path),
+    )
+
+    response = api.handle(
+        "/wallets/screener",
+        {"scope": ["fifa"], "mode": ["whale"], "limit": ["1"]},
+    )
+
+    assert response.status == 200
+    assert response.body["wallets"] == [{"user_address": "0xone", "rank": 1}]
+    assert response.body["total"] == 2
+    assert response.body["publish"]["dataset"] == "wallets_screener_fifa"
+    assert fake.queries == []
+
+
+def test_product_api_prod_incompatible_publish_snapshot_returns_503(tmp_path) -> None:
+    write_publish_snapshot(
+        tmp_path,
+        "wallets_screener_fifa",
+        {"wallets": [{"user_address": "0xone"}]},
+        list_key="wallets",
+        parameters={
+            "path": "/wallets/screener",
+            "query": "scope=fifa&mode=whale&limit=500",
+        },
+    )
+    fake = FakeClickHouse('{"user_address":"0xshould-not-query"}\n')
+    api = ProductApi(
+        clickhouse=fake,
+        settings=Settings(env="prod", serving_mode="readonly", publish_data_dir=tmp_path),
+    )
+
+    response = api.handle(
+        "/wallets/screener",
+        {"scope": ["fifa"], "mode": ["smart"], "limit": ["1"]},
+    )
+
+    assert response.status == 503
+    assert response.body["status"] == "missing_publish_snapshot"
+    assert fake.queries == []
+
+
 def test_product_api_wallet_fifa_24h_pnl_reads_cached_mart() -> None:
     fake = FakeClickHouse(
         outputs=[
@@ -621,6 +683,40 @@ def test_product_api_wallet_fifa_24h_pnl_can_filter_to_active_wallets() -> None:
     query = fake.queries[0]
     assert "fifa.trade_count_24h > 0" in query
     assert "order by fifa.trade_count_24h > 0 desc" not in query
+
+
+def test_product_api_prod_polycop_fifa_signals_reads_publish_snapshot(tmp_path) -> None:
+    write_publish_snapshot(
+        tmp_path,
+        "wallets_polycop_fifa_signals",
+        {
+            "status": "ok",
+            "wallets": [
+                {"address": "0xone", "ai_score": 90},
+                {"address": "0xtwo", "ai_score": 80},
+            ],
+        },
+        list_key="wallets",
+        parameters={
+            "path": "/wallets/polycop-fifa-signals",
+            "query": "limit=500&min_fifa_notional=1000&data_quality=estimate",
+        },
+    )
+    fake = FakeClickHouse()
+    api = ProductApi(
+        clickhouse=fake,
+        settings=Settings(env="prod", serving_mode="readonly", publish_data_dir=tmp_path),
+    )
+
+    response = api.handle(
+        "/wallets/polycop-fifa-signals",
+        {"limit": ["1"], "min_fifa_notional": ["1000"], "data_quality": ["estimate"]},
+    )
+
+    assert response.status == 200
+    assert response.body["wallets"] == [{"address": "0xone", "ai_score": 90}]
+    assert response.body["publish"]["dataset"] == "wallets_polycop_fifa_signals"
+    assert fake.queries == []
 
 
 def test_product_api_polycop_wallet_signals_reads_cache_and_filters() -> None:
@@ -1177,6 +1273,63 @@ def test_product_api_wallet_detail_live_uses_polymarket_wallet_apis(monkeypatch)
     assert body["activity_summary"]["traded_notional"] == 23.0
     assert body["recent_activity"][0]["title"] == "Newest trade"
     assert "mart_wallet_reputation" in fake.queries[0]
+
+
+def test_product_api_wallet_detail_live_prod_skips_clickhouse_overrides(
+    monkeypatch, tmp_path
+) -> None:
+    def page(items):
+        return SimpleNamespace(response=SimpleNamespace(body=items, url="https://example.test"), items=items)
+
+    class FakePolymarketClient:
+        def __init__(self, settings) -> None:
+            self.settings = settings
+
+        def data_positions(self, *, user):
+            return page(
+                [
+                    {
+                        "proxyWallet": user,
+                        "asset": "asset-1",
+                        "conditionId": "c1",
+                        "title": "Will Belgium win?",
+                        "slug": "fifwc-bel-egy-win",
+                        "eventSlug": "fifwc-bel-egy",
+                        "outcome": "Yes",
+                        "size": 100,
+                        "avgPrice": 0.5,
+                        "curPrice": 0.7,
+                        "initialValue": 50,
+                        "currentValue": 70,
+                        "cashPnl": 20,
+                    }
+                ]
+            )
+
+        def data_value(self, *, user):
+            return page([{"user": user, "value": 70}])
+
+        def user_pnl(self, *, user, interval, fidelity):
+            return page([{"t": 1781568000, "p": -500.0}])
+
+        def data_activity(self, *, user, limit, offset):
+            return page([])
+
+    monkeypatch.setattr("zetta.api.PolymarketClient", FakePolymarketClient)
+    monkeypatch.setattr(ProductApi, "live_pusd_balance", lambda _self, _user: 12.5)
+    monkeypatch.setattr(ProductApi, "wallet_rtds_activity_rows", lambda *_args, **_kwargs: [])
+    fake = FakeClickHouse(outputs=['{"should":"not-query"}\n'])
+    api = ProductApi(
+        clickhouse=fake,
+        settings=Settings(env="prod", serving_mode="readonly", publish_data_dir=tmp_path),
+    )
+
+    response = api.handle("/wallets/detail", {"user": ["0xABC"], "live": ["1"]})
+
+    assert response.status == 200
+    assert response.body["wallet"]["data_source"] == "live"
+    assert response.body["positions"][0]["title"] == "Will Belgium win?"
+    assert fake.queries == []
 
 
 def test_product_api_wallet_detail_live_realtime_uses_rtds_and_cache(monkeypatch) -> None:

@@ -101,6 +101,16 @@ lightweight publish-sync timer
 monitoring/log rotation
 ```
 
+Recommended prod environment:
+
+```text
+ZETTA_ENV=prod
+ZETTA_SERVING_MODE=readonly
+ZETTA_DISABLE_HEAVY_JOBS=1
+ZETTA_ENABLE_CLICKHOUSE_HEAVY_QUERIES=0
+ZETTA_PUBLISH_DATA_DIR=/var/lib/zetta/publish
+```
+
 Optional later split:
 
 ```text
@@ -290,6 +300,35 @@ Example manifest:
   "checksum": "sha256:..."
 }
 ```
+
+Current CLI support:
+
+```bash
+# On stg: export all core prod snapshots.
+zetta --publish-data-dir /var/lib/zetta/publish publish export-core
+
+# On stg: export one dataset.
+zetta --publish-data-dir /var/lib/zetta/publish publish export-api \
+  --dataset wallets_screener_fifa
+
+# On prod: inspect the active local snapshot.
+zetta --env prod --serving-mode readonly \
+  --publish-data-dir /var/lib/zetta/publish \
+  publish inspect --dataset wallets_screener_fifa
+```
+
+Supported core datasets:
+
+```text
+wallets_screener_fifa
+wallets_polycop_fifa_signals
+wallets_fifa_24h_pnl
+```
+
+In `prod` / `readonly` mode, the API will serve these datasets from the local
+publish snapshot and will not run the heavy ClickHouse query path for the matching
+endpoint. If a compatible snapshot is missing, the endpoint returns
+`missing_publish_snapshot` instead of falling back to a heavy query.
 
 ## Recommended Timers
 

@@ -4,12 +4,12 @@ import argparse
 import json
 import sys
 import time
-from dataclasses import asdict, is_dataclass
+from dataclasses import asdict, is_dataclass, replace
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any
 
-from zetta.api import serve_api
+from zetta.api import ProductApi, serve_api
 from zetta.chain.polymarket import (
     FEE_CHARGED_TOPIC,
     ORDER_FILLED_TOPIC,
@@ -39,6 +39,14 @@ from zetta.official_trade_feed import (
     load_recent_trade_messages,
     load_recent_wallet_trade_messages,
     serve_official_trade_feed,
+)
+from zetta.publish import (
+    CORE_API_DATASETS,
+    load_publish_snapshot,
+    parse_query_string,
+    publish_age_seconds,
+    publish_dataset_spec,
+    write_publish_snapshot,
 )
 from zetta.realtime.orderbook import reconciliation_diff, reconstruct_ws_market_raw, rest_book_summary
 from zetta.realtime_trades import serve_trade_stream
@@ -73,6 +81,8 @@ def main(argv: list[str] | None = None) -> int:
     parser = build_parser()
     args = parser.parse_args(argv)
     app_settings = Settings(
+        env=args.env,
+        serving_mode=args.serving_mode,
         gamma_base_url=args.gamma_base_url,
         data_base_url=args.data_base_url,
         clob_base_url=args.clob_base_url,
@@ -86,11 +96,14 @@ def main(argv: list[str] | None = None) -> int:
         postgres_dsn=args.postgres_dsn,
         raw_data_dir=Path(args.raw_data_dir),
         state_dir=Path(args.state_dir),
+        publish_data_dir=Path(args.publish_data_dir),
         raw_chunk_records=args.raw_chunk_records,
         raw_chunk_seconds=args.raw_chunk_seconds,
         request_timeout_seconds=args.timeout,
         user_agent=args.user_agent,
         http_resolve_overrides=args.http_resolve_overrides,
+        disable_heavy_jobs=args.disable_heavy_jobs,
+        enable_clickhouse_heavy_queries=args.enable_clickhouse_heavy_queries,
     )
     try:
         result = args.func(args, app_settings)
@@ -104,6 +117,8 @@ def main(argv: list[str] | None = None) -> int:
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(prog="zetta")
+    parser.add_argument("--env", default=settings.env)
+    parser.add_argument("--serving-mode", default=settings.serving_mode)
     parser.add_argument("--gamma-base-url", default=settings.gamma_base_url)
     parser.add_argument("--data-base-url", default=settings.data_base_url)
     parser.add_argument("--clob-base-url", default=settings.clob_base_url)
@@ -117,6 +132,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--postgres-dsn", default=settings.postgres_dsn)
     parser.add_argument("--raw-data-dir", default=str(settings.raw_data_dir))
     parser.add_argument("--state-dir", default=str(settings.state_dir))
+    parser.add_argument("--publish-data-dir", default=str(settings.publish_data_dir))
     parser.add_argument("--raw-chunk-records", type=int, default=settings.raw_chunk_records)
     parser.add_argument("--raw-chunk-seconds", type=float, default=settings.raw_chunk_seconds)
     parser.add_argument("--task-file", default="data/state/tasks.json")
@@ -130,11 +146,47 @@ def build_parser() -> argparse.ArgumentParser:
         default=settings.http_resolve_overrides,
         help="Comma-separated host:ip curl fallback overrides, e.g. gamma-api.polymarket.com:1.2.3.4.",
     )
+    parser.add_argument(
+        "--disable-heavy-jobs",
+        action=argparse.BooleanOptionalAction,
+        default=settings.disable_heavy_jobs,
+    )
+    parser.add_argument(
+        "--enable-clickhouse-heavy-queries",
+        action=argparse.BooleanOptionalAction,
+        default=settings.enable_clickhouse_heavy_queries,
+    )
 
     subparsers = parser.add_subparsers(required=True)
 
     endpoints = subparsers.add_parser("endpoints", help="Print configured API endpoints.")
     endpoints.set_defaults(func=cmd_endpoints)
+
+    publish = subparsers.add_parser("publish", help="Create and inspect prod publish snapshots.")
+    publish_subparsers = publish.add_subparsers(required=True)
+
+    export_api = publish_subparsers.add_parser(
+        "export-api",
+        help="Export one core API response as a versioned publish snapshot.",
+    )
+    export_api.add_argument("--dataset", required=True, choices=sorted(CORE_API_DATASETS))
+    export_api.add_argument("--query", help="Override the default dataset query string.")
+    export_api.add_argument("--version")
+    export_api.set_defaults(func=cmd_publish_export_api)
+
+    export_core = publish_subparsers.add_parser(
+        "export-core",
+        help="Export all core prod API publish snapshots.",
+    )
+    export_core.add_argument("--version")
+    export_core.set_defaults(func=cmd_publish_export_core)
+
+    inspect_snapshot = publish_subparsers.add_parser(
+        "inspect",
+        help="Inspect the active publish snapshot manifest.",
+    )
+    inspect_snapshot.add_argument("--dataset", required=True, choices=sorted(CORE_API_DATASETS))
+    inspect_snapshot.set_defaults(func=cmd_publish_inspect)
 
     db = subparsers.add_parser("db", help="Database utility commands.")
     db_subparsers = db.add_subparsers(required=True)
@@ -906,6 +958,11 @@ def add_gamma_args(parser: argparse.ArgumentParser) -> None:
 
 def cmd_endpoints(_args: argparse.Namespace, app_settings: Settings) -> dict[str, str]:
     return {
+        "env": app_settings.env,
+        "serving_mode": app_settings.serving_mode,
+        "publish_data_dir": str(app_settings.publish_data_dir),
+        "uses_publish_snapshots": str(app_settings.uses_publish_snapshots()).lower(),
+        "allows_heavy_queries": str(app_settings.allows_heavy_queries()).lower(),
         "gamma": app_settings.gamma_base_url,
         "data": app_settings.data_base_url,
         "clob": app_settings.clob_base_url,
@@ -921,8 +978,101 @@ def cmd_endpoints(_args: argparse.Namespace, app_settings: Settings) -> dict[str
     }
 
 
+def cmd_publish_export_api(args: argparse.Namespace, app_settings: Settings) -> Any:
+    return export_publish_api_dataset(
+        app_settings,
+        dataset=args.dataset,
+        query=args.query,
+        version=args.version,
+    )
+
+
+def cmd_publish_export_core(args: argparse.Namespace, app_settings: Settings) -> Any:
+    exported = []
+    for dataset in sorted(CORE_API_DATASETS):
+        exported.append(
+            export_publish_api_dataset(
+                app_settings,
+                dataset=dataset,
+                query=None,
+                version=args.version,
+            )
+        )
+    return {"publish_data_dir": str(app_settings.publish_data_dir), "datasets": exported}
+
+
+def export_publish_api_dataset(
+    app_settings: Settings,
+    *,
+    dataset: str,
+    query: str | None,
+    version: str | None,
+) -> dict[str, Any]:
+    spec = publish_dataset_spec(dataset)
+    query_string = query if query is not None else spec.query
+    api = ProductApi(
+        clickhouse=ClickHouseWriter(
+            replace(app_settings, env="stg", serving_mode="compute")
+        ),
+        settings=replace(app_settings, env="stg", serving_mode="compute"),
+    )
+    response = api.handle(spec.path, parse_query_string(query_string))
+    if response.status >= 400:
+        return {
+            "dataset": spec.dataset,
+            "status": "error",
+            "http_status": response.status,
+            "body": response.body,
+        }
+    manifest = write_publish_snapshot(
+        app_settings.publish_data_dir,
+        spec.dataset,
+        response.body,
+        list_key=spec.list_key,
+        version=version,
+        source_env=app_settings.env,
+        parameters={"path": spec.path, "query": query_string},
+    )
+    return {
+        "dataset": spec.dataset,
+        "status": "ok",
+        "path": spec.path,
+        "query": query_string,
+        "manifest": manifest,
+    }
+
+
+def cmd_publish_inspect(args: argparse.Namespace, app_settings: Settings) -> Any:
+    snapshot = load_publish_snapshot(app_settings.publish_data_dir, args.dataset)
+    if snapshot is None:
+        return {
+            "dataset": args.dataset,
+            "status": "missing",
+            "publish_data_dir": str(app_settings.publish_data_dir),
+        }
+    return {
+        "dataset": snapshot.dataset,
+        "status": "ok",
+        "publish_data_dir": str(app_settings.publish_data_dir),
+        "manifest": snapshot.manifest,
+        "age_seconds": publish_age_seconds(snapshot.manifest),
+    }
+
+
 def cmd_db_ping(_args: argparse.Namespace, app_settings: Settings) -> Any:
     return {"clickhouse": ClickHouseWriter(app_settings).ping()}
+
+
+def heavy_job_disabled_response(app_settings: Settings, command: str) -> dict[str, Any] | None:
+    if app_settings.allows_heavy_queries():
+        return None
+    return {
+        "status": "disabled",
+        "command": command,
+        "env": app_settings.env,
+        "serving_mode": app_settings.serving_mode,
+        "reason": "heavy jobs are disabled by configuration",
+    }
 
 
 def cmd_db_migrate(args: argparse.Namespace, app_settings: Settings) -> Any:
@@ -1133,6 +1283,9 @@ CTF_LOG_TOPICS = [
 
 
 def cmd_chain_frontier(args: argparse.Namespace, app_settings: Settings) -> Any:
+    disabled = heavy_job_disabled_response(app_settings, "chain-frontier")
+    if disabled is not None:
+        return disabled
     if args.lookback_blocks <= 0:
         raise ValueError("--lookback-blocks must be positive")
     if args.confirmations < 0:
@@ -2958,58 +3111,94 @@ def cmd_load_lifecycle_events(args: argparse.Namespace, app_settings: Settings) 
 
 
 def cmd_build_market_1m(_args: argparse.Namespace, app_settings: Settings) -> Any:
+    disabled = heavy_job_disabled_response(app_settings, "build market-1m")
+    if disabled is not None:
+        return disabled
     return MartBuilder(clickhouse=ClickHouseWriter(app_settings)).build_market_1m()
 
 
 def cmd_build_trader_profiles(_args: argparse.Namespace, app_settings: Settings) -> Any:
+    disabled = heavy_job_disabled_response(app_settings, "build trader-profiles")
+    if disabled is not None:
+        return disabled
     return MartBuilder(clickhouse=ClickHouseWriter(app_settings)).build_trader_profiles()
 
 
 def cmd_build_wallet_trade_rollup(args: argparse.Namespace, app_settings: Settings) -> Any:
+    disabled = heavy_job_disabled_response(app_settings, "build wallet-trade-rollup")
+    if disabled is not None:
+        return disabled
     return MartBuilder(clickhouse=ClickHouseWriter(app_settings)).build_wallet_trade_rollup(
         since_hours=args.since_hours,
     )
 
 
 def cmd_build_trader_chain_pnl(_args: argparse.Namespace, app_settings: Settings) -> Any:
+    disabled = heavy_job_disabled_response(app_settings, "build trader-chain-pnl")
+    if disabled is not None:
+        return disabled
     return MartBuilder(clickhouse=ClickHouseWriter(app_settings)).build_trader_chain_pnl()
 
 
 def cmd_build_event_wallet_pnl(_args: argparse.Namespace, app_settings: Settings) -> Any:
+    disabled = heavy_job_disabled_response(app_settings, "build event-wallet-pnl")
+    if disabled is not None:
+        return disabled
     return MartBuilder(clickhouse=ClickHouseWriter(app_settings)).build_event_wallet_pnl()
 
 
 def cmd_build_live_wallet_positions(_args: argparse.Namespace, app_settings: Settings) -> Any:
+    disabled = heavy_job_disabled_response(app_settings, "build live-wallet-positions")
+    if disabled is not None:
+        return disabled
     return MartBuilder(clickhouse=ClickHouseWriter(app_settings)).build_live_wallet_positions()
 
 
 def cmd_build_wallet_reputation(_args: argparse.Namespace, app_settings: Settings) -> Any:
+    disabled = heavy_job_disabled_response(app_settings, "build wallet-reputation")
+    if disabled is not None:
+        return disabled
     return MartBuilder(clickhouse=ClickHouseWriter(app_settings)).build_wallet_reputation()
 
 
 def cmd_build_wallet_screener(_args: argparse.Namespace, app_settings: Settings) -> Any:
+    disabled = heavy_job_disabled_response(app_settings, "build wallet-screener")
+    if disabled is not None:
+        return disabled
     return MartBuilder(clickhouse=ClickHouseWriter(app_settings)).build_wallet_screener()
 
 
 def cmd_build_wallet_fifa_24h_pnl(args: argparse.Namespace, app_settings: Settings) -> Any:
+    disabled = heavy_job_disabled_response(app_settings, "build wallet-fifa-24h-pnl")
+    if disabled is not None:
+        return disabled
     return MartBuilder(clickhouse=ClickHouseWriter(app_settings)).build_wallet_fifa_24h_pnl(
         window_hours=args.window_hours,
     )
 
 
 def cmd_build_wallet_fifa_chain_cashflow(args: argparse.Namespace, app_settings: Settings) -> Any:
+    disabled = heavy_job_disabled_response(app_settings, "build wallet-fifa-chain-cashflow")
+    if disabled is not None:
+        return disabled
     return MartBuilder(clickhouse=ClickHouseWriter(app_settings)).build_wallet_fifa_chain_cashflow(
         window_days=args.window_days,
     )
 
 
 def cmd_build_fifa_trades(args: argparse.Namespace, app_settings: Settings) -> Any:
+    disabled = heavy_job_disabled_response(app_settings, "build fifa-trades")
+    if disabled is not None:
+        return disabled
     return MartBuilder(clickhouse=ClickHouseWriter(app_settings)).build_fifa_trades(
         window_hours=args.window_hours,
     )
 
 
 def cmd_build_fifa_chain_trades(args: argparse.Namespace, app_settings: Settings) -> Any:
+    disabled = heavy_job_disabled_response(app_settings, "build fifa-chain-trades")
+    if disabled is not None:
+        return disabled
     return MartBuilder(clickhouse=ClickHouseWriter(app_settings)).build_fifa_chain_trades(
         from_block=args.from_block,
         to_block=args.to_block,
@@ -3019,6 +3208,9 @@ def cmd_build_fifa_chain_trades(args: argparse.Namespace, app_settings: Settings
 
 
 def cmd_build_event_anomaly_signals(args: argparse.Namespace, app_settings: Settings) -> Any:
+    disabled = heavy_job_disabled_response(app_settings, "build event-anomaly-signals")
+    if disabled is not None:
+        return disabled
     return MartBuilder(clickhouse=ClickHouseWriter(app_settings)).build_event_anomaly_signals(
         large_trade_threshold=args.large_trade_threshold,
         liquidity_ratio_threshold=args.liquidity_ratio_threshold,
@@ -3029,11 +3221,17 @@ def cmd_build_event_anomaly_signals(args: argparse.Namespace, app_settings: Sett
 
 
 def cmd_build_analytics_core(_args: argparse.Namespace, app_settings: Settings) -> Any:
+    disabled = heavy_job_disabled_response(app_settings, "build analytics-core")
+    if disabled is not None:
+        return disabled
     results = MartBuilder(clickhouse=ClickHouseWriter(app_settings)).build_analytics_core()
     return {"marts": [asdict(result) for result in results]}
 
 
 def cmd_build_alerts(args: argparse.Namespace, app_settings: Settings) -> Any:
+    disabled = heavy_job_disabled_response(app_settings, "build alerts")
+    if disabled is not None:
+        return disabled
     return MartBuilder(clickhouse=ClickHouseWriter(app_settings)).build_alerts(
         price_move_threshold=args.price_move_threshold,
         spread_threshold=args.spread_threshold,
